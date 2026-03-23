@@ -1,11 +1,11 @@
-// Command pam-oauth2-enroll links a local Unix user to a GitHub identity by
+// Command oauth2-pam-enroll links a local Unix user to a GitHub identity by
 // running a Device Authorization Grant flow and writing the result to the
 // enrollment file.
 //
 // Typical usage (run as root or via sudo):
 //
-//	pam-oauth2-enroll --user alice
-//	pam-oauth2-enroll --user alice --remove
+//	oauth2-pam-enroll --user alice
+//	oauth2-pam-enroll --user alice --remove
 package main
 
 import (
@@ -23,9 +23,9 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 
-	"github.com/scttfrdmn/pam-oauth2/pkg/config"
-	"github.com/scttfrdmn/pam-oauth2/pkg/enrollment"
-	"github.com/scttfrdmn/pam-oauth2/pkg/provider/github"
+	"github.com/scttfrdmn/oauth2-pam/pkg/config"
+	"github.com/scttfrdmn/oauth2-pam/pkg/enrollment"
+	"github.com/scttfrdmn/oauth2-pam/pkg/provider/github"
 )
 
 var (
@@ -51,25 +51,25 @@ func buildRootCmd() *cobra.Command {
 	)
 
 	cmd := &cobra.Command{
-		Use:   "pam-oauth2-enroll",
-		Short: "Enroll a local Unix user with a GitHub identity for pam-oauth2 authentication",
-		Long: `pam-oauth2-enroll links a local Unix username to a GitHub account so that
+		Use:   "oauth2-pam-enroll",
+		Short: "Enroll a local Unix user with a GitHub identity for oauth2-pam authentication",
+		Long: `oauth2-pam-enroll links a local Unix username to a GitHub account so that
 the user can authenticate via the GitHub Device Flow in future PAM sessions.
 
-Run as root (or via sudo) since the enrollment file lives in /etc/pam-oauth2/.
+Run as root (or via sudo) since the enrollment file lives in /etc/oauth2-pam/.
 
 Examples:
   # Enroll the current user
-  sudo pam-oauth2-enroll
+  sudo oauth2-pam-enroll
 
   # Enroll a specific user
-  sudo pam-oauth2-enroll --user alice
+  sudo oauth2-pam-enroll --user alice
 
   # Enroll with supplementary group overrides
-  sudo pam-oauth2-enroll --user alice --groups users,docker
+  sudo oauth2-pam-enroll --user alice --groups users,docker
 
   # Remove an enrollment
-  sudo pam-oauth2-enroll --user alice --remove`,
+  sudo oauth2-pam-enroll --user alice --remove`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if verbose {
@@ -94,7 +94,7 @@ Examples:
 
 			enrollFile := cfg.Mapper.EnrollmentFile
 			if enrollFile == "" {
-				enrollFile = "/etc/pam-oauth2/enrolled-users.yaml"
+				enrollFile = "/etc/oauth2-pam/enrolled-users.yaml"
 			}
 
 			if removeMode {
@@ -104,7 +104,7 @@ Examples:
 		},
 	}
 
-	cmd.Flags().StringVarP(&cfgPath, "config", "c", "/etc/pam-oauth2/broker.yaml", "Broker config file")
+	cmd.Flags().StringVarP(&cfgPath, "config", "c", "/etc/oauth2-pam/broker.yaml", "Broker config file")
 	cmd.Flags().StringVarP(&localUser, "user", "u", "", "Local Unix username to enroll (default: caller)")
 	cmd.Flags().StringSliceVar(&groups, "groups", nil, "Supplementary Unix groups (overrides mapper defaults)")
 	cmd.Flags().BoolVar(&removeMode, "remove", false, "Remove an existing enrollment")
@@ -114,7 +114,7 @@ Examples:
 		Use:   "version",
 		Short: "Show version",
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Printf("pam-oauth2-enroll %s (commit: %s, built: %s)\n", version, gitCommit, buildDate)
+			fmt.Printf("oauth2-pam-enroll %s (commit: %s, built: %s)\n", version, gitCommit, buildDate)
 		},
 	})
 
@@ -157,6 +157,18 @@ func runRemove(localUser, enrollFile string) error {
 // runEnroll runs the Device Flow, confirms the GitHub identity, and writes
 // the enrollment record.
 func runEnroll(localUser string, groups []string, enrollFile string, cfg *config.Config) error {
+	// Verify the local Unix user exists before starting the device flow.
+	if _, err := user.Lookup(localUser); err != nil {
+		return fmt.Errorf("local user %q not found: %w", localUser, err)
+	}
+
+	// Verify each requested group exists.
+	for _, g := range groups {
+		if _, err := user.LookupGroup(g); err != nil {
+			return fmt.Errorf("group %q not found: %w", g, err)
+		}
+	}
+
 	if len(cfg.Providers) == 0 {
 		return fmt.Errorf("no providers configured in %s", "config")
 	}

@@ -2,10 +2,10 @@
 
 # Build variables
 BINARY_DIR := bin
-PAM_MODULE := pam_oauth2.so
-BROKER_BINARY := pam-oauth2-broker
-ADMIN_BINARY := pam-oauth2-admin
-ENROLL_BINARY := pam-oauth2-enroll
+PAM_MODULE := oauth2_pam.so
+BROKER_BINARY := oauth2-pam-broker
+ADMIN_BINARY := oauth2-pam-admin
+ENROLL_BINARY := oauth2-pam-enroll
 
 # Version information
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
@@ -38,13 +38,13 @@ build-pam:
 build-admin:
 	@echo "Building admin CLI..."
 	@mkdir -p $(BINARY_DIR)
-	go build $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(ADMIN_BINARY) ./cmd/pam-oauth2-admin
+	go build $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(ADMIN_BINARY) ./cmd/oauth2-pam-admin
 
 ## Build enrollment CLI tool
 build-enroll:
 	@echo "Building enrollment CLI..."
 	@mkdir -p $(BINARY_DIR)
-	go build $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(ENROLL_BINARY) ./cmd/pam-oauth2-enroll
+	go build $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(ENROLL_BINARY) ./cmd/oauth2-pam-enroll
 
 ## Run all tests
 test:
@@ -68,9 +68,9 @@ install: build
 	sudo cp $(BINARY_DIR)/$(BROKER_BINARY) /usr/local/bin/
 	sudo cp $(BINARY_DIR)/$(ADMIN_BINARY) /usr/local/bin/
 	sudo cp $(BINARY_DIR)/$(ENROLL_BINARY) /usr/local/bin/
-	sudo cp configs/systemd/pam-oauth2-broker.service /etc/systemd/system/
+	sudo cp configs/systemd/oauth2-pam-broker.service /etc/systemd/system/
 	sudo systemctl daemon-reload
-	sudo systemctl enable pam-oauth2-broker
+	sudo systemctl enable oauth2-pam-broker
 
 ## Install development version
 install-dev: build
@@ -79,9 +79,9 @@ install-dev: build
 	sudo cp $(BINARY_DIR)/$(BROKER_BINARY) /usr/local/bin/
 	sudo cp $(BINARY_DIR)/$(ADMIN_BINARY) /usr/local/bin/
 	sudo cp $(BINARY_DIR)/$(ENROLL_BINARY) /usr/local/bin/
-	sudo mkdir -p /etc/pam-oauth2
-	sudo cp configs/example.yaml /etc/pam-oauth2/broker.yaml
-	sudo cp configs/systemd/pam-oauth2-broker.service /etc/systemd/system/
+	sudo mkdir -p /etc/oauth2-pam
+	sudo cp configs/example.yaml /etc/oauth2-pam/broker.yaml
+	sudo cp configs/systemd/oauth2-pam-broker.service /etc/systemd/system/
 	sudo systemctl daemon-reload
 
 ## Clean build artifacts
@@ -127,11 +127,11 @@ release: clean
 	@mkdir -p $(BINARY_DIR)
 	GOOS=linux GOARCH=amd64 go build $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(BROKER_BINARY)-linux-amd64 ./cmd/broker
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=1 go build -buildmode=c-shared $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(PAM_MODULE)-linux-amd64 ./cmd/pam-module
-	GOOS=linux GOARCH=amd64 go build $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(ADMIN_BINARY)-linux-amd64 ./cmd/pam-oauth2-admin
-	GOOS=linux GOARCH=amd64 go build $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(ENROLL_BINARY)-linux-amd64 ./cmd/pam-oauth2-enroll
+	GOOS=linux GOARCH=amd64 go build $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(ADMIN_BINARY)-linux-amd64 ./cmd/oauth2-pam-admin
+	GOOS=linux GOARCH=amd64 go build $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(ENROLL_BINARY)-linux-amd64 ./cmd/oauth2-pam-enroll
 	GOOS=linux GOARCH=arm64 go build $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(BROKER_BINARY)-linux-arm64 ./cmd/broker
-	GOOS=linux GOARCH=arm64 go build $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(ADMIN_BINARY)-linux-arm64 ./cmd/pam-oauth2-admin
-	GOOS=linux GOARCH=arm64 go build $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(ENROLL_BINARY)-linux-arm64 ./cmd/pam-oauth2-enroll
+	GOOS=linux GOARCH=arm64 go build $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(ADMIN_BINARY)-linux-arm64 ./cmd/oauth2-pam-admin
+	GOOS=linux GOARCH=arm64 go build $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(ENROLL_BINARY)-linux-arm64 ./cmd/oauth2-pam-enroll
 
 ## Validate project structure
 validate:

@@ -13,7 +13,7 @@
 #include <stdlib.h>
 
 // PAM module name and version
-#define PAM_MODULE_NAME    "pam_oauth2"
+#define PAM_MODULE_NAME    "oauth2_pam"
 #define PAM_MODULE_VERSION "0.1.0"
 
 // Buffer sizes
@@ -21,8 +21,8 @@
 #define MAX_RESPONSE_SIZE  8192
 #define MAX_SOCKET_PATH    108
 
-// Default socket path for the pam-oauth2 broker
-#define DEFAULT_SOCKET_PATH "/var/run/pam-oauth2/broker.sock"
+// Default socket path for the oauth2-pam broker
+#define DEFAULT_SOCKET_PATH "/var/run/oauth2-pam/broker.sock"
 
 // Prototypes implemented in cgo_bridge.c (compiled as part of the .so)
 void log_pam_message(int priority, const char *format, ...);
@@ -39,6 +39,7 @@ int  send_auth_request(int sock,
                        const char *rhost,
                        const char *tty);
 int  receive_auth_response(int sock, char *response, size_t response_size);
+int  validate_socket_path(const char *path);
 int  display_message(pam_handle_t *pamh, const char *message);
 int  prompt_user(pam_handle_t *pamh,
                  const char *prompt,

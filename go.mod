@@ -1,4 +1,4 @@
-module github.com/scttfrdmn/pam-oauth2
+module github.com/scttfrdmn/oauth2-pam
 
 go 1.24.0
 

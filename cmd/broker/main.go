@@ -11,9 +11,9 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
-	"github.com/scttfrdmn/pam-oauth2/internal/ipc"
-	"github.com/scttfrdmn/pam-oauth2/pkg/auth"
-	"github.com/scttfrdmn/pam-oauth2/pkg/config"
+	"github.com/scttfrdmn/oauth2-pam/internal/ipc"
+	"github.com/scttfrdmn/oauth2-pam/pkg/auth"
+	"github.com/scttfrdmn/oauth2-pam/pkg/config"
 )
 
 var (
@@ -23,7 +23,7 @@ var (
 )
 
 var (
-	configPath  = flag.String("config", "/etc/pam-oauth2/broker.yaml", "Path to configuration file")
+	configPath  = flag.String("config", "/etc/oauth2-pam/broker.yaml", "Path to configuration file")
 	logLevel    = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 	showVersion = flag.Bool("version", false, "Show version information")
 )
@@ -32,7 +32,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("pam-oauth2-broker version %s\n", version)
+		fmt.Printf("oauth2-pam-broker version %s\n", version)
 		fmt.Printf("  Build date: %s\n", buildDate)
 		fmt.Printf("  Git commit: %s\n", gitCommit)
 		os.Exit(0)
@@ -43,7 +43,7 @@ func main() {
 	log.Info().
 		Str("version", version).
 		Str("config", *configPath).
-		Msg("Starting pam-oauth2 Authentication Broker")
+		Msg("Starting oauth2-pam Authentication Broker")
 
 	// Load and validate configuration
 	cfg, err := config.LoadConfig(*configPath)
@@ -61,7 +61,7 @@ func main() {
 	}
 
 	// Create IPC server
-	ipcServer, err := ipc.NewServer(cfg.Server.SocketPath, broker)
+	ipcServer, err := ipc.NewServer(cfg.Server.SocketPath, broker, cfg)
 	if err != nil {
 		log.Fatal().Err(err).Str("socket", cfg.Server.SocketPath).Msg("Failed to create IPC server")
 	}
@@ -78,7 +78,7 @@ func main() {
 
 	log.Info().
 		Str("socket", cfg.Server.SocketPath).
-		Msg("pam-oauth2 broker ready")
+		Msg("oauth2-pam broker ready")
 
 	// Wait for shutdown signal
 	sigChan := make(chan os.Signal, 1)
@@ -116,7 +116,7 @@ func setupLogging(level string) {
 	}
 	zerolog.SetGlobalLevel(lvl)
 
-	if os.Getenv("PAM_OAUTH2_DEV") == "true" {
+	if os.Getenv("OAUTH2_PAM_DEV") == "true" {
 		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
 	}
 }

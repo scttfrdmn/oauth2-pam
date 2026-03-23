@@ -1,0 +1,33 @@
+[Unit]
+Description=oauth2-pam Authentication Broker
+Documentation=https://github.com/scttfrdmn/oauth2-pam
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/oauth2-pam-broker --config /etc/oauth2-pam/broker.yaml
+Restart=always
+RestartSec=5s
+
+# Run as root so it can write to /var/run/oauth2-pam/ and /var/log/oauth2-pam/
+User=root
+Group=root
+
+# Runtime directory
+RuntimeDirectory=oauth2-pam
+RuntimeDirectoryMode=0755
+
+# Log directory
+LogsDirectory=oauth2-pam
+LogsDirectoryMode=0750
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/run/oauth2-pam /var/log/oauth2-pam /etc/oauth2-pam
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

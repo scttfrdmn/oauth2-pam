@@ -7,6 +7,7 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -17,7 +18,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
-	"github.com/scttfrdmn/pam-oauth2/pkg/config"
+	"github.com/scttfrdmn/oauth2-pam/pkg/config"
 )
 
 const (
@@ -130,6 +131,15 @@ func New(cfg config.ProviderConfig) (*Provider, error) {
 		cfg:  cfg,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
+			// Only follow redirects to GitHub-owned hosts. A redirect to any
+			// other host would indicate a misconfiguration or a MITM attempt.
+			CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+				h := req.URL.Hostname()
+				if h != "github.com" && !strings.HasSuffix(h, ".github.com") {
+					return fmt.Errorf("redirect to non-GitHub host %q rejected", h)
+				}
+				return nil
+			},
 		},
 	}, nil
 }
@@ -247,7 +257,17 @@ func (p *Provider) PollDeviceAuthorization(ctx context.Context, deviceCode strin
 		AccessToken: tr.AccessToken,
 		TokenType:   tr.TokenType,
 		Scope:       tr.Scope,
-		Fingerprint: generateFingerprint(tr.AccessToken),
+		Fingerprint: tokenDisplayLabel(tr.AccessToken),
+	}
+
+	// Fail fast if any required scope is absent. Missing scopes cause silent
+	// downstream failures (e.g., /user/orgs returns [] instead of an error),
+	// making the root cause very hard to diagnose.
+	for _, required := range []string{"read:org", "read:user", "user:email"} {
+		if !strings.Contains(token.Scope, required) {
+			return nil, fmt.Errorf("github token missing required scope %q (granted: %q); "+
+				"ensure the OAuth app requests the correct scopes", required, token.Scope)
+		}
 	}
 
 	log.Debug().
@@ -432,11 +452,49 @@ func (p *Provider) apiGet(ctx context.Context, accessToken, path string, dest in
 	return nil
 }
 
-func generateFingerprint(accessToken string) string {
+// tokenDisplayLabel returns a human-readable prefix…suffix label for audit logs.
+// It is NOT cryptographic — use the SHA-256 fingerprint in TokenManager for
+// collision-resistant identification.
+func tokenDisplayLabel(accessToken string) string {
 	if len(accessToken) < 16 {
 		return accessToken
 	}
 	return accessToken[:8] + "..." + accessToken[len(accessToken)-8:]
+}
+
+// RevokeAccessToken revokes an OAuth2 access token via the GitHub API.
+// Uses DELETE /applications/{client_id}/token with HTTP Basic auth (client
+// credentials). This is a best-effort call; the caller should not fail the
+// overall revocation flow if this returns an error.
+func (p *Provider) RevokeAccessToken(ctx context.Context, accessToken string) error {
+	type revokeRequest struct {
+		AccessToken string `json:"access_token"`
+	}
+	body, err := json.Marshal(revokeRequest{AccessToken: accessToken})
+	if err != nil {
+		return fmt.Errorf("marshal revoke request: %w", err)
+	}
+
+	apiURL := fmt.Sprintf("%s/applications/%s/token", apiBase, p.cfg.ClientID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, apiURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build revoke request: %w", err)
+	}
+	req.SetBasicAuth(p.cfg.ClientID, p.cfg.ClientSecret)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("revoke token request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("revoke token: unexpected status %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // Sentinel errors returned by PollDeviceAuthorization

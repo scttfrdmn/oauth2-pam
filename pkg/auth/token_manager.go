@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
-	"github.com/scttfrdmn/pam-oauth2/pkg/config"
-	"github.com/scttfrdmn/pam-oauth2/pkg/security"
+	"github.com/scttfrdmn/oauth2-pam/pkg/config"
+	"github.com/scttfrdmn/oauth2-pam/pkg/security"
 )
 
 // TokenManager handles token lifecycle management including encrypted storage
@@ -40,7 +40,7 @@ type StoredToken struct {
 	SessionID    string
 	Fingerprint  string
 	Encrypted    bool
-	Metadata     map[string]interface{}
+	Metadata     map[string]string
 	CreatedAt    time.Time
 	LastUsed     time.Time
 }
@@ -117,8 +117,10 @@ func (tm *TokenManager) StoreToken(sessionID, userID, accessToken, refreshToken 
 	return tokenID, nil
 }
 
-// GetToken retrieves a stored token by ID.
-func (tm *TokenManager) GetToken(tokenID string) (*StoredToken, error) {
+// getToken retrieves a stored token by ID.
+// Note: when stored.Encrypted == true, AccessToken contains AES-GCM ciphertext.
+// Use GetDecryptedAccessToken for the plaintext access token.
+func (tm *TokenManager) getToken(tokenID string) (*StoredToken, error) {
 	tm.tokenStore.mutex.RLock()
 	stored, ok := tm.tokenStore.tokens[tokenID]
 	tm.tokenStore.mutex.RUnlock()
@@ -130,7 +132,6 @@ func (tm *TokenManager) GetToken(tokenID string) (*StoredToken, error) {
 		return nil, fmt.Errorf("token expired")
 	}
 
-	stored.LastUsed = time.Now()
 	return stored, nil
 }
 
@@ -186,7 +187,33 @@ func generateTokenID() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+// GetDecryptedAccessToken retrieves and decrypts the access token for tokenID.
+func (tm *TokenManager) GetDecryptedAccessToken(tokenID string) (string, error) {
+	tm.tokenStore.mutex.RLock()
+	stored, ok := tm.tokenStore.tokens[tokenID]
+	tm.tokenStore.mutex.RUnlock()
+
+	if !ok {
+		return "", fmt.Errorf("token not found: %s", tokenID)
+	}
+	if stored.ExpiresAt.Before(time.Now()) {
+		return "", fmt.Errorf("token expired")
+	}
+
+	if !stored.Encrypted {
+		return stored.AccessToken, nil
+	}
+	if tm.encryption == nil {
+		return "", fmt.Errorf("token is encrypted but no encryption key configured")
+	}
+	decrypted, err := tm.encryption.Decrypt([]byte(stored.AccessToken))
+	if err != nil {
+		return "", fmt.Errorf("decrypt token: %w", err)
+	}
+	return string(decrypted), nil
+}
+
 func fingerprintToken(token string) string {
 	h := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(h[:8])
+	return hex.EncodeToString(h[:16])
 }

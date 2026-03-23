@@ -2,15 +2,19 @@ package auth
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
-	"github.com/scttfrdmn/pam-oauth2/pkg/config"
-	"github.com/scttfrdmn/pam-oauth2/pkg/mapper"
-	"github.com/scttfrdmn/pam-oauth2/pkg/provider/github"
-	"github.com/scttfrdmn/pam-oauth2/pkg/security"
+	"github.com/scttfrdmn/oauth2-pam/pkg/config"
+	"github.com/scttfrdmn/oauth2-pam/pkg/mapper"
+	"github.com/scttfrdmn/oauth2-pam/pkg/provider/github"
+	"github.com/scttfrdmn/oauth2-pam/pkg/security"
 )
 
 // Broker manages authentication requests, device flows, and sessions.
@@ -31,6 +35,7 @@ type Broker struct {
 // Session represents an active authentication session.
 type Session struct {
 	ID                 string
+	TokenID            string // key into TokenManager for the stored access token
 	LocalUser          string
 	RequestedLocalUser string // UserID from the PAM auth request; used by Tier 0 enrollment
 	GitHubLogin        string
@@ -43,7 +48,7 @@ type Session struct {
 	SourceIP           string
 	TokenFingerprint   string
 	IsActive           bool
-	Metadata           map[string]interface{}
+	Metadata           map[string]string
 }
 
 // AuthRequest is an authentication request from the PAM module.
@@ -56,7 +61,7 @@ type AuthRequest struct {
 	DeviceID   string
 	SessionID  string
 	Timestamp  time.Time
-	Metadata   map[string]interface{}
+	Metadata   map[string]string
 }
 
 // AuthResponse is the broker's response to an auth request.
@@ -74,7 +79,7 @@ type AuthResponse struct {
 	RequiresApproval bool
 	ErrorCode        string
 	ErrorMessage     string
-	Metadata         map[string]interface{}
+	Metadata         map[string]string
 }
 
 // NewBroker creates and validates a new Broker.
@@ -123,7 +128,7 @@ func NewBroker(cfg *config.Config) (*Broker, error) {
 // Start starts the broker background services.
 func (b *Broker) Start(ctx context.Context) error {
 	b.ctx = ctx
-	log.Info().Msg("Starting pam-oauth2 broker services")
+	log.Info().Msg("Starting oauth2-pam broker services")
 
 	if err := b.tokenManager.Start(ctx); err != nil {
 		return fmt.Errorf("start token manager: %w", err)
@@ -135,13 +140,13 @@ func (b *Broker) Start(ctx context.Context) error {
 	b.wg.Add(1)
 	go b.sessionCleanup(ctx)
 
-	log.Info().Msg("pam-oauth2 broker services started")
+	log.Info().Msg("oauth2-pam broker services started")
 	return nil
 }
 
 // Stop shuts down broker background services.
 func (b *Broker) Stop() error {
-	log.Info().Msg("Stopping pam-oauth2 broker services")
+	log.Info().Msg("Stopping oauth2-pam broker services")
 
 	close(b.stopChan)
 	b.wg.Wait()
@@ -153,7 +158,7 @@ func (b *Broker) Stop() error {
 		log.Error().Err(err).Msg("Error stopping audit logger")
 	}
 
-	log.Info().Msg("pam-oauth2 broker services stopped")
+	log.Info().Msg("oauth2-pam broker services stopped")
 	return nil
 }
 
@@ -168,14 +173,6 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 		Str("login_type", req.LoginType).
 		Msg("Processing authentication request")
 
-	// Check for an existing active session
-	if session := b.getSession(req.SessionID); session != nil {
-		if session.IsActive && session.ExpiresAt.After(time.Now()) {
-			return b.successResponse(session), nil
-		}
-		b.removeSession(req.SessionID)
-	}
-
 	// Pick the first configured provider (single-provider for now)
 	if len(b.providers) == 0 {
 		return &AuthResponse{
@@ -185,6 +182,17 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 		}, nil
 	}
 	provider := b.providers[0]
+
+	// Enforce per-user session limit before starting a new device flow.
+	if max := b.config.Authentication.MaxConcurrentSessions; max > 0 {
+		if b.countUserSessions(req.UserID) >= max {
+			return &AuthResponse{
+				Success:      false,
+				ErrorCode:    "SESSION_LIMIT_REACHED",
+				ErrorMessage: "Maximum concurrent sessions reached",
+			}, nil
+		}
+	}
 
 	// Start device flow
 	deviceFlow, err := provider.StartDeviceFlow(b.ctx)
@@ -213,9 +221,17 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 		qrCode = ""
 	}
 
-	// Create a pending session keyed by SessionID
+	// Generate a cryptographically random session ID server-side.
+	// The PAM client's req.SessionID is intentionally ignored to prevent
+	// session fixation attacks.
+	sessionID, err := generateSessionID()
+	if err != nil {
+		return nil, fmt.Errorf("generate session ID: %w", err)
+	}
+
+	// Create a pending session
 	session := &Session{
-		ID:                 req.SessionID,
+		ID:                 sessionID,
 		RequestedLocalUser: req.UserID,
 		Provider:           provider.Name(),
 		CreatedAt:          time.Now(),
@@ -227,21 +243,21 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 	}
 	b.setSession(session)
 
-	// Poll in the background; update session when done
+	// Poll in the background; update session when the device flow completes.
 	b.wg.Add(1)
-	go b.pollDeviceAuthorization(session, provider, deviceFlow)
+	go b.pollDeviceAuthorization(sessionID, provider, deviceFlow)
 
 	return &AuthResponse{
 		Success:        true,
-		SessionID:      session.ID,
+		SessionID:      sessionID,
 		DeviceCode:     deviceFlow.UserCode,
 		DeviceURL:      deviceFlow.DeviceURL,
 		QRCode:         qrCode,
 		ExpiresAt:      deviceFlow.ExpiresAt,
 		RequiresDevice: true,
-		Metadata: map[string]interface{}{
+		Metadata: map[string]string{
 			"provider":         provider.Name(),
-			"polling_interval": deviceFlow.PollingInterval,
+			"polling_interval": fmt.Sprintf("%d", deviceFlow.PollingInterval),
 		},
 	}, nil
 }
@@ -263,7 +279,7 @@ func (b *Broker) CheckSession(sessionID string) (*AuthResponse, error) {
 			SessionID:      sessionID,
 			RequiresDevice: true,
 			ExpiresAt:      session.ExpiresAt,
-			Metadata:       map[string]interface{}{"status": "pending"},
+			Metadata:       map[string]string{"status": "pending"},
 		}, nil
 	}
 
@@ -302,11 +318,25 @@ func (b *Broker) RefreshSession(sessionID string) (*AuthResponse, error) {
 	return b.successResponse(session), nil
 }
 
-// RevokeSession removes a session.
+// RevokeSession removes a session and revokes its stored access token.
 func (b *Broker) RevokeSession(sessionID string) error {
 	session := b.getSession(sessionID)
 	if session == nil {
 		return fmt.Errorf("session not found: %s", sessionID)
+	}
+
+	if session.TokenID != "" {
+		// Best-effort: revoke the token at GitHub before removing it locally.
+		// Order matters: decrypt first (needs the local copy), then revoke at
+		// GitHub, then delete from the token store.
+		if plaintext, err := b.tokenManager.GetDecryptedAccessToken(session.TokenID); err != nil {
+			log.Warn().Err(err).Str("session_id", sessionID).Msg("Could not decrypt token for GitHub revocation")
+		} else if p := b.providerByName(session.Provider); p != nil {
+			if err := p.RevokeAccessToken(b.ctx, plaintext); err != nil {
+				log.Warn().Err(err).Str("session_id", sessionID).Msg("GitHub token revocation failed (token may remain valid at GitHub)")
+			}
+		}
+		b.tokenManager.RevokeToken(session.TokenID)
 	}
 
 	b.removeSession(sessionID)
@@ -325,7 +355,10 @@ func (b *Broker) RevokeSession(sessionID string) error {
 
 // --- background polling ---
 
-func (b *Broker) pollDeviceAuthorization(session *Session, provider *github.Provider, df *github.DeviceFlow) {
+// pollDeviceAuthorization polls the GitHub token endpoint in the background.
+// It takes sessionID (not a *Session pointer) to avoid data races; all
+// session reads/writes go through getSession/setSession under the mutex.
+func (b *Broker) pollDeviceAuthorization(sessionID string, provider *github.Provider, df *github.DeviceFlow) {
 	defer b.wg.Done()
 
 	interval := time.Duration(df.PollingInterval) * time.Second
@@ -345,9 +378,9 @@ func (b *Broker) pollDeviceAuthorization(session *Session, provider *github.Prov
 
 		case <-timeout.C:
 			log.Warn().
-				Str("session_id", session.ID).
+				Str("session_id", sessionID).
 				Msg("Device flow expired")
-			b.removeSession(session.ID)
+			b.removeSession(sessionID)
 			return
 
 		case <-ticker.C:
@@ -361,77 +394,131 @@ func (b *Broker) pollDeviceAuthorization(session *Session, provider *github.Prov
 					ticker.Reset(interval)
 					continue
 				case github.ErrExpiredToken:
-					b.removeSession(session.ID)
+					b.removeSession(sessionID)
 					return
 				case github.ErrAccessDenied:
 					b.auditLogger.LogAuthEvent(security.AuditEvent{
 						EventType:    "authentication_denied",
-						SessionID:    session.ID,
+						SessionID:    sessionID,
 						Provider:     provider.Name(),
 						Success:      false,
 						ErrorMessage: "user denied authorization",
 						Timestamp:    time.Now(),
 					})
-					b.removeSession(session.ID)
+					b.removeSession(sessionID)
 					return
 				default:
-					log.Error().Err(err).Str("session_id", session.ID).Msg("Device poll error")
-					b.removeSession(session.ID)
+					log.Error().Err(err).Str("session_id", sessionID).Msg("Device poll error")
+					b.removeSession(sessionID)
 					return
 				}
 			}
 
-			// Token obtained — fetch identity
-			identity, err := provider.GetIdentity(b.ctx, token)
-			if err != nil {
-				log.Error().Err(err).Str("session_id", session.ID).Msg("Failed to get GitHub identity")
-				b.auditLogger.LogAuthEvent(security.AuditEvent{
-					EventType:    "authentication_failed",
-					SessionID:    session.ID,
-					Provider:     provider.Name(),
-					Success:      false,
-					ErrorMessage: err.Error(),
-					Timestamp:    time.Now(),
-				})
-				b.removeSession(session.ID)
+			// Token obtained — fetch identity (retry up to 3x for transient errors).
+			var identity *github.Identity
+			for attempt := 1; attempt <= 3; attempt++ {
+				identity, err = provider.GetIdentity(b.ctx, token)
+				if err == nil {
+					break
+				}
+				if !isTransientError(err) || attempt == 3 {
+					log.Error().Err(err).Int("attempt", attempt).
+						Str("session_id", sessionID).Msg("Failed to get GitHub identity")
+					b.auditLogger.LogAuthEvent(security.AuditEvent{
+						EventType:    "authentication_failed",
+						SessionID:    sessionID,
+						Provider:     provider.Name(),
+						Success:      false,
+						ErrorMessage: err.Error(),
+						Timestamp:    time.Now(),
+					})
+					b.removeSession(sessionID)
+					return
+				}
+				log.Warn().Err(err).Int("attempt", attempt).
+					Str("session_id", sessionID).Msg("Transient error fetching identity, retrying")
+				time.Sleep(2 * time.Second)
+			}
+
+			// Get a snapshot of the current session state (holds no live pointer).
+			{
+			current := b.getSession(sessionID)
+			if current == nil {
+				// Session was removed externally (revoked or timed out).
 				return
 			}
 
-			// Map to local user; pass the PAM-requested username for Tier 0 enrollment lookup
-			mapResult, err := b.mapper.Map(b.ctx, identity, session.RequestedLocalUser)
+			// Map to local user; retry transient errors up to 3x.
+			var mapResult *mapper.Result
+			for attempt := 1; attempt <= 3; attempt++ {
+				mapResult, err = b.mapper.Map(b.ctx, identity, current.RequestedLocalUser)
+				if err == nil {
+					break
+				}
+				if !isTransientError(err) || attempt == 3 {
+					log.Error().Err(err).Int("attempt", attempt).
+						Str("session_id", sessionID).
+						Str("github_login", identity.Login).
+						Msg("Identity mapping failed")
+					b.auditLogger.LogAuthEvent(security.AuditEvent{
+						EventType:    "authentication_failed",
+						UserID:       identity.Login,
+						SessionID:    sessionID,
+						Provider:     provider.Name(),
+						Success:      false,
+						ErrorMessage: err.Error(),
+						Timestamp:    time.Now(),
+					})
+					b.removeSession(sessionID)
+					return
+				}
+				log.Warn().Err(err).Int("attempt", attempt).
+					Str("session_id", sessionID).Msg("Transient error mapping identity, retrying")
+				time.Sleep(2 * time.Second)
+			}
+
+			// Store the token in the encrypted token manager.
+			tokenLifetime := b.config.Authentication.TokenLifetime
+			if tokenLifetime <= 0 {
+				tokenLifetime = 8 * time.Hour
+			}
+			tokenID, err := b.tokenManager.StoreToken(
+				sessionID, mapResult.LocalUser,
+				token.AccessToken, "",
+				time.Now().Add(tokenLifetime),
+			)
 			if err != nil {
-				log.Error().Err(err).
-					Str("session_id", session.ID).
-					Str("github_login", identity.Login).
-					Msg("Identity mapping failed")
-				b.auditLogger.LogAuthEvent(security.AuditEvent{
-					EventType:    "authentication_failed",
-					UserID:       identity.Login,
-					SessionID:    session.ID,
-					Provider:     provider.Name(),
-					Success:      false,
-					ErrorMessage: err.Error(),
-					Timestamp:    time.Now(),
-				})
-				b.removeSession(session.ID)
+				log.Error().Err(err).Str("session_id", sessionID).Msg("Failed to store token")
+				b.removeSession(sessionID)
 				return
 			}
 
-			// Update session with resolved identity
-			session.LocalUser = mapResult.LocalUser
-			session.GitHubLogin = identity.Login
-			session.Email = identity.Email
-			session.Groups = mapResult.Groups
-			session.TokenFingerprint = token.Fingerprint
-			session.IsActive = true
-			b.setSession(session)
+			// Guard: if the session was revoked while we were fetching identity /
+			// mapping / storing the token, discard the result rather than
+			// recreating a session the admin just removed.
+			if b.getSession(sessionID) == nil {
+				b.tokenManager.RevokeToken(tokenID)
+				log.Info().Str("session_id", sessionID).
+					Msg("Session revoked during device flow; discarding authentication result")
+				return
+			}
+
+			// Update the session snapshot and write it back under the mutex.
+			current.LocalUser = mapResult.LocalUser
+			current.GitHubLogin = identity.Login
+			current.Email = identity.Email
+			current.Groups = mapResult.Groups
+			current.TokenFingerprint = token.Fingerprint
+			current.TokenID = tokenID
+			current.IsActive = true
+			b.setSession(current)
 
 			b.auditLogger.LogAuthEvent(security.AuditEvent{
 				EventType:  "authentication_success",
 				UserID:     mapResult.LocalUser,
 				Email:      identity.Email,
 				Groups:     mapResult.Groups,
-				SessionID:  session.ID,
+				SessionID:  sessionID,
 				Provider:   provider.Name(),
 				AuthMethod: "github_device_flow",
 				Success:    true,
@@ -443,30 +530,92 @@ func (b *Broker) pollDeviceAuthorization(session *Session, provider *github.Prov
 			})
 
 			log.Info().
-				Str("session_id", session.ID).
+				Str("session_id", sessionID).
 				Str("local_user", mapResult.LocalUser).
 				Str("github_login", identity.Login).
 				Msg("Authentication successful")
 			return
+			} // end inner block
 		}
 	}
 }
 
+// isTransientError returns true for network/IO errors that may resolve on retry,
+// as opposed to fatal errors (auth denied, identity not found, etc.).
+func isTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	return false
+}
+
 // --- session helpers ---
 
+// getSession returns a copy of the session, not a live pointer into the map.
+// Callers receive an immutable snapshot; writes must go through setSession.
 func (b *Broker) getSession(sessionID string) *Session {
 	if sessionID == "" {
 		return nil
 	}
 	b.sessionMutex.RLock()
 	defer b.sessionMutex.RUnlock()
-	return b.sessions[sessionID]
+	s, ok := b.sessions[sessionID]
+	if !ok {
+		return nil
+	}
+	snapshot := *s
+	// Deep-copy reference fields so mutations to the stored session cannot
+	// corrupt a caller's snapshot (and vice versa).
+	snapshot.Groups = append([]string(nil), s.Groups...)
+	if s.Metadata != nil {
+		snapshot.Metadata = make(map[string]string, len(s.Metadata))
+		for k, v := range s.Metadata {
+			snapshot.Metadata[k] = v
+		}
+	}
+	return &snapshot
+}
+
+// countUserSessions returns the number of sessions associated with userID.
+func (b *Broker) countUserSessions(userID string) int {
+	b.sessionMutex.RLock()
+	defer b.sessionMutex.RUnlock()
+	count := 0
+	for _, s := range b.sessions {
+		if s.RequestedLocalUser == userID || s.LocalUser == userID {
+			count++
+		}
+	}
+	return count
+}
+
+// generateSessionID creates a 16-byte cryptographically random session ID.
+func generateSessionID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 func (b *Broker) setSession(session *Session) {
 	b.sessionMutex.Lock()
 	defer b.sessionMutex.Unlock()
 	b.sessions[session.ID] = session
+}
+
+// providerByName returns the first provider whose Name() matches name, or nil.
+func (b *Broker) providerByName(name string) *github.Provider {
+	for _, p := range b.providers {
+		if p.Name() == name {
+			return p
+		}
+	}
+	return nil
 }
 
 func (b *Broker) removeSession(sessionID string) {
@@ -483,10 +632,10 @@ func (b *Broker) successResponse(session *Session) *AuthResponse {
 		Groups:    session.Groups,
 		SessionID: session.ID,
 		ExpiresAt: session.ExpiresAt,
-		Metadata: map[string]interface{}{
+		Metadata: map[string]string{
 			"provider":      session.Provider,
 			"github_login":  session.GitHubLogin,
-			"last_accessed": session.LastAccessed,
+			"last_accessed": session.LastAccessed.Format(time.RFC3339),
 		},
 	}
 }
@@ -516,7 +665,9 @@ func (b *Broker) sessionCleanup(ctx context.Context) {
 			b.sessionMutex.RUnlock()
 
 			for _, id := range expired {
-				_ = b.RevokeSession(id)
+				if err := b.RevokeSession(id); err != nil {
+					log.Warn().Err(err).Str("session_id", id).Msg("Failed to revoke expired session during cleanup")
+				}
 			}
 
 			if len(expired) > 0 {

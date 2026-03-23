@@ -2,8 +2,8 @@ bin/
 coverage.out
 coverage.html
 *.so
-/etc/pam-oauth2/
+/etc/oauth2-pam/
 # compiled binaries in root (from manual go build)
-/pam-oauth2-admin
-/pam-oauth2-broker
-/pam-oauth2-enroll
+/oauth2-pam-admin
+/oauth2-pam-broker
+/oauth2-pam-enroll

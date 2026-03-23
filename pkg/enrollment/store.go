@@ -1,6 +1,6 @@
 // Package enrollment manages the enrolled-users file that links local Unix
 // usernames to GitHub logins. It provides the backing store for the mapper's
-// Tier 0 lookup and for the pam-oauth2-enroll CLI tool.
+// Tier 0 lookup and for the oauth2-pam-enroll CLI tool.
 package enrollment
 
 import (
@@ -49,7 +49,7 @@ func Load(path string) (*Store, error) {
 // Save writes the store to path atomically using a temp file + rename, with
 // an exclusive flock on the destination file to prevent concurrent writers.
 func (s *Store) Save(path string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
 		return fmt.Errorf("create enrollment directory: %w", err)
 	}
 

@@ -1,11 +1,11 @@
-# pam-oauth2
+# oauth2-pam
 
 A Linux PAM module that authenticates users via OAuth2 Device Flow, with GitHub as the primary provider. Users authenticate by visiting a URL on their phone and approving the request — no passwords, no SSH key distribution.
 
 ## How it works
 
 ```
-SSH login → pam_oauth2.so → Unix socket → broker daemon
+SSH login → oauth2_pam.so → Unix socket → broker daemon
                                               │
                                     GitHub Device Flow (RFC 8628)
                                               │
@@ -36,8 +36,8 @@ SSH login → pam_oauth2.so → Unix socket → broker daemon
 ### 1. Create a GitHub OAuth App
 
 Go to **GitHub → Settings → Developer settings → OAuth Apps → New OAuth App**:
-- Application name: `pam-oauth2`
-- Homepage URL: `https://github.com/scttfrdmn/pam-oauth2`
+- Application name: `oauth2-pam`
+- Homepage URL: `https://github.com/scttfrdmn/oauth2-pam`
 - **Enable device flow** (checkbox in the app settings)
 - No callback URL needed for Device Flow
 
@@ -46,8 +46,8 @@ Copy the **Client ID** and generate a **Client Secret**.
 ### 2. Build
 
 ```bash
-git clone https://github.com/scttfrdmn/pam-oauth2
-cd pam-oauth2
+git clone https://github.com/scttfrdmn/oauth2-pam
+cd oauth2-pam
 make build
 ```
 
@@ -58,16 +58,16 @@ sudo make install
 ```
 
 This installs:
-- `/lib/security/pam_oauth2.so`
-- `/usr/local/bin/pam-oauth2-broker`
-- `/usr/local/bin/pam-oauth2-admin`
-- `/etc/systemd/system/pam-oauth2-broker.service`
+- `/lib/security/oauth2_pam.so`
+- `/usr/local/bin/oauth2-pam-broker`
+- `/usr/local/bin/oauth2-pam-admin`
+- `/etc/systemd/system/oauth2-pam-broker.service`
 
 ### 4. Configure
 
 ```bash
-sudo cp configs/example.yaml /etc/pam-oauth2/broker.yaml
-sudo $EDITOR /etc/pam-oauth2/broker.yaml
+sudo cp configs/example.yaml /etc/oauth2-pam/broker.yaml
+sudo $EDITOR /etc/oauth2-pam/broker.yaml
 ```
 
 Minimal config:
@@ -92,7 +92,7 @@ mapper:
 ### 5. Start the broker
 
 ```bash
-sudo systemctl enable --now pam-oauth2-broker
+sudo systemctl enable --now oauth2-pam-broker
 ```
 
 ### 6. Configure PAM (SSH)
@@ -101,7 +101,7 @@ Edit `/etc/pam.d/sshd`:
 
 ```
 # Add before @include common-auth
-auth sufficient pam_oauth2.so socket=/var/run/pam-oauth2/broker.sock
+auth sufficient oauth2_pam.so socket=/var/run/oauth2-pam/broker.sock
 ```
 
 Enable `ChallengeResponseAuthentication yes` in `/etc/ssh/sshd_config` and restart sshd.
@@ -149,14 +149,14 @@ mapper:
 
 ```bash
 #!/bin/bash
-# /usr/local/lib/pam-oauth2/map-user.sh
+# /usr/local/lib/oauth2-pam/map-user.sh
 # Receives Identity JSON on stdin, writes Result JSON to stdout
 
 INPUT=$(cat)
 LOGIN=$(echo "$INPUT" | jq -r .login)
 
 # Example: look up in a local database
-LOCAL_USER=$(sqlite3 /etc/pam-oauth2/users.db \
+LOCAL_USER=$(sqlite3 /etc/oauth2-pam/users.db \
   "SELECT local_user FROM mappings WHERE github_login='$LOGIN'")
 
 if [ -n "$LOCAL_USER" ]; then
@@ -182,26 +182,26 @@ Return `404` or `204` to indicate no mapping (falls through to next tier).
 
 ```bash
 # Check broker status
-pam-oauth2-admin status
+oauth2-pam-admin status
 
 # Test a full authentication flow
-pam-oauth2-admin test-auth --user octocat
+oauth2-pam-admin test-auth --user octocat
 
 # Test mapping without a real OAuth flow
-pam-oauth2-admin test-mapping --login octocat --org my-org --team my-org/engineers
+oauth2-pam-admin test-mapping --login octocat --org my-org --team my-org/engineers
 
 # Revoke a session
-pam-oauth2-admin revoke-session <session-id>
+oauth2-pam-admin revoke-session <session-id>
 ```
 
 ## Project Structure
 
 ```
-pam-oauth2/
+oauth2-pam/
 ├── cmd/
-│   ├── broker/              # Broker daemon (pam-oauth2-broker)
-│   ├── pam-module/          # PAM shared library (pam_oauth2.so)
-│   └── pam-oauth2-admin/    # Admin CLI
+│   ├── broker/              # Broker daemon (oauth2-pam-broker)
+│   ├── pam-module/          # PAM shared library (oauth2_pam.so)
+│   └── oauth2-pam-admin/    # Admin CLI
 ├── internal/
 │   └── ipc/                 # Unix socket IPC server
 ├── pkg/

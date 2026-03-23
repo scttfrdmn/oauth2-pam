@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog/log"
-	"github.com/scttfrdmn/pam-oauth2/pkg/config"
+	"github.com/scttfrdmn/oauth2-pam/pkg/config"
 )
 
 // AuditEvent represents a security audit event.
@@ -40,11 +41,17 @@ type AuditOutput interface {
 
 // AuditLogger manages async audit event dispatch to one or more outputs.
 type AuditLogger struct {
-	config    config.AuditConfig
-	outputs   []AuditOutput
-	eventChan chan AuditEvent
-	stopChan  chan struct{}
-	wg        sync.WaitGroup
+	config       config.AuditConfig
+	outputs      []AuditOutput
+	eventChan    chan AuditEvent
+	stopChan     chan struct{}
+	wg           sync.WaitGroup
+	droppedCount atomic.Uint64
+}
+
+// DroppedEvents returns the number of audit events dropped due to a full channel.
+func (al *AuditLogger) DroppedEvents() uint64 {
+	return al.droppedCount.Load()
 }
 
 // NewAuditLogger creates a new AuditLogger.
@@ -114,7 +121,8 @@ func (al *AuditLogger) LogAuthEvent(event AuditEvent) {
 	select {
 	case al.eventChan <- event:
 	default:
-		log.Warn().Msg("Audit event channel full, dropping event")
+		n := al.droppedCount.Add(1)
+		log.Warn().Uint64("total_dropped", n).Msg("Audit event channel full, dropping event")
 	}
 }
 

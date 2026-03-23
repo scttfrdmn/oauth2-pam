@@ -2,12 +2,13 @@ package config
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/spf13/viper"
 )
 
-// Config represents the complete configuration for the pam-oauth2 broker
+// Config represents the complete configuration for the oauth2-pam broker
 type Config struct {
 	Server         ServerConfig         `mapstructure:"server"`
 	Providers      []ProviderConfig     `mapstructure:"providers"`
@@ -64,7 +65,7 @@ type MapperConfig struct {
 
 	// EnrollmentFile is the path to the YAML file that maps local Unix users
 	// to their enrolled GitHub logins (Tier 0).
-	// Default: /etc/pam-oauth2/enrolled-users.yaml
+	// Default: /etc/oauth2-pam/enrolled-users.yaml
 	EnrollmentFile string `mapstructure:"enrollment_file"`
 
 	// Rules is the built-in config-file mapper (Tier 1)
@@ -160,7 +161,7 @@ func LoadConfig(configPath string) (*Config, error) {
 	v.SetConfigFile(configPath)
 	v.SetConfigType("yaml")
 
-	v.SetEnvPrefix("PAM_OAUTH2")
+	v.SetEnvPrefix("OAUTH2_PAM")
 	v.AutomaticEnv()
 
 	if err := v.ReadInConfig(); err != nil {
@@ -188,9 +189,9 @@ func loadFromEnvironment(v *viper.Viper) (*Config, error) {
 }
 
 func setDefaults(v *viper.Viper) {
-	v.SetDefault("server.socket_path", "/var/run/pam-oauth2/broker.sock")
+	v.SetDefault("server.socket_path", "/var/run/oauth2-pam/broker.sock")
 	v.SetDefault("server.log_level", "info")
-	v.SetDefault("server.audit_log", "/var/log/pam-oauth2/audit.log")
+	v.SetDefault("server.audit_log", "/var/log/oauth2-pam/audit.log")
 	v.SetDefault("server.read_timeout", "30s")
 	v.SetDefault("server.write_timeout", "30s")
 
@@ -203,7 +204,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("security.rate_limiting.max_requests_per_minute", 60)
 	v.SetDefault("security.rate_limiting.max_concurrent_auths", 10)
 
-	v.SetDefault("mapper.enrollment_file", "/etc/pam-oauth2/enrolled-users.yaml")
+	v.SetDefault("mapper.enrollment_file", "/etc/oauth2-pam/enrolled-users.yaml")
 	v.SetDefault("mapper.external_script_timeout", "5s")
 	v.SetDefault("mapper.http_timeout", "2s")
 
@@ -251,8 +252,21 @@ func (c *Config) Validate() error {
 	if c.Authentication.RefreshThreshold <= 0 {
 		return fmt.Errorf("authentication.refresh_threshold must be positive")
 	}
-	if c.Authentication.MaxConcurrentSessions <= 0 {
-		return fmt.Errorf("authentication.max_concurrent_sessions must be positive")
+	if c.Authentication.MaxConcurrentSessions < 0 {
+		return fmt.Errorf("authentication.max_concurrent_sessions must be non-negative (0 = unlimited)")
+	}
+
+	// AES key must be 16, 24, or 32 bytes for AES-128/192/256.
+	if c.Security.SecureTokenStorage && c.Security.TokenEncryptionKey != "" {
+		keyLen := len(c.Security.TokenEncryptionKey)
+		if keyLen != 16 && keyLen != 24 && keyLen != 32 {
+			return fmt.Errorf("security.token_encryption_key must be 16, 24, or 32 bytes (got %d)", keyLen)
+		}
+	}
+
+	// Require HTTPS for the mapper HTTP endpoint to protect identity data in transit.
+	if c.Mapper.HTTPEndpoint != "" && !strings.HasPrefix(c.Mapper.HTTPEndpoint, "https://") {
+		return fmt.Errorf("mapper.http_endpoint must use HTTPS (got %q)", c.Mapper.HTTPEndpoint)
 	}
 
 	// Validate mapper has at least one tier configured

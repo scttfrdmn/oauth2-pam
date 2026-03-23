@@ -23,6 +23,18 @@ void log_pam_message_string(int priority, const char *message) {
     closelog();
 }
 
+/* validate_socket_path returns 0 if path is safe, -1 otherwise.
+   Paths must be under /var/run/oauth2-pam/ and must not contain "..". */
+int validate_socket_path(const char *path) {
+    const char *required_prefix = "/var/run/oauth2-pam/";
+    if (path == NULL) return -1;
+    /* sun_path is 104 bytes on macOS, 108 on Linux; 103 leaves room for NUL */
+    if (strlen(path) > 103) return -1;
+    if (strncmp(path, required_prefix, strlen(required_prefix)) != 0) return -1;
+    if (strstr(path, "..") != NULL) return -1;
+    return 0;
+}
+
 int connect_to_broker(const char *socket_path) {
     int sock;
     struct sockaddr_un addr;
@@ -84,9 +96,11 @@ int send_auth_request(int sock, const char *username, const char *service,
     else if (strstr(service, "gdm") != NULL || strstr(service, "lightdm") != NULL)
         login_type = "gui";
 
+    char pid_str[24];
+    snprintf(pid_str, sizeof(pid_str), "%d", (int)getpid());
     json_object_object_add(metadata, "service", json_object_new_string(service));
     json_object_object_add(metadata, "tty",     json_object_new_string(tty));
-    json_object_object_add(metadata, "pid",     json_object_new_int(getpid()));
+    json_object_object_add(metadata, "pid",     json_object_new_string(pid_str));
 
     json_object_object_add(req, "type",        json_object_new_string("authenticate"));
     json_object_object_add(req, "user_id",     json_object_new_string(username));
@@ -110,14 +124,31 @@ int send_auth_request(int sock, const char *username, const char *service,
 }
 
 int receive_auth_response(int sock, char *response, size_t response_size) {
-    ssize_t received = recv(sock, response, response_size - 1, 0);
-    if (received <= 0) {
-        log_pam_message(LOG_ERR, "Failed to receive response: %s",
-                        received == 0 ? "connection closed" : strerror(errno));
+    size_t total = 0;
+    /* Loop until the broker closes the connection (n==0) or an error occurs.
+       The broker writes one JSON object then immediately closes the connection,
+       so reading until EOF guarantees we have the complete response even when
+       it arrives across multiple recv() calls (e.g. large device-flow payloads
+       containing base64-encoded QR codes). */
+    while (total < response_size - 1) {
+        ssize_t n = recv(sock, response + total, response_size - 1 - total, 0);
+        if (n < 0) {
+            log_pam_message(LOG_ERR, "Failed to receive response: %s", strerror(errno));
+            return -1;
+        }
+        if (n == 0) break;  /* broker closed connection — full response received */
+        total += n;
+    }
+    if (total == 0) {
+        log_pam_message(LOG_ERR, "Auth response: broker closed connection with no data");
         return -1;
     }
-    response[received] = '\0';
-    log_pam_message(LOG_DEBUG, "Received response: %s", response);
+    if (total == response_size - 1) {
+        log_pam_message(LOG_ERR, "Auth response too large (>= %zu bytes); rejecting", total);
+        return -1;
+    }
+    response[total] = '\0';
+    log_pam_message(LOG_DEBUG, "Received response (%zu bytes)", total);
     return 0;
 }
 
@@ -195,6 +226,11 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
 
     parse_arguments(argc, argv);
     socket_path = get_socket_path(argc, argv);
+
+    if (validate_socket_path(socket_path) != 0) {
+        log_pam_message(LOG_ERR, "Invalid socket path: %s", socket_path);
+        return PAM_AUTHINFO_UNAVAIL;
+    }
 
     log_pam_message(LOG_INFO, "%s v%s authentication started", PAM_MODULE_NAME, PAM_MODULE_VERSION);
 

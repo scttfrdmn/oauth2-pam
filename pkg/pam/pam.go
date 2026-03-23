@@ -9,6 +9,7 @@ import "C"
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"unsafe"
 )
 
@@ -91,9 +92,14 @@ func CloseSocket(sock int) {
 	C.close(C.int(sock))
 }
 
-// IsSocketPathValid returns true if the path is a plausible Unix socket path.
+// IsSocketPathValid returns true if the path is a valid broker socket path.
+// Paths must be under /var/run/oauth2-pam/ to prevent a PAM module option
+// from redirecting traffic to an attacker-controlled socket.
 func IsSocketPathValid(socketPath string) bool {
-	return socketPath != "" && socketPath[0] == '/' && len(socketPath) <= 107
+	return socketPath != "" &&
+		strings.HasPrefix(socketPath, "/var/run/oauth2-pam/") &&
+		len(socketPath) <= 107 &&
+		!strings.Contains(socketPath, "..")
 }
 
 // GetLoginType maps a PAM service name / tty to a login type string.

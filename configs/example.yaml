@@ -1,10 +1,10 @@
-# pam-oauth2 broker configuration
-# Copy to /etc/pam-oauth2/broker.yaml and edit for your environment.
+# oauth2-pam broker configuration
+# Copy to /etc/oauth2-pam/broker.yaml and edit for your environment.
 
 server:
-  socket_path: /var/run/pam-oauth2/broker.sock
+  socket_path: /var/run/oauth2-pam/broker.sock
   log_level: info                          # debug | info | warn | error
-  audit_log: /var/log/pam-oauth2/audit.log
+  audit_log: /var/log/oauth2-pam/audit.log
   read_timeout: 30s
   write_timeout: 30s
 
@@ -39,7 +39,7 @@ providers:
 # Four tiers are tried in order; the first match wins.
 # At least one tier must be configured.
 #
-# Tier 0 — enrollment_file: self-enrolled users (set up with pam-oauth2-enroll)
+# Tier 0 — enrollment_file: self-enrolled users (set up with oauth2-pam-enroll)
 # Tier 1 — rules: built-in YAML rules, zero runtime dependencies
 # Tier 2 — external_script: external binary (JSON stdin → JSON stdout)
 # Tier 3 — http_endpoint: HTTP identity service (POST JSON)
@@ -47,13 +47,13 @@ providers:
 mapper:
 
   # --- Tier 0: enrollment file (optional) ---
-  # Users self-enroll once with: sudo pam-oauth2-enroll --user <local-user>
+  # Users self-enroll once with: sudo oauth2-pam-enroll --user <local-user>
   # The enrollment file maps local Unix usernames to their GitHub logins.
   # On auth, the broker checks whether the PAM-supplied username matches an
   # enrolled GitHub identity before falling through to the other tiers.
   #
   enrollment_enabled: false
-  enrollment_file: /etc/pam-oauth2/enrolled-users.yaml
+  enrollment_file: /etc/oauth2-pam/enrolled-users.yaml
 
   # --- Tier 1: built-in rules ---
   # All match fields within a rule are ANDed; first matching rule wins.
@@ -84,7 +84,7 @@ mapper:
   # a {"local_user": "...", "groups": [...]} JSON object to stdout.
   # Exit non-zero or emit empty/missing local_user to skip to next tier.
   #
-  # external_script: /usr/local/lib/pam-oauth2/map-user.sh
+  # external_script: /usr/local/lib/oauth2-pam/map-user.sh
   # external_script_timeout: 5s
 
   # --- Tier 3: HTTP service (optional) ---
@@ -128,7 +128,7 @@ audit:
 
   outputs:
     - type: file
-      path: /var/log/pam-oauth2/audit.log
+      path: /var/log/oauth2-pam/audit.log
 
     # Uncomment to also log to stdout (useful for journald / Docker)
     # - type: stdout

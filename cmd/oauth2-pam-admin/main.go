@@ -7,7 +7,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
-	"github.com/scttfrdmn/pam-oauth2/internal/ipc"
+	"github.com/scttfrdmn/oauth2-pam/internal/ipc"
 )
 
 var (
@@ -24,8 +24,8 @@ var (
 
 func main() {
 	root := &cobra.Command{
-		Use:   "pam-oauth2-admin",
-		Short: "Admin CLI for the pam-oauth2 authentication broker",
+		Use:   "oauth2-pam-admin",
+		Short: "Admin CLI for the oauth2-pam authentication broker",
 		PersistentPreRun: func(cmd *cobra.Command, args []string) {
 			if verbose {
 				zerolog.SetGlobalLevel(zerolog.DebugLevel)
@@ -37,9 +37,9 @@ func main() {
 	}
 
 	root.PersistentFlags().StringVarP(&socketPath, "socket", "s",
-		"/var/run/pam-oauth2/broker.sock", "Broker Unix socket path")
+		"/var/run/oauth2-pam/broker.sock", "Broker Unix socket path")
 	root.PersistentFlags().StringVarP(&configPath, "config", "c",
-		"/etc/pam-oauth2/broker.yaml", "Broker configuration file")
+		"/etc/oauth2-pam/broker.yaml", "Broker configuration file")
 	root.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "Enable verbose output")
 
 	root.AddCommand(
@@ -65,7 +65,7 @@ func newVersionCmd() *cobra.Command {
 				Str("version", version).
 				Str("build_date", buildDate).
 				Str("git_commit", gitCommit).
-				Msg("pam-oauth2-admin")
+				Msg("oauth2-pam-admin")
 		},
 	}
 }

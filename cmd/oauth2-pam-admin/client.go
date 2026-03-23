@@ -8,10 +8,10 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
-	"github.com/scttfrdmn/pam-oauth2/internal/ipc"
-	"github.com/scttfrdmn/pam-oauth2/pkg/config"
-	"github.com/scttfrdmn/pam-oauth2/pkg/mapper"
-	"github.com/scttfrdmn/pam-oauth2/pkg/provider/github"
+	"github.com/scttfrdmn/oauth2-pam/internal/ipc"
+	"github.com/scttfrdmn/oauth2-pam/pkg/config"
+	"github.com/scttfrdmn/oauth2-pam/pkg/mapper"
+	"github.com/scttfrdmn/oauth2-pam/pkg/provider/github"
 )
 
 // ipcClient is a thin client for the broker IPC socket.

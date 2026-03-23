@@ -17,18 +17,22 @@ import (
 	"io"
 	"net/http"
 	"os/exec"
+	"regexp"
 	"strings"
-	"text/template"
 	"time"
 
 	"github.com/rs/zerolog/log"
-	"github.com/scttfrdmn/pam-oauth2/pkg/config"
-	"github.com/scttfrdmn/pam-oauth2/pkg/enrollment"
-	"github.com/scttfrdmn/pam-oauth2/pkg/provider/github"
+	"github.com/scttfrdmn/oauth2-pam/pkg/config"
+	"github.com/scttfrdmn/oauth2-pam/pkg/enrollment"
+	"github.com/scttfrdmn/oauth2-pam/pkg/provider/github"
 )
 
 // ErrNoMapping is returned when no tier produces a mapping for the identity.
 var ErrNoMapping = fmt.Errorf("no mapping found for identity")
+
+// unixUsernameRe matches valid POSIX portable Unix usernames:
+// starts with letter or underscore, up to 32 chars of [a-z0-9_-].
+var unixUsernameRe = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
 
 // Result is the output of a successful mapping.
 type Result struct {
@@ -48,8 +52,16 @@ type Chain struct {
 // New creates a new mapper Chain from the given config.
 func New(cfg config.MapperConfig) *Chain {
 	return &Chain{
-		cfg:        cfg,
-		httpClient: &http.Client{},
+		cfg: cfg,
+		httpClient: &http.Client{
+			Timeout: 5 * time.Second,
+			// Disallow all redirects: the mapper endpoint is operator-configured
+			// and may be untrusted; following a redirect could reach internal
+			// services (SSRF via 301 → http://169.254.169.254/ etc.).
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}
 }
 
@@ -145,6 +157,11 @@ func mapViaEnrollment(path, localUser, githubLogin string) *Result {
 	if rec == nil {
 		return nil
 	}
+	if !unixUsernameRe.MatchString(rec.LocalUser) {
+		log.Warn().Str("local_user", rec.LocalUser).Str("path", path).
+			Msg("mapper tier0: enrollment record has invalid Unix username; skipping")
+		return nil
+	}
 	return &Result{
 		LocalUser: rec.LocalUser,
 		Groups:    rec.Groups,
@@ -159,12 +176,15 @@ func mapViaRules(rules []config.MappingRule, id *github.Identity) (*Result, erro
 			continue
 		}
 
-		localUser, err := expandTemplate(rule.LocalUser, id)
+		localUser, err := expandLocalUser(rule.LocalUser, id)
 		if err != nil {
-			return nil, fmt.Errorf("mapper rule: expand local_user template: %w", err)
+			return nil, fmt.Errorf("mapper rule: expand local_user: %w", err)
 		}
 		if localUser == "" {
 			return nil, fmt.Errorf("mapper rule: local_user resolved to empty string")
+		}
+		if !unixUsernameRe.MatchString(localUser) {
+			return nil, fmt.Errorf("mapper rule: local_user %q is not a valid Unix username", localUser)
 		}
 
 		return &Result{
@@ -189,21 +209,36 @@ func ruleMatches(m config.MatchCriteria, id *github.Identity) bool {
 	return true
 }
 
-// expandTemplate executes a Go text/template with the Identity as data.
-// Supports {{ .Login }}, {{ .Email }}, {{ .Name }}.
-func expandTemplate(tmplStr string, id *github.Identity) (string, error) {
-	if !strings.Contains(tmplStr, "{{") {
+// expandLocalUser replaces supported placeholder variables in tmplStr with
+// values from the GitHub identity. Supports both Go-template style (for
+// backwards compatibility) and brace-style placeholders:
+//
+//	{{ .Login }}, {{.Login}}, {login}
+//	{{ .Email }}, {{.Email}}, {email}
+//	{{ .Name  }}, {{.Name }}, {name}
+//
+// Any remaining "{{" after substitution is rejected to prevent template
+// injection via GitHub-controlled identity fields.
+func expandLocalUser(tmplStr string, id *github.Identity) (string, error) {
+	if !strings.ContainsAny(tmplStr, "{") {
 		return tmplStr, nil
 	}
-	tmpl, err := template.New("").Parse(tmplStr)
-	if err != nil {
-		return "", err
+	r := strings.NewReplacer(
+		"{{ .Login }}", id.Login,
+		"{{.Login}}", id.Login,
+		"{login}", id.Login,
+		"{{ .Email }}", id.Email,
+		"{{.Email}}", id.Email,
+		"{email}", id.Email,
+		"{{ .Name }}", id.Name,
+		"{{.Name}}", id.Name,
+		"{name}", id.Name,
+	)
+	result := r.Replace(tmplStr)
+	if strings.Contains(result, "{{") {
+		return "", fmt.Errorf("local_user contains unsupported template expression: %q", tmplStr)
 	}
-	var buf strings.Builder
-	if err := tmpl.Execute(&buf, id); err != nil {
-		return "", err
-	}
-	return buf.String(), nil
+	return result, nil
 }
 
 // --- Tier 2: external script ---
@@ -235,6 +270,12 @@ func mapViaScript(ctx context.Context, scriptPath string, id *github.Identity) (
 
 	cmd := exec.CommandContext(ctx, scriptPath)
 	cmd.Stdin = bytes.NewReader(inputJSON)
+	// Restrict the script's environment to prevent information leakage
+	// (e.g., credentials in env vars) and reduce the attack surface.
+	cmd.Env = []string{
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"HOME=/nonexistent",
+	}
 
 	out, err := cmd.Output()
 	if err != nil {
