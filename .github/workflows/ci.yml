@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The Linux job is the real one: it is the only place the PAM module compiles,
+  # and the only place SO_PEERCRED (peercred_linux.go, the per-UID rate limiter)
+  # is more than dead code.
+  linux:
+    name: Linux — build, vet, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install PAM and json-c headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpam0g-dev libjson-c-dev
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l ./cmd ./pkg ./internal ./test)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt would change these files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test -race ./...
+
+      # `make build` verifies with nm that all six pam_sm_* entry points made it
+      # into the .so. v0.1.1 shipped a module with none, and nothing failed.
+      - name: Build all binaries and verify PAM entry points
+        run: make build
+
+  # Proves the module's cgo is quarantined: cmd/pam-module/main.go must stay
+  # buildable off Linux, or the project cannot be developed on a Mac.
+  macos:
+    name: macOS — build and test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install PAM and json-c headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpam0g-dev libjson-c-dev
+      # Installed directly rather than via golangci-lint-action, whose v6 line
+      # predates golangci-lint v2 and drives it with removed flags. The version
+      # is pinned so a new release cannot turn a green branch red by adding
+      # linters; see .golangci.yml.
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+
+      - run: golangci-lint run ./...
+
+  # The only job that exercises oauth2_pam.so in a real PAM stack: real sshd,
+  # real broker, real Unix socket, with GitHub faked. Go tests cannot reach this
+  # half of the protocol, and it is where the v0.1.x auth bypass would resurface.
+  integration:
+    name: Container harness — real sshd + PAM
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # The driver dumps both sides' logs itself when a case fails, then tears
+      # the stack down — so there is nothing left for a follow-up log step to
+      # collect.
+      - name: Run the harness
+        run: make test-integration

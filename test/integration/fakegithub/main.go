@@ -187,7 +187,7 @@ func (s *state) controlMux() http.Handler {
 			s.outcome = o
 			s.mu.Unlock()
 			log.Printf("control: outcome = %s", o)
-			fmt.Fprintf(w, "%s\n", o)
+			_, _ = fmt.Fprintf(w, "%s\n", o)
 		}
 	}
 
@@ -207,7 +207,7 @@ func (s *state) controlMux() http.Handler {
 		s.login = login
 		s.mu.Unlock()
 		log.Printf("control: login = %s", login)
-		fmt.Fprintf(w, "%s\n", login)
+		_, _ = fmt.Fprintf(w, "%s\n", login)
 	})
 
 	mux.HandleFunc("/control/reset", func(w http.ResponseWriter, r *http.Request) {
@@ -216,7 +216,7 @@ func (s *state) controlMux() http.Handler {
 		s.polls, s.revoked = 0, nil
 		s.mu.Unlock()
 		log.Printf("control: reset")
-		fmt.Fprintln(w, "reset")
+		_, _ = fmt.Fprintln(w, "reset")
 	})
 
 	mux.HandleFunc("/control/state", func(w http.ResponseWriter, r *http.Request) {

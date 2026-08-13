@@ -292,6 +292,33 @@ func TestMappedUserMustMatchRequestedLogin(t *testing.T) {
 	}
 }
 
+// TestMappedUserMatchingRequestedLoginAuthorizes is the companion to the test
+// above. Without it, TestMappedUserMustMatchRequestedLogin would also pass if a
+// login as bob could never succeed for some unrelated reason, and the mismatch
+// check it exists to cover would be untested.
+func TestMappedUserMatchingRequestedLoginAuthorizes(t *testing.T) {
+	h := newHarness(t)
+
+	// Same login attempt as the mismatch test; the only change is who GitHub
+	// says the authorizing user is.
+	h.fake.setLogin("bob")
+
+	start := h.authenticate("bob")
+	if start.Status != auth.StatusPending {
+		t.Fatalf("status = %q, want pending", start.Status)
+	}
+
+	h.fake.grant()
+
+	resp := h.waitForTerminal(start.SessionID)
+	if !resp.Success {
+		t.Fatalf("status = %q (%s), want an authorized login as bob", resp.Status, resp.ErrorCode)
+	}
+	if resp.UserID != "bob" {
+		t.Errorf("user_id = %q, want %q", resp.UserID, "bob")
+	}
+}
+
 // TestUserDenialAtProviderIsDenied covers the RFC 8628 access_denied path.
 func TestUserDenialAtProviderIsDenied(t *testing.T) {
 	h := newHarness(t)

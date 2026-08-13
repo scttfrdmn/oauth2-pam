@@ -752,10 +752,7 @@ func isTransientError(err error) bool {
 		return false
 	}
 	var netErr net.Error
-	if errors.As(err, &netErr) {
-		return true
-	}
-	return false
+	return errors.As(err, &netErr)
 }
 
 // --- session helpers ---

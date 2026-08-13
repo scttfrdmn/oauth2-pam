@@ -1,0 +1,8 @@
+# Pinned so CI and a local `golangci-lint run` agree. The standard set
+# (errcheck, govet, ineffassign, staticcheck, unused) is what this codebase is
+# clean against; adding linters is a deliberate act, not a side effect of
+# upgrading the tool.
+version: "2"
+
+linters:
+  default: standard
