@@ -342,6 +342,42 @@ static void parse_arguments(int argc, const char **argv, struct module_options *
     debug_enabled = opts->debug;
 }
 
+/* monotonic_seconds is the clock the poll loop measures its deadline against.
+   CLOCK_REALTIME will not do: ntpd, chronyd and `hwclock --hctosys` can step it
+   at any moment, and a freshly booted or just-reconnected host — precisely where
+   the first ssh login happens — is where that step is largest. A backward step
+   would extend the login window past timeout=, a forward one would abandon a
+   user mid-approval. CLOCK_MONOTONIC cannot be stepped. */
+static long monotonic_seconds(void) {
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        /* Cannot happen on Linux with a valid clock id. Degrade to the realtime
+           clock rather than treating the login as expired. */
+        return (long)time(NULL);
+    }
+    return (long)ts.tv_sec;
+}
+
+/* sleep_seconds waits the full interval even if signals arrive.
+   sleep() returns early on any signal and discards the unslept remainder, and
+   during a keyboard-interactive exchange signals do arrive: SIGWINCH when the
+   user resizes the terminal, SIGALRM from sshd's login grace timer. Each one
+   would shorten a poll interval, driving more requests at the broker and at
+   GitHub — whose device endpoint answers slow_down when polled too fast.
+   nanosleep hands back the remaining time so the loop can finish it. */
+static void sleep_seconds(long seconds) {
+    struct timespec remaining;
+
+    if (seconds <= 0) return;
+    remaining.tv_sec  = (time_t)seconds;
+    remaining.tv_nsec = 0;
+
+    while (nanosleep(&remaining, &remaining) == -1 && errno == EINTR) {
+        /* Interrupted by a signal; finish what is left of the interval. */
+    }
+}
+
 /* broker_roundtrip opens a connection, sends one request and reads the reply.
    send_fn does the request-specific serialization. Returns 0 on success with
    *out set (caller frees), -1 on any transport or parse failure. */
@@ -433,7 +469,7 @@ static int terminal_status_to_pam(const struct broker_response *r, const char *u
 static int poll_for_authorization(pam_handle_t *pamh, const struct module_options *opts,
                                   const char *username, const char *session_id,
                                   int poll_interval) {
-    time_t deadline = time(NULL) + opts->auth_timeout;
+    long deadline = monotonic_seconds() + opts->auth_timeout;
     int consecutive_failures = 0;
     const int max_consecutive_failures = 3;
 
@@ -469,13 +505,13 @@ static int poll_for_authorization(pam_handle_t *pamh, const struct module_option
             free(r);
         }
 
-        if (time(NULL) + poll_interval > deadline) {
+        if (monotonic_seconds() + poll_interval > deadline) {
             log_pam_message(LOG_NOTICE,
                             "Timed out after %ds waiting for %s to authorize",
                             opts->auth_timeout, username);
             return PAM_AUTH_ERR;
         }
-        sleep((unsigned int)poll_interval);
+        sleep_seconds(poll_interval);
     }
 }
 
