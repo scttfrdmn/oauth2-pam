@@ -52,7 +52,7 @@ jobs:
       - uses: github/codeql-action/autobuild@988661ebb5e81487b3fb31b2185d2856c0a10679 # v4
 
       - name: Analyze
-        uses: github/codeql-action/analyze@988661ebb5e81487b3fb31b2185d2856c0a10679 # v4
+        uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4
 
   # Relevant surface here: file modes on the enrollment store and audit log, the
   # exec.Command in the tier-2 mapper, and the AES-GCM usage in pkg/security.
