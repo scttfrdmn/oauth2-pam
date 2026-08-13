@@ -4,7 +4,9 @@
 server:
   socket_path: /var/run/oauth2-pam/broker.sock
   log_level: info                          # debug | info | warn | error
-  audit_log: /var/log/oauth2-pam/audit.log
+
+  # Deadlines applied to each IPC connection. Raise read_timeout if a slow
+  # identity-mapping service makes the PAM module's calls time out.
   read_timeout: 30s
   write_timeout: 30s
 
@@ -42,7 +44,7 @@ providers:
 # Tier 0 — enrollment_file: self-enrolled users (set up with oauth2-pam-enroll)
 # Tier 1 — rules: built-in YAML rules, zero runtime dependencies
 # Tier 2 — external_script: external binary (JSON stdin → JSON stdout)
-# Tier 3 — http_endpoint: HTTP identity service (POST JSON)
+# Tier 3 — http_endpoint: HTTPS identity service (POST JSON)
 
 mapper:
 
@@ -56,8 +58,10 @@ mapper:
   enrollment_file: /etc/oauth2-pam/enrolled-users.yaml
 
   # --- Tier 1: built-in rules ---
-  # All match fields within a rule are ANDed; first matching rule wins.
-  # local_user supports {{ .Login }} template (expands to GitHub login).
+  # All match fields within a rule are ANDed, and matching is case-insensitive;
+  # the first matching rule wins. local_user supports the {{ .Login }},
+  # {{ .Email }}, and {{ .Name }} templates, and must expand to a valid POSIX
+  # username — which has to be the same name the user is logging in as.
 
   rules:
     # Org admins get sudo
@@ -92,7 +96,10 @@ mapper:
   # Expected response: {"local_user":"...","groups":[...]}
   # Return 404 or 204 to indicate no mapping (falls through to next tier).
   #
-  # http_endpoint: http://localhost:8082/map
+  # The endpoint must be HTTPS — a plain http:// URL is rejected at startup —
+  # and redirects are refused outright to avoid an SSRF vector into your network.
+  #
+  # http_endpoint: https://identity.internal.example/map
   # http_timeout: 2s
 
 # ---------------------------------------------------------------------------
@@ -113,9 +120,16 @@ security:
   # token_encryption_key must be exactly 16, 24, or 32 characters
   # Generate with: openssl rand -hex 16
   # token_encryption_key: "change-me-32-byte-key-here!!!!!"
+
+  # Upper bound on how long a stored token may live. Must be >= token_lifetime
+  # above; the broker refuses to start otherwise.
   max_token_age: 24h
+
   rate_limiting:
+    # Per-UID sliding window on IPC requests (Linux, via SO_PEERCRED).
     max_requests_per_minute: 60
+    # Ceiling on device flows awaiting approval broker-wide. Further
+    # authenticate requests are refused until one finishes or expires.
     max_concurrent_auths: 10
 
 # ---------------------------------------------------------------------------
@@ -138,8 +152,23 @@ audit:
     #   facility: auth
     #   severity: info
 
+  # Only these event types are written; everything else is dropped and counted.
+  # Omit the list entirely to record every event. An unrecognised name here is
+  # a startup error rather than a silent hole in the audit trail, so this list
+  # must be a subset of:
+  #
+  #   authentication_attempt   a login attempt began (a device flow started)
+  #   authentication_success   a login was authorized
+  #   authentication_failed    the attempt failed (provider or broker error)
+  #   authentication_denied    the attempt was refused (denial, org/team, or
+  #                            a mapped user that is not the login name)
+  #   device_flow_failed       the device flow itself could not be started
+  #   session_revoked          a session was revoked
+  #
   events:
     - authentication_attempt
     - authentication_success
-    - authentication_failure
+    - authentication_failed
+    - authentication_denied
+    - device_flow_failed
     - session_revoked

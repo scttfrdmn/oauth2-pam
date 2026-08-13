@@ -16,6 +16,14 @@ func GenerateQRCode(url string) (string, error) {
 	return qr.ToSmallString(false), nil
 }
 
+// The instructions below are delivered to the user as the body of a PAM
+// prompt: the module appends its own "press Enter once you have approved"
+// line and then blocks on the reply before it starts polling the broker.
+//
+// So none of these may promise that authorization completes on its own. It
+// does not — a user who approves on their phone and waits, having been told
+// waiting is all that is required, sits there until the login times out.
+
 // FormatDeviceInstructions formats the device flow prompt for SSH / generic terminal.
 func FormatDeviceInstructions(deviceURL, userCode, qrCode string) string {
 	var b strings.Builder
@@ -37,7 +45,7 @@ func FormatDeviceInstructions(deviceURL, userCode, qrCode string) string {
 	b.WriteString(userCode)
 	b.WriteString("\n\n")
 
-	b.WriteString("Waiting for authorization... (completes automatically)\n")
+	b.WriteString("Approve the request in your browser, then return here.\n")
 	b.WriteString("═══════════════════════════════════════════════════\n")
 
 	return b.String()
@@ -59,7 +67,7 @@ func FormatConsoleInstructions(deviceURL, userCode, qrCode string) string {
 	b.WriteString(deviceURL)
 	b.WriteString("\nCode:   ")
 	b.WriteString(userCode)
-	b.WriteString("\n\nWaiting...")
+	b.WriteString("\n\nApprove the request, then return here.")
 
 	return b.String()
 }
@@ -73,8 +81,8 @@ func FormatGUIInstructions(deviceURL, userCode, qrCode string) string {
 	b.WriteString(deviceURL)
 	b.WriteString("\n2. Enter code: ")
 	b.WriteString(userCode)
-	b.WriteString("\n3. Sign in with your GitHub account\n\n")
-	b.WriteString("This dialog will close automatically once authentication is complete.")
+	b.WriteString("\n3. Sign in with your GitHub account\n")
+	b.WriteString("4. Return here and confirm to finish signing in")
 
 	return b.String()
 }

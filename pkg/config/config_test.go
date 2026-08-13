@@ -300,3 +300,29 @@ func TestEnvironmentOverridesScalars(t *testing.T) {
 		t.Errorf("log_level = %q, want the environment override %q", cfg.Server.LogLevel, "warn")
 	}
 }
+
+// TestShippedExampleConfigIsValid loads configs/example.yaml the way an
+// operator would. It shipped with an `http://` mapper endpoint that Validate
+// rejects, so the documented starting point was one the broker refused to
+// start from.
+func TestShippedExampleConfigIsValid(t *testing.T) {
+	path := filepath.Join("..", "..", "configs", "example.yaml")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("the example config is missing: %v", err)
+	}
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig(%s): %v", path, err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("the shipped example config does not validate: %v", err)
+	}
+
+	// Every audit event the example lists must be one the broker actually
+	// emits; Validate enforces that, so a typo here fails above.
+	if len(cfg.Audit.Events) != len(KnownAuditEvents) {
+		t.Errorf("the example lists %d audit events, want all %d",
+			len(cfg.Audit.Events), len(KnownAuditEvents))
+	}
+}
