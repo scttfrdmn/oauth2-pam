@@ -1,4 +1,4 @@
-.PHONY: build test test-unit test-integration install clean lint fmt vet tidy help
+.PHONY: build test test-unit test-integration verify-linux install clean lint fmt vet tidy help
 
 # Build variables
 BINARY_DIR := bin
@@ -86,6 +86,24 @@ test-unit:
 test-integration:
 	@echo "Running container integration harness..."
 	test/integration/run-tests.sh
+
+## Run the Linux vet/test/lint sweep in a container, cgo packages included
+##
+## On macOS the module cannot be compiled at all, so `go build ./...`,
+## `go test ./...` and golangci-lint all silently exclude cmd/pam-module — the
+## most security-sensitive package here. This is the same sweep CI runs, with the
+## headers present. Answers "does the Linux build compile and pass"; use
+## test-integration to answer "does a login work".
+verify-linux:
+	@echo "Building the verification image..."
+	@docker build -q -f test/docker/Dockerfile.verify -t oauth2-pam-verify . >/dev/null
+	@echo "Running vet, tests and lint under Linux..."
+	docker run --rm \
+		-v "$(PWD)":/src \
+		-v oauth2-pam-verify-gocache:/root/.cache/go-build \
+		-v oauth2-pam-verify-gomod:/go/pkg/mod \
+		oauth2-pam-verify \
+		sh -c 'go build ./... && go vet ./... && go test -race ./... && golangci-lint run ./...'
 
 ## Install binaries to system locations
 install: build
@@ -186,6 +204,7 @@ help:
 	@echo "  test              Run all tests"
 	@echo "  test-unit         Run unit tests only"
 	@echo "  test-integration  Run the container harness (needs Docker)"
+	@echo "  verify-linux      Vet, test and lint under Linux, cgo included (needs Docker)"
 	@echo "  install           Install binaries to system"
 	@echo "  install-dev       Install development version"
 	@echo "  clean             Clean build artifacts"

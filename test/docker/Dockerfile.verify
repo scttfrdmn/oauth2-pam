@@ -1,0 +1,28 @@
+# The image behind `make verify-linux`: the vet/test/lint sweep CI runs, but with
+# the PAM and json-c headers present, so cmd/pam-module is genuinely included
+# rather than skipped. On macOS `go build ./...` cannot link against libpam, so
+# without this the only way to compile the C locally is to push and read CI.
+#
+# The source is not copied in — the Makefile target mounts the working tree, so
+# an edit is picked up without rebuilding the image.
+FROM golang:1.24-bookworm
+
+# Above any source, so editing a file does not re-run apt-get.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      libpam0g-dev \
+      libjson-c-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# The golang images set GOTOOLCHAIN=local, which pins the toolchain to the one in
+# the image. CI leaves it at the default (auto), and golangci-lint is built with a
+# newer Go than this project targets — so without this, the install below fails
+# here while succeeding in CI. Building the project itself still uses the image's
+# 1.24, because that is what go.mod asks for.
+ENV GOTOOLCHAIN=auto
+
+# Pinned to the same version as .github/workflows/ci.yml. If these drift, a local
+# sweep passes and CI fails, which is the exact problem this image exists to stop.
+RUN go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+
+WORKDIR /src

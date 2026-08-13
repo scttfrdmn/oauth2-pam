@@ -5,6 +5,70 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Security scanning in CI** (`.github/workflows/security.yml`): CodeQL with
+  `security-extended`, gosec with SARIF upload, govulncheck, dependency review on
+  pull requests, and OpenSSF Scorecard, plus a weekly schedule. CodeQL installs
+  the PAM headers so `cmd/pam-module` is actually analyzed rather than silently
+  skipped. ([#18](https://github.com/scttfrdmn/oauth2-pam/issues/18))
+- **A release workflow** (`.github/workflows/release.yml`) and
+  `scripts/release.sh`. Tags build amd64 and arm64 on native runners and publish
+  `.tar.gz` + `.sha256` archives containing the module, the three binaries,
+  `configs/`, and an installer. Two gates run before anything is published: the
+  tag must agree with the README version badge and the CHANGELOG, and the built
+  `.so` must export all six `pam_sm_*` entry points.
+  ([#19](https://github.com/scttfrdmn/oauth2-pam/issues/19))
+- `SECURITY.md`, issue and pull-request templates, and `CODEOWNERS`. The security
+  policy records what is verified and what is not — including that no login
+  against real github.com has ever been exercised by the test suite.
+  ([#21](https://github.com/scttfrdmn/oauth2-pam/issues/21))
+- `.github/dependabot.yml` for Go modules, actions, and the harness base images.
+  ([#20](https://github.com/scttfrdmn/oauth2-pam/issues/20))
+- `make verify-linux`: the full vet/test/lint sweep in a container, so the cgo
+  packages are covered from a Mac instead of only in CI.
+  ([#25](https://github.com/scttfrdmn/oauth2-pam/issues/25))
+- `oauth2-pam-admin gen-key` generates a `token_encryption_key`, and the new
+  `pkg/security/keys` package holds the key rules — generation, validation and
+  decoding — in one place that both `config.Validate` and cipher construction
+  call. Nothing previously shipped a way to produce a valid key, which is how
+  memorable passphrases end up in a 256-bit slot. `token_encryption_key` now also
+  accepts the base64 form `gen-key` prints (44 characters); 16, 24, or 32 raw
+  characters still work. `scripts/install-release.sh` generates a key when it
+  writes a fresh config. ([#24](https://github.com/scttfrdmn/oauth2-pam/issues/24))
+- `peerUID` implementations for darwin and freebsd, plus a stub for everything
+  else, so the broker's rate limiter no longer attributes every unidentifiable
+  peer to UID 0 — root's real UID. Unknown peers now share a sentinel bucket that
+  cannot collide with a real UID, and the broker logs whether peer credentials are
+  available at all. ([#23](https://github.com/scttfrdmn/oauth2-pam/issues/23))
+
+### Fixed
+
+- **The device-flow poll loop measured its deadline with the wall clock.** An NTP
+  or `hwclock` step could extend a login window past `timeout=` or abandon a user
+  mid-approval — most likely on a freshly booted host, which is exactly where the
+  first ssh login happens. It now uses `CLOCK_MONOTONIC`. The loop also slept with
+  `sleep()`, which returns early on any signal and discards the remainder, so a
+  `SIGWINCH` from a terminal resize shortened the interval and polled GitHub
+  faster than configured; it now finishes the interval with `nanosleep`.
+  ([#22](https://github.com/scttfrdmn/oauth2-pam/issues/22))
+
+### Changed
+
+- GitHub Actions are pinned to full commit SHAs rather than floating tags.
+  ([#20](https://github.com/scttfrdmn/oauth2-pam/issues/20))
+- Audit events that record an access decision — `authentication_success`,
+  `authentication_failed`, `authentication_denied`, `session_revoked` — are
+  written synchronously instead of queued, so a crash or a full queue cannot
+  discard the record of who was let in. The high-volume `authentication_attempt`
+  is still buffered. ([#24](https://github.com/scttfrdmn/oauth2-pam/issues/24))
+- Key and token plaintext copies are zeroized once they are no longer needed, and
+  `Encryption.Destroy` drops the cipher. Both are documented as narrowing a window
+  rather than erasing a secret — Go offers no way to do the latter.
+  ([#24](https://github.com/scttfrdmn/oauth2-pam/issues/24))
+
 ## [0.2.0] - 2026-08-13
 
 Authentication did not work in 0.1.x, and the way it failed was unsafe. Two

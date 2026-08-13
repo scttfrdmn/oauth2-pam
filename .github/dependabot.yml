@@ -1,0 +1,45 @@
+# Pinning actions to SHAs (see the note in ci.yml) trades a supply-chain risk for
+# an unpatched-dependency risk unless something bumps the pins. That is this file.
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+
+  # The harness images. golang: and debian: base tags move, and the client image
+  # is where the PAM module is actually loaded, so a stale base there is a stale
+  # libpam.
+  - package-ecosystem: "docker"
+    directories:
+      - "/test/integration"
+      - "/test/docker"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "testing"
+    commit-message:
+      prefix: "test"
+      include: "scope"

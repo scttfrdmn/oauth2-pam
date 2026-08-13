@@ -52,17 +52,26 @@ go vet ./...
 go test -race ./...
 golangci-lint run ./... # version pinned in .github/workflows/ci.yml
 gofmt -l ./cmd ./pkg ./internal ./test
+make verify-linux       # the same sweep under Linux, with the cgo packages included
 make test-integration   # needs Docker; see test/integration/README.md
 ```
 
-On macOS, add a second lint pass for the files a Mac never compiles
-(`peercred_linux.go`, `cgo_bridge_linux.c`'s Go side):
+`make verify-linux` runs build, vet, `test -race` and lint in a container with the
+PAM and json-c headers present. It matters because a Mac cannot compile
+`cmd/pam-module` at all, so `go build ./...`, `go test ./...` and golangci-lint all
+*silently skip* the most security-sensitive package in the repo — and
+`peercred_linux.go` with it. It answers "does the Linux build compile and pass";
+`make test-integration` answers "does a login work".
+
+If you would rather not build the image, the narrower version is a lint pass for
+the files a Mac never compiles:
 
 ```sh
 GOOS=linux golangci-lint run ./...
 ```
 
-Without it, `_linux.go` files are invisible to local lint and first fail in CI.
+Without one or the other, `_linux.go` files are invisible locally and first fail
+in CI.
 
 CI runs all of it on every push and pull request: Linux (where the module
 compiles and `SO_PEERCRED` is real), macOS (where it must still build), lint, and

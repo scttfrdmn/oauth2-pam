@@ -1,0 +1,161 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # Runs before anything is built. v0.1.1 and v0.2.0 were tagged, released and
+  # annotated by hand, which is how release notes and a version badge drift from
+  # the tag they describe. Cheaper to fail here than to edit a published release.
+  verify-version:
+    name: Verify the tag agrees with the docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check README badge and CHANGELOG match the tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          fail=0
+
+          # [^)]+ rather than [^-]+ so a pre-release version like 0.3.0-rc.1,
+          # which contains a dash, still matches.
+          badge=$(grep -oE 'badge/version-[^)]+-blue' README.md | head -1 | sed -E 's#badge/version-(.+)-blue#\1#')
+          if [ "$badge" != "$VERSION" ]; then
+            echo "::error::README version badge is '$badge' but the tag is '$VERSION'. Use scripts/release.sh."
+            fail=1
+          fi
+
+          if ! grep -qE "^## \[${VERSION}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [${VERSION}]' section. Use scripts/release.sh."
+            fail=1
+          fi
+
+          [ "$fail" -eq 0 ] || exit 1
+          echo "Tag, README badge and CHANGELOG all say $VERSION."
+
+  build:
+    name: Build (${{ matrix.arch }})
+    needs: verify-version
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs_on: ubuntu-latest
+          - arch: arm64
+            runs_on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install PAM and json-c headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpam0g-dev libjson-c-dev
+
+      - name: Set build variables
+        id: vars
+        run: |
+          {
+            echo "version=${GITHUB_REF_NAME}"
+            echo "ldflags=-s -w -X main.version=${GITHUB_REF_NAME} -X main.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ) -X main.gitCommit=$(git rev-parse --short HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+      # Native runners rather than cross-compilation: the module is
+      # -buildmode=c-shared against the host's libpam and libjson-c, so an arm64
+      # artifact has to be linked on arm64.
+      - name: Build the three binaries
+        env:
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p bin
+          for c in broker:oauth2-pam-broker \
+                   oauth2-pam-admin:oauth2-pam-admin \
+                   oauth2-pam-enroll:oauth2-pam-enroll; do
+            go build -trimpath -ldflags="${{ steps.vars.outputs.ldflags }}" \
+              -o "bin/${c#*:}" "./cmd/${c%%:*}"
+          done
+
+      - name: Build the PAM module
+        env:
+          CGO_ENABLED: 1
+        run: |
+          go build -buildmode=c-shared -trimpath -ldflags="${{ steps.vars.outputs.ldflags }}" \
+            -o bin/oauth2_pam.so ./cmd/pam-module
+          rm -f bin/oauth2_pam.h
+
+      # The release gate, not a formality. v0.1.1 published a .so with none of
+      # these symbols and nothing noticed for a month; the sister project is
+      # still shipping one (oidc-pam#140). A release that publishes a module PAM
+      # cannot load is worse than no release, because the artifact looks official.
+      - name: Verify the PAM entry points made it into the artifact
+        run: |
+          for sym in pam_sm_authenticate pam_sm_setcred pam_sm_acct_mgmt \
+                     pam_sm_open_session pam_sm_close_session pam_sm_chauthtok; do
+            nm -D --defined-only bin/oauth2_pam.so | grep -q " T $sym\$" \
+              || { echo "::error::MISSING ENTRY POINT: $sym"; exit 1; }
+          done
+          echo "All six pam_sm_* entry points present."
+
+      - name: Create archive
+        run: |
+          DIR="oauth2-pam-${{ steps.vars.outputs.version }}-linux-${{ matrix.arch }}"
+          mkdir -p "$DIR"
+          cp bin/oauth2-pam-broker bin/oauth2-pam-admin bin/oauth2-pam-enroll \
+             bin/oauth2_pam.so "$DIR/"
+          cp -r configs "$DIR/configs"
+          cp README.md CHANGELOG.md SECURITY.md LICENSE "$DIR/"
+          install -m 0755 scripts/install-release.sh "$DIR/install.sh"
+          tar czf "$DIR.tar.gz" "$DIR"
+          sha256sum "$DIR.tar.gz" > "$DIR.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: |
+            oauth2-pam-*.tar.gz
+            oauth2-pam-*.tar.gz.sha256
+          retention-days: 1
+
+  release:
+    name: Publish the GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-linux-*
+          merge-multiple: true
+          path: dist/
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          # verify-version already proved this section exists.
+          awk -v v="${VERSION#v}" '
+            $0 ~ "^## \\[" v "\\]" { inside = 1; next }
+            inside && /^## \[/      { exit }
+            inside                  { print }
+          ' CHANGELOG.md > notes.md
+
+          gh release create "$VERSION" \
+            --title "oauth2-pam $VERSION" \
+            --notes-file notes.md \
+            --verify-tag \
+            dist/*.tar.gz dist/*.sha256

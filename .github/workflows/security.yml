@@ -1,0 +1,159 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # A new advisory can land against a dependency this repo has not touched in
+  # months, so the scans cannot only run on pushes.
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # CodeQL is the only tool here that reasons across function boundaries, which
+  # is what this codebase needs: the v0.1.x bypass was a two-step data flow —
+  # Success: true set in pkg/auth/broker.go, read and trusted in the C bridge.
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Without these, autobuild still succeeds — it just quietly skips
+      # cmd/pam-module, which is the most security-sensitive package in the repo.
+      - name: Install PAM and json-c headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpam0g-dev libjson-c-dev
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@988661ebb5e81487b3fb31b2185d2856c0a10679 # v4
+        with:
+          languages: go
+          queries: security-extended,security-and-quality
+
+      - uses: github/codeql-action/autobuild@988661ebb5e81487b3fb31b2185d2856c0a10679 # v4
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@988661ebb5e81487b3fb31b2185d2856c0a10679 # v4
+
+  # Relevant surface here: file modes on the enrollment store and audit log, the
+  # exec.Command in the tier-2 mapper, and the AES-GCM usage in pkg/security.
+  gosec:
+    name: gosec
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install PAM and json-c headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpam0g-dev libjson-c-dev
+
+      # continue-on-error on purpose: gosec is a linter with opinions, and a
+      # false positive should not block a merge while its finding still lands in
+      # the Security tab for triage. The gates that must stay hard are in ci.yml.
+      - name: Run gosec
+        continue-on-error: true
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
+          gosec -fmt sarif -out gosec.sarif -exclude-dir=test ./...
+
+      - name: Upload results
+        uses: github/codeql-action/upload-sarif@988661ebb5e81487b3fb31b2185d2856c0a10679 # v4
+        with:
+          sarif_file: gosec.sarif
+          category: gosec
+
+  # Reachability-based, so it reports the subset of advisories that touch code
+  # this project actually calls rather than everything in go.sum.
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install PAM and json-c headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpam0g-dev libjson-c-dev
+
+      - name: Run govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  dependency-review:
+    name: Dependency review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: moderate
+          # This project is MIT and links a c-shared object into sshd's address
+          # space; a copyleft dependency arriving unnoticed is a licensing
+          # problem, not a style preference.
+          deny-licenses: GPL-2.0, GPL-3.0, AGPL-3.0
+
+  # Supply-chain posture. It will have opinions about branch protection and
+  # signed releases; the pinned actions in ci.yml are already partly its doing.
+  scorecard:
+    name: OpenSSF Scorecard
+    runs-on: ubuntu-latest
+    # publish_results needs a push or schedule event on the default branch; on a
+    # pull_request the action fails outright rather than degrading.
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      security-events: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
+        with:
+          results_file: scorecard.sarif
+          results_format: sarif
+          publish_results: true
+
+      - uses: github/codeql-action/upload-sarif@988661ebb5e81487b3fb31b2185d2856c0a10679 # v4
+        with:
+          sarif_file: scorecard.sarif
+          category: scorecard

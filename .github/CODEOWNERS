@@ -1,0 +1,34 @@
+# Single-maintainer repo, so this is not review routing — it is a list of the
+# paths where a change decides who gets a shell, and therefore where a review
+# should be slower than usual.
+
+*                       @scttfrdmn
+
+# The PAM module runs as root inside sshd and is the only client of the auth
+# contract. Both of this project's serious defects lived here.
+/cmd/pam-module/        @scttfrdmn
+
+# The session state machine: Success == true iff Status == StatusAuthorized.
+/pkg/auth/              @scttfrdmn
+
+# The socket, peer credentials, rate limiting, request validation.
+/internal/ipc/          @scttfrdmn
+
+# Token encryption and the audit trail.
+/pkg/security/          @scttfrdmn
+
+# Decides which GitHub identity becomes which Unix user.
+/pkg/mapper/            @scttfrdmn
+
+# Validation is load-bearing: HTTPS enforcement, key lengths, endpoint checks.
+/pkg/config/            @scttfrdmn
+
+# The only thing that exercises the module in a real PAM stack.
+/test/integration/      @scttfrdmn
+
+# Anything that can change what gets built, scanned, or published.
+/.github/workflows/     @scttfrdmn
+/Makefile               @scttfrdmn
+/scripts/               @scttfrdmn
+/go.mod                 @scttfrdmn
+/go.sum                 @scttfrdmn
