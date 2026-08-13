@@ -28,11 +28,37 @@ build-broker:
 	@mkdir -p $(BINARY_DIR)
 	go build $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(BROKER_BINARY) ./cmd/broker
 
-## Build PAM module
+## Build PAM module (Linux only — needs Linux-PAM headers and json-c)
 build-pam:
+	@if [ "$$(go env GOOS)" != "linux" ]; then \
+		echo "build-pam: skipped — the PAM module requires Linux (Linux-PAM headers"; \
+		echo "  and json-c). Build it in a Linux container:"; \
+		echo "    make docker-build-pam"; \
+		exit 1; \
+	fi
 	@echo "Building PAM module..."
 	@mkdir -p $(BINARY_DIR)
 	CGO_ENABLED=1 go build -buildmode=c-shared $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(PAM_MODULE) ./cmd/pam-module
+	@echo "Verifying PAM entry points are present..."
+	@if command -v nm >/dev/null 2>&1; then \
+		count=$$(nm -D --defined-only $(BINARY_DIR)/$(PAM_MODULE) 2>/dev/null | grep -c ' pam_sm_'); \
+		if [ "$$count" -lt 6 ]; then \
+			echo "ERROR: $(PAM_MODULE) exports $$count pam_sm_* symbols, expected 6."; \
+			echo "  PAM cannot load a module without entry points. Is the C file"; \
+			echo "  still part of the cmd/pam-module package?"; \
+			exit 1; \
+		fi; \
+		echo "  $$count pam_sm_* entry points present"; \
+	fi
+
+## Build the PAM module in a Linux container (works from macOS)
+docker-build-pam:
+	@echo "Building PAM module in a Linux container..."
+	@mkdir -p $(BINARY_DIR)
+	docker run --rm -v "$(PWD)":/src -w /src golang:1.24 sh -c '\
+		apt-get update -qq && \
+		apt-get install -y -qq libpam0g-dev libjson-c-dev >/dev/null && \
+		make build-pam'
 
 ## Build admin CLI tool
 build-admin:
@@ -126,7 +152,13 @@ release: clean
 	@echo "Creating release build..."
 	@mkdir -p $(BINARY_DIR)
 	GOOS=linux GOARCH=amd64 go build $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(BROKER_BINARY)-linux-amd64 ./cmd/broker
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=1 go build -buildmode=c-shared $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(PAM_MODULE)-linux-amd64 ./cmd/pam-module
+	@# The PAM module needs cgo against Linux-PAM, so it cannot be
+	@# cross-compiled from macOS; build it on Linux (or via docker-build-pam).
+	@if [ "$$(go env GOOS)" = "linux" ]; then \
+		GOOS=linux GOARCH=amd64 CGO_ENABLED=1 go build -buildmode=c-shared $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(PAM_MODULE)-linux-amd64 ./cmd/pam-module; \
+	else \
+		echo "release: skipping $(PAM_MODULE) — requires a Linux build host (see docker-build-pam)"; \
+	fi
 	GOOS=linux GOARCH=amd64 go build $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(ADMIN_BINARY)-linux-amd64 ./cmd/oauth2-pam-admin
 	GOOS=linux GOARCH=amd64 go build $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(ENROLL_BINARY)-linux-amd64 ./cmd/oauth2-pam-enroll
 	GOOS=linux GOARCH=arm64 go build $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(BROKER_BINARY)-linux-arm64 ./cmd/broker
@@ -148,7 +180,8 @@ help:
 	@echo "Available targets:"
 	@echo "  build             Build all binaries"
 	@echo "  build-broker      Build authentication broker daemon"
-	@echo "  build-pam         Build PAM module (.so)"
+	@echo "  build-pam         Build PAM module (.so) — Linux only"
+	@echo "  docker-build-pam  Build the PAM module in a Linux container"
 	@echo "  build-admin       Build admin CLI tool"
 	@echo "  test              Run all tests"
 	@echo "  test-unit         Run unit tests only"
