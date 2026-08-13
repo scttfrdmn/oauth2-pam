@@ -151,7 +151,10 @@ jobs:
         env:
           GOTOOLCHAIN: auto
         run: |
-          major=$(awk '/^go [0-9]/ { print $2; exit }' go.mod)
+          # cut, because the go directive is written either way — `go 1.25` or
+          # `go 1.25.0`, and `go get` rewrites one into the other. Only the major
+          # belongs in the prefix match below.
+          major=$(awk '/^go [0-9]/ { print $2; exit }' go.mod | cut -d. -f1,2)
           toolchain=$(curl -fsSL 'https://go.dev/dl/?mode=json' \
             | jq -er --arg prefix "go${major}." \
                 '[.[] | select(.stable) | .version | select(startswith($prefix))] | first')
