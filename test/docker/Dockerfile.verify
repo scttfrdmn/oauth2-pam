@@ -5,7 +5,7 @@
 #
 # The source is not copied in — the Makefile target mounts the working tree, so
 # an edit is picked up without rebuilding the image.
-FROM golang:1.24-bookworm
+FROM golang:1.25-bookworm
 
 # Above any source, so editing a file does not re-run apt-get.
 RUN apt-get update \
@@ -16,10 +16,9 @@ RUN apt-get update \
 
 # The golang images set GOTOOLCHAIN=local, and so does actions/setup-go v6+. That
 # is the right default for building this project — no silent toolchain
-# substitution — but golangci-lint is built with a newer Go than go.mod targets, so
-# installing it needs the default resolution back. ci.yml scopes the same override
-# to its install step. Building the project still uses the image's 1.24, because
-# that is what go.mod asks for.
+# substitution — but a tool installed below may be built with a newer Go than this
+# image ships, and then the install fails outright. ci.yml scopes the same
+# override to its install step.
 ENV GOTOOLCHAIN=auto
 
 # Pinned to the same version as .github/workflows/ci.yml. If these drift, a local

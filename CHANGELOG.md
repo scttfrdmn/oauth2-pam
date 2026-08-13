@@ -68,6 +68,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Encryption.Destroy` drops the cipher. Both are documented as narrowing a window
   rather than erasing a secret — Go offers no way to do the latter.
   ([#24](https://github.com/scttfrdmn/oauth2-pam/issues/24))
+- **The minimum Go version is now 1.25** (from 1.24). Go backports security fixes
+  to the two newest majors only, so 1.24 is end-of-life: with `go 1.24.0` in
+  go.mod, CI's `GOTOOLCHAIN=local` build used a toolchain with 33 standard-library
+  advisories reachable from this code, and no 1.24.x pin could ever clear them.
+  govulncheck reports zero under 1.25. The pin is the language version rather than
+  a patch release, so any 1.25.x toolchain satisfies it.
 
 ## [0.2.0] - 2026-08-13
 

@@ -1,6 +1,6 @@
 module github.com/scttfrdmn/oauth2-pam
 
-go 1.24.0
+go 1.25
 
 require (
 	github.com/rs/zerolog v1.34.0

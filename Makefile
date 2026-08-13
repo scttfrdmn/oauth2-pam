@@ -55,7 +55,7 @@ build-pam:
 docker-build-pam:
 	@echo "Building PAM module in a Linux container..."
 	@mkdir -p $(BINARY_DIR)
-	docker run --rm -v "$(PWD)":/src -w /src golang:1.24 sh -c '\
+	docker run --rm -v "$(PWD)":/src -w /src golang:1.25 sh -c '\
 		apt-get update -qq && \
 		apt-get install -y -qq libpam0g-dev libjson-c-dev >/dev/null && \
 		make build-pam'

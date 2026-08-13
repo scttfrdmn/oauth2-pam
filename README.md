@@ -38,7 +38,7 @@ host   └───────────────────────�
 
 ## Requirements
 
-- Go 1.24+
+- Go 1.25+ (1.24 is end-of-life and no longer receives security backports)
 - Linux with PAM (`libpam0g-dev`)
 - `libjson-c-dev`
 - A GitHub OAuth App with Device Flow enabled
