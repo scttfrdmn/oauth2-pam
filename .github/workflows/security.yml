@@ -110,14 +110,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # check-latest matters here more than anywhere else. go.mod names a major
-      # (`go 1.25`), and without this setup-go takes whatever 1.25.x the runner
-      # image has cached — which lags the current release. Most of what
-      # govulncheck reports against this project is the standard library of the
-      # toolchain it ran under, all of it "fixed in" the newest patch, so a stale
-      # cached toolchain fails the job for reasons no change to this repository
-      # can address. GOTOOLCHAIN=local (exported by setup-go v6+) means nothing
-      # upgrades it after the fact.
+      # This go is only used to install govulncheck and to resolve the module
+      # graph; the toolchain the scan actually analyzes with is chosen in the run
+      # step below, and for the reason explained there it is not this one.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -129,14 +124,40 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libpam0g-dev libjson-c-dev
 
+      # Most of what govulncheck reports against this project is not in its code
+      # or its dependencies — it is the standard library of the toolchain the scan
+      # ran under, every finding "fixed in" a Go patch that is already out. And
+      # setup-go cannot install that patch: it installs from actions/go-versions,
+      # a manifest that trails a Go release by days to weeks (at the time of
+      # writing, go1.25.13 was published and the manifest's newest 1.25.x was
+      # 1.25.12, which is five reachable stdlib advisories). check-latest above
+      # does not help, because the manifest is what it re-reads.
+      #
+      # So the scan resolves the newest patch of the major go.mod pins and hands
+      # it to GOTOOLCHAIN, which fetches toolchains from the module proxy — that
+      # is current the moment a release lands. What remains gated is what this
+      # repository can actually act on: an advisory still reachable under the
+      # newest patch of the pinned major, which means the code, a dependency, or
+      # the major itself has to move.
+      #
+      # If the major goes end-of-life it drops out of go.dev/dl (only the two
+      # newest are listed), `jq -e` fails on the empty result, and the job stops
+      # with it. That is the intended behaviour: a toolchain nobody patches any
+      # more is the finding.
       - name: Run govulncheck
-        # See the note on gosec: GOTOOLCHAIN=local from setup-go blocks installing
-        # a tool that requires a newer Go than go.mod targets.
+        # GOTOOLCHAIN=auto for the install, for the reason given on gosec:
+        # setup-go v6+ exports local, which blocks installing a tool built with a
+        # newer Go than go.mod targets.
         env:
           GOTOOLCHAIN: auto
         run: |
+          major=$(awk '/^go [0-9]/ { print $2; exit }' go.mod)
+          toolchain=$(curl -fsSL 'https://go.dev/dl/?mode=json' \
+            | jq -er --arg prefix "go${major}." \
+                '[.[] | select(.stable) | .version | select(startswith($prefix))] | first')
+          echo "go.mod pins go${major}; scanning with ${toolchain}"
           go install golang.org/x/vuln/cmd/govulncheck@latest
-          govulncheck ./...
+          GOTOOLCHAIN="$toolchain" govulncheck ./...
 
   dependency-review:
     name: Dependency review

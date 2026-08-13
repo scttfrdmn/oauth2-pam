@@ -28,12 +28,17 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # check-latest: go.mod names a major (`go 1.25`), and the default is to use
-      # whatever 1.25.x the runner image cached, which lags the current release by
-      # weeks. Building and testing on the newest patch of the pinned major is
-      # what keeps this job honest about the toolchain a release is built with —
-      # and it is what stops govulncheck in security.yml from failing on
-      # standard-library advisories already fixed upstream.
+      # check-latest: go.mod names a major (`go 1.25`), and the default is to build
+      # with whatever 1.25.x the runner image already cached, which trails the
+      # current release. This gets the newest patch setup-go can offer, so a
+      # standard-library fix reaches these jobs — and release.yml — without
+      # waiting for the runner image to be rebuilt. It stays inside the major
+      # go.mod pins; it will not move to 1.26.
+      #
+      # It only trails less, it does not track: setup-go installs from the
+      # actions/go-versions manifest, which itself lags a Go release. Where that
+      # gap is load-bearing — govulncheck — the toolchain is chosen differently;
+      # see security.yml.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
