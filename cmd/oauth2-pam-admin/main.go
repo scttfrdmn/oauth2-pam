@@ -6,8 +6,8 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
-	"github.com/spf13/cobra"
 	"github.com/scttfrdmn/oauth2-pam/internal/ipc"
+	"github.com/spf13/cobra"
 )
 
 var (

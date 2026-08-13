@@ -117,24 +117,6 @@ func (tm *TokenManager) StoreToken(sessionID, userID, accessToken, refreshToken 
 	return tokenID, nil
 }
 
-// getToken retrieves a stored token by ID.
-// Note: when stored.Encrypted == true, AccessToken contains AES-GCM ciphertext.
-// Use GetDecryptedAccessToken for the plaintext access token.
-func (tm *TokenManager) getToken(tokenID string) (*StoredToken, error) {
-	tm.tokenStore.mutex.RLock()
-	stored, ok := tm.tokenStore.tokens[tokenID]
-	tm.tokenStore.mutex.RUnlock()
-
-	if !ok {
-		return nil, fmt.Errorf("token not found: %s", tokenID)
-	}
-	if stored.ExpiresAt.Before(time.Now()) {
-		return nil, fmt.Errorf("token expired")
-	}
-
-	return stored, nil
-}
-
 // RevokeToken removes a token from the store.
 func (tm *TokenManager) RevokeToken(tokenID string) {
 	tm.tokenStore.mutex.Lock()

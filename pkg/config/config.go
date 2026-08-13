@@ -1,12 +1,27 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"strings"
 	"time"
 
 	"github.com/spf13/viper"
 )
+
+// KnownAuditEvents lists every event type the broker emits. audit.events
+// filters against this set, and Validate rejects names that are not in it:
+// a typo in the allowlist would otherwise silently punch a hole in the audit
+// trail.
+var KnownAuditEvents = []string{
+	"authentication_attempt",
+	"authentication_success",
+	"authentication_failed",
+	"authentication_denied",
+	"device_flow_failed",
+	"session_revoked",
+}
 
 // Config represents the complete configuration for the oauth2-pam broker
 type Config struct {
@@ -18,11 +33,17 @@ type Config struct {
 	Audit          AuditConfig          `mapstructure:"audit"`
 }
 
-// ServerConfig contains server-specific configuration
+// ServerConfig contains server-specific configuration.
+//
+// There is deliberately no audit_log field: audit destinations are configured
+// under audit.outputs, and a second setting that looked like it also chose one
+// but was ignored was worse than no setting at all.
 type ServerConfig struct {
-	SocketPath   string        `mapstructure:"socket_path"`
-	LogLevel     string        `mapstructure:"log_level"`
-	AuditLog     string        `mapstructure:"audit_log"`
+	SocketPath string `mapstructure:"socket_path"`
+	LogLevel   string `mapstructure:"log_level"`
+
+	// ReadTimeout bounds how long the broker waits for a complete request
+	// from a connected client; WriteTimeout bounds sending the response.
 	ReadTimeout  time.Duration `mapstructure:"read_timeout"`
 	WriteTimeout time.Duration `mapstructure:"write_timeout"`
 }
@@ -31,7 +52,7 @@ type ServerConfig struct {
 // Currently "github" is the only supported type.
 type ProviderConfig struct {
 	Name         string `mapstructure:"name"`
-	Type         string `mapstructure:"type"`          // "github"
+	Type         string `mapstructure:"type"` // "github"
 	ClientID     string `mapstructure:"client_id"`
 	ClientSecret string `mapstructure:"client_secret"`
 
@@ -136,10 +157,10 @@ type RateLimiting struct {
 
 // AuditConfig contains audit logging configuration
 type AuditConfig struct {
-	Enabled  bool          `mapstructure:"enabled"`
-	Format   string        `mapstructure:"format"`
-	Outputs  []AuditOutput `mapstructure:"outputs"`
-	Events   []string      `mapstructure:"events"`
+	Enabled bool          `mapstructure:"enabled"`
+	Format  string        `mapstructure:"format"`
+	Outputs []AuditOutput `mapstructure:"outputs"`
+	Events  []string      `mapstructure:"events"`
 }
 
 // AuditOutput defines where audit logs are sent
@@ -152,7 +173,12 @@ type AuditOutput struct {
 	Severity string            `mapstructure:"severity"`
 }
 
-// LoadConfig loads configuration from a YAML file
+// LoadConfig loads configuration from a YAML file.
+//
+// The file is required. Environment variables (OAUTH2_PAM_*) can override
+// scalar values that have defaults, but they cannot stand in for the file: the
+// providers list is a slice, which AutomaticEnv cannot populate, and Validate
+// requires at least one provider.
 func LoadConfig(configPath string) (*Config, error) {
 	v := viper.New()
 
@@ -165,10 +191,13 @@ func LoadConfig(configPath string) (*Config, error) {
 	v.AutomaticEnv()
 
 	if err := v.ReadInConfig(); err != nil {
-		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
-			return loadFromEnvironment(v)
+		// SetConfigFile names the file explicitly, so a missing file arrives as
+		// an *fs.PathError, never as viper.ConfigFileNotFoundError (which only
+		// occurs when searching for a config by name across search paths).
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("config file not found: %s", configPath)
 		}
-		return nil, fmt.Errorf("failed to read config file: %w", err)
+		return nil, fmt.Errorf("failed to read config file %s: %w", configPath, err)
 	}
 
 	var config Config
@@ -179,19 +208,9 @@ func LoadConfig(configPath string) (*Config, error) {
 	return &config, nil
 }
 
-// loadFromEnvironment builds a minimal config from environment variables
-func loadFromEnvironment(v *viper.Viper) (*Config, error) {
-	var config Config
-	if err := v.Unmarshal(&config); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal config from environment: %w", err)
-	}
-	return &config, nil
-}
-
 func setDefaults(v *viper.Viper) {
 	v.SetDefault("server.socket_path", "/var/run/oauth2-pam/broker.sock")
 	v.SetDefault("server.log_level", "info")
-	v.SetDefault("server.audit_log", "/var/log/oauth2-pam/audit.log")
 	v.SetDefault("server.read_timeout", "30s")
 	v.SetDefault("server.write_timeout", "30s")
 
@@ -210,12 +229,7 @@ func setDefaults(v *viper.Viper) {
 
 	v.SetDefault("audit.enabled", true)
 	v.SetDefault("audit.format", "json")
-	v.SetDefault("audit.events", []string{
-		"authentication_attempt",
-		"authentication_success",
-		"authentication_failure",
-		"session_revoked",
-	})
+	v.SetDefault("audit.events", KnownAuditEvents)
 }
 
 // Validate validates the configuration
@@ -256,6 +270,29 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("authentication.max_concurrent_sessions must be non-negative (0 = unlimited)")
 	}
 
+	// A session cannot outlive the token it is built on.
+	if c.Security.MaxTokenAge > 0 && c.Authentication.TokenLifetime > c.Security.MaxTokenAge {
+		return fmt.Errorf("authentication.token_lifetime (%s) must not exceed security.max_token_age (%s)",
+			c.Authentication.TokenLifetime, c.Security.MaxTokenAge)
+	}
+
+	if c.Server.ReadTimeout < 0 {
+		return fmt.Errorf("server.read_timeout must not be negative")
+	}
+	if c.Server.WriteTimeout < 0 {
+		return fmt.Errorf("server.write_timeout must not be negative")
+	}
+	if c.Security.RateLimiting.MaxConcurrentAuths < 0 {
+		return fmt.Errorf("security.rate_limiting.max_concurrent_auths must be non-negative (0 = unlimited)")
+	}
+
+	for _, e := range c.Audit.Events {
+		if !isKnownAuditEvent(e) {
+			return fmt.Errorf("audit.events contains unknown event type %q (known: %s)",
+				e, strings.Join(KnownAuditEvents, ", "))
+		}
+	}
+
 	// AES key must be 16, 24, or 32 bytes for AES-128/192/256.
 	if c.Security.SecureTokenStorage && c.Security.TokenEncryptionKey != "" {
 		keyLen := len(c.Security.TokenEncryptionKey)
@@ -279,4 +316,13 @@ func (c *Config) Validate() error {
 	}
 
 	return nil
+}
+
+func isKnownAuditEvent(name string) bool {
+	for _, k := range KnownAuditEvents {
+		if k == name {
+			return true
+		}
+	}
+	return false
 }

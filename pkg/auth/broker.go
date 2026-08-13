@@ -127,12 +127,12 @@ type AuthRequest struct {
 // of Status == StatusAuthorized and nothing else; see the Status* constants.
 type AuthResponse struct {
 	Success          bool
-	Status           string   // one of the Status* constants
-	UserID           string   // local Unix username; set only when authorized
+	Status           string // one of the Status* constants
+	UserID           string // local Unix username; set only when authorized
 	Email            string
 	Groups           []string
 	SessionID        string
-	DeviceCode       string   // user-visible code (e.g. "ABCD-1234")
+	DeviceCode       string // user-visible code (e.g. "ABCD-1234")
 	DeviceURL        string
 	QRCode           string
 	ExpiresAt        time.Time
@@ -269,6 +269,18 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 
 	// Bound in-flight device flows for this user, evicting the oldest.
 	b.evictExcessPendingFlows(req.UserID)
+
+	// Global cap on device flows awaiting authorization. Each one holds a
+	// goroutine polling the provider, so this bounds the work a burst of login
+	// attempts can create broker-wide.
+	if max := b.config.Security.RateLimiting.MaxConcurrentAuths; max > 0 {
+		if n := b.countPendingFlows(); n >= max {
+			log.Warn().Int("pending", n).Int("max", max).
+				Msg("Concurrent device flow limit reached; rejecting authentication")
+			return errorResponse("AUTH_LIMIT_REACHED",
+				"Too many authentications in progress; try again shortly"), nil
+		}
+	}
 
 	// Start device flow
 	deviceFlow, err := provider.StartDeviceFlow(b.ctx)
@@ -567,141 +579,141 @@ func (b *Broker) pollDeviceAuthorization(sessionID string, provider *github.Prov
 
 			// Get a snapshot of the current session state (holds no live pointer).
 			{
-			current := b.getSession(sessionID)
-			if current == nil {
-				// Session was removed externally (revoked or timed out).
-				return
-			}
-
-			// Map to local user; retry transient errors up to 3x.
-			var mapResult *mapper.Result
-			for attempt := 1; attempt <= 3; attempt++ {
-				mapResult, err = b.mapper.Map(b.ctx, identity, current.RequestedLocalUser)
-				if err == nil {
-					break
+				current := b.getSession(sessionID)
+				if current == nil {
+					// Session was removed externally (revoked or timed out).
+					return
 				}
-				if !isTransientError(err) || attempt == 3 {
-					log.Error().Err(err).Int("attempt", attempt).
+
+				// Map to local user; retry transient errors up to 3x.
+				var mapResult *mapper.Result
+				for attempt := 1; attempt <= 3; attempt++ {
+					mapResult, err = b.mapper.Map(b.ctx, identity, current.RequestedLocalUser)
+					if err == nil {
+						break
+					}
+					if !isTransientError(err) || attempt == 3 {
+						log.Error().Err(err).Int("attempt", attempt).
+							Str("session_id", sessionID).
+							Str("github_login", identity.Login).
+							Msg("Identity mapping failed")
+						b.auditLogger.LogAuthEvent(security.AuditEvent{
+							EventType:    "authentication_failed",
+							UserID:       identity.Login,
+							SessionID:    sessionID,
+							Provider:     provider.Name(),
+							Success:      false,
+							ErrorMessage: err.Error(),
+							Timestamp:    time.Now(),
+						})
+						// No mapping is a decision (this identity has no local
+						// account); anything else is an operational failure.
+						status := StatusError
+						if errors.Is(err, mapper.ErrNoMapping) {
+							status = StatusDenied
+						}
+						b.failSession(sessionID, status, "No local account mapping for this identity")
+						return
+					}
+					log.Warn().Err(err).Int("attempt", attempt).
+						Str("session_id", sessionID).Msg("Transient error mapping identity, retrying")
+					time.Sleep(2 * time.Second)
+				}
+
+				// The mapped local user must be the account the login was for.
+				// This is the authoritative check: the broker will not activate a
+				// session whose mapped user differs from the requested one, so a
+				// stale or hostile client cannot skip it. Without this, an
+				// identity mapping to "alice" would authorize `ssh root@host`.
+				if current.RequestedLocalUser != "" && mapResult.LocalUser != current.RequestedLocalUser {
+					log.Warn().
 						Str("session_id", sessionID).
+						Str("requested_user", current.RequestedLocalUser).
+						Str("mapped_user", mapResult.LocalUser).
 						Str("github_login", identity.Login).
-						Msg("Identity mapping failed")
+						Msg("Mapped local user does not match requested login; denying")
 					b.auditLogger.LogAuthEvent(security.AuditEvent{
-						EventType:    "authentication_failed",
-						UserID:       identity.Login,
+						EventType:    "authentication_denied",
+						UserID:       current.RequestedLocalUser,
 						SessionID:    sessionID,
 						Provider:     provider.Name(),
 						Success:      false,
-						ErrorMessage: err.Error(),
+						ErrorMessage: "mapped local user does not match requested login",
 						Timestamp:    time.Now(),
+						Metadata: map[string]interface{}{
+							"github_login":   identity.Login,
+							"requested_user": current.RequestedLocalUser,
+							"mapped_user":    mapResult.LocalUser,
+						},
 					})
-					// No mapping is a decision (this identity has no local
-					// account); anything else is an operational failure.
-					status := StatusError
-					if errors.Is(err, mapper.ErrNoMapping) {
-						status = StatusDenied
-					}
-					b.failSession(sessionID, status, "No local account mapping for this identity")
+					b.failSession(sessionID, StatusDenied,
+						"Authenticated identity is not authorized for this account")
 					return
 				}
-				log.Warn().Err(err).Int("attempt", attempt).
-					Str("session_id", sessionID).Msg("Transient error mapping identity, retrying")
-				time.Sleep(2 * time.Second)
-			}
 
-			// The mapped local user must be the account the login was for.
-			// This is the authoritative check: the broker will not activate a
-			// session whose mapped user differs from the requested one, so a
-			// stale or hostile client cannot skip it. Without this, an
-			// identity mapping to "alice" would authorize `ssh root@host`.
-			if current.RequestedLocalUser != "" && mapResult.LocalUser != current.RequestedLocalUser {
-				log.Warn().
-					Str("session_id", sessionID).
-					Str("requested_user", current.RequestedLocalUser).
-					Str("mapped_user", mapResult.LocalUser).
-					Str("github_login", identity.Login).
-					Msg("Mapped local user does not match requested login; denying")
+				// Store the token in the encrypted token manager.
+				tokenLifetime := b.config.Authentication.TokenLifetime
+				if tokenLifetime <= 0 {
+					tokenLifetime = 8 * time.Hour
+				}
+				tokenID, err := b.tokenManager.StoreToken(
+					sessionID, mapResult.LocalUser,
+					token.AccessToken, "",
+					time.Now().Add(tokenLifetime),
+				)
+				if err != nil {
+					log.Error().Err(err).Str("session_id", sessionID).Msg("Failed to store token")
+					b.failSession(sessionID, StatusError, "Internal error storing credentials")
+					return
+				}
+
+				// Guard: if the session was revoked while we were fetching identity /
+				// mapping / storing the token, discard the result rather than
+				// recreating a session the admin just removed.
+				if b.getSession(sessionID) == nil {
+					b.tokenManager.RevokeToken(tokenID)
+					log.Info().Str("session_id", sessionID).
+						Msg("Session revoked during device flow; discarding authentication result")
+					return
+				}
+
+				// Update the session snapshot and write it back under the mutex.
+				current.LocalUser = mapResult.LocalUser
+				current.GitHubLogin = identity.Login
+				current.Email = identity.Email
+				current.Groups = mapResult.Groups
+				current.TokenFingerprint = token.Fingerprint
+				current.TokenID = tokenID
+				current.Status = StatusAuthorized
+				current.IsActive = true
+				// The session now governs a live login rather than a device code,
+				// so switch to the configured session lifetime.
+				current.ExpiresAt = time.Now().Add(tokenLifetime)
+				current.LastAccessed = time.Now()
+				b.setSession(current)
+
 				b.auditLogger.LogAuthEvent(security.AuditEvent{
-					EventType:    "authentication_denied",
-					UserID:       current.RequestedLocalUser,
-					SessionID:    sessionID,
-					Provider:     provider.Name(),
-					Success:      false,
-					ErrorMessage: "mapped local user does not match requested login",
-					Timestamp:    time.Now(),
+					EventType:  "authentication_success",
+					UserID:     mapResult.LocalUser,
+					Email:      identity.Email,
+					Groups:     mapResult.Groups,
+					SessionID:  sessionID,
+					Provider:   provider.Name(),
+					AuthMethod: "github_device_flow",
+					Success:    true,
+					Timestamp:  time.Now(),
 					Metadata: map[string]interface{}{
-						"github_login":   identity.Login,
-						"requested_user": current.RequestedLocalUser,
-						"mapped_user":    mapResult.LocalUser,
+						"github_login": identity.Login,
+						"github_orgs":  identity.Orgs,
 					},
 				})
-				b.failSession(sessionID, StatusDenied,
-					"Authenticated identity is not authorized for this account")
+
+				log.Info().
+					Str("session_id", sessionID).
+					Str("local_user", mapResult.LocalUser).
+					Str("github_login", identity.Login).
+					Msg("Authentication successful")
 				return
-			}
-
-			// Store the token in the encrypted token manager.
-			tokenLifetime := b.config.Authentication.TokenLifetime
-			if tokenLifetime <= 0 {
-				tokenLifetime = 8 * time.Hour
-			}
-			tokenID, err := b.tokenManager.StoreToken(
-				sessionID, mapResult.LocalUser,
-				token.AccessToken, "",
-				time.Now().Add(tokenLifetime),
-			)
-			if err != nil {
-				log.Error().Err(err).Str("session_id", sessionID).Msg("Failed to store token")
-				b.failSession(sessionID, StatusError, "Internal error storing credentials")
-				return
-			}
-
-			// Guard: if the session was revoked while we were fetching identity /
-			// mapping / storing the token, discard the result rather than
-			// recreating a session the admin just removed.
-			if b.getSession(sessionID) == nil {
-				b.tokenManager.RevokeToken(tokenID)
-				log.Info().Str("session_id", sessionID).
-					Msg("Session revoked during device flow; discarding authentication result")
-				return
-			}
-
-			// Update the session snapshot and write it back under the mutex.
-			current.LocalUser = mapResult.LocalUser
-			current.GitHubLogin = identity.Login
-			current.Email = identity.Email
-			current.Groups = mapResult.Groups
-			current.TokenFingerprint = token.Fingerprint
-			current.TokenID = tokenID
-			current.Status = StatusAuthorized
-			current.IsActive = true
-			// The session now governs a live login rather than a device code,
-			// so switch to the configured session lifetime.
-			current.ExpiresAt = time.Now().Add(tokenLifetime)
-			current.LastAccessed = time.Now()
-			b.setSession(current)
-
-			b.auditLogger.LogAuthEvent(security.AuditEvent{
-				EventType:  "authentication_success",
-				UserID:     mapResult.LocalUser,
-				Email:      identity.Email,
-				Groups:     mapResult.Groups,
-				SessionID:  sessionID,
-				Provider:   provider.Name(),
-				AuthMethod: "github_device_flow",
-				Success:    true,
-				Timestamp:  time.Now(),
-				Metadata: map[string]interface{}{
-					"github_login": identity.Login,
-					"github_orgs":  identity.Orgs,
-				},
-			})
-
-			log.Info().
-				Str("session_id", sessionID).
-				Str("local_user", mapResult.LocalUser).
-				Str("github_login", identity.Login).
-				Msg("Authentication successful")
-			return
 			} // end inner block
 		}
 	}
@@ -773,6 +785,20 @@ func (b *Broker) countUserSessions(userID string) int {
 			continue
 		}
 		if s.RequestedLocalUser == userID || s.LocalUser == userID {
+			count++
+		}
+	}
+	return count
+}
+
+// countPendingFlows returns the number of device flows awaiting authorization
+// across all users.
+func (b *Broker) countPendingFlows() int {
+	b.sessionMutex.RLock()
+	defer b.sessionMutex.RUnlock()
+	count := 0
+	for _, s := range b.sessions {
+		if s.Status == StatusPending && !s.IsActive {
 			count++
 		}
 	}

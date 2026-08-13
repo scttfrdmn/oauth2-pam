@@ -41,12 +41,23 @@ type AuditOutput interface {
 
 // AuditLogger manages async audit event dispatch to one or more outputs.
 type AuditLogger struct {
-	config       config.AuditConfig
-	outputs      []AuditOutput
-	eventChan    chan AuditEvent
-	stopChan     chan struct{}
-	wg           sync.WaitGroup
-	droppedCount atomic.Uint64
+	config config.AuditConfig
+	// enabledEvents is the audit.events allowlist. A nil map means "no filter
+	// configured", which allows every event — an empty allowlist that silently
+	// discarded the entire audit trail would be a trap.
+	enabledEvents map[string]struct{}
+	outputs       []AuditOutput
+	eventChan     chan AuditEvent
+	stopChan      chan struct{}
+	wg            sync.WaitGroup
+	droppedCount  atomic.Uint64
+	filteredCount atomic.Uint64
+}
+
+// FilteredEvents returns the number of events not written because their type
+// was absent from the audit.events allowlist.
+func (al *AuditLogger) FilteredEvents() uint64 {
+	return al.filteredCount.Load()
 }
 
 // DroppedEvents returns the number of audit events dropped due to a full channel.
@@ -76,11 +87,25 @@ func NewAuditLogger(cfg config.AuditConfig) (*AuditLogger, error) {
 	}
 
 	return &AuditLogger{
-		config:    cfg,
-		outputs:   outputs,
-		eventChan: make(chan AuditEvent, 1000),
-		stopChan:  make(chan struct{}),
+		config:        cfg,
+		enabledEvents: buildEventFilter(cfg.Events),
+		outputs:       outputs,
+		eventChan:     make(chan AuditEvent, 1000),
+		stopChan:      make(chan struct{}),
 	}, nil
+}
+
+// buildEventFilter turns the configured event list into a lookup set, or nil
+// when no list is configured (meaning: log everything).
+func buildEventFilter(events []string) map[string]struct{} {
+	if len(events) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(events))
+	for _, e := range events {
+		set[e] = struct{}{}
+	}
+	return set
 }
 
 // Start starts the audit logger background dispatcher.
@@ -106,10 +131,17 @@ func (al *AuditLogger) Stop() error {
 	return nil
 }
 
-// LogAuthEvent queues an audit event for async writing.
+// LogAuthEvent queues an audit event for async writing. Events whose type is
+// not in the configured audit.events allowlist are discarded here.
 func (al *AuditLogger) LogAuthEvent(event AuditEvent) {
 	if !al.config.Enabled {
 		return
+	}
+	if al.enabledEvents != nil {
+		if _, ok := al.enabledEvents[event.EventType]; !ok {
+			al.filteredCount.Add(1)
+			return
+		}
 	}
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now()

@@ -24,25 +24,31 @@ const maxRequestSize = 64 * 1024 // 64 KB
 
 // Server handles IPC communication between the PAM module and the broker.
 type Server struct {
-	socketPath  string
-	broker      *auth.Broker
-	listener    net.Listener
-	rateLimiter *rateLimiter
-	stopChan    chan struct{}
-	wg          sync.WaitGroup
-	stopOnce    sync.Once
+	socketPath   string
+	broker       *auth.Broker
+	listener     net.Listener
+	rateLimiter  *rateLimiter
+	readTimeout  time.Duration
+	writeTimeout time.Duration
+	stopChan     chan struct{}
+	wg           sync.WaitGroup
+	stopOnce     sync.Once
 }
+
+// defaultIOTimeout applies when server.read_timeout / server.write_timeout are
+// unset or non-positive.
+const defaultIOTimeout = 30 * time.Second
 
 // Request is a message from the PAM module.
 type Request struct {
-	Type       string                 `json:"type"`       // authenticate, check_session, refresh_session, revoke_session
-	UserID     string                 `json:"user_id"`
-	SourceIP   string                 `json:"source_ip"`
-	UserAgent  string                 `json:"user_agent"`
-	TargetHost string                 `json:"target_host"`
-	LoginType  string                 `json:"login_type"` // ssh, console, gui
-	DeviceID   string                 `json:"device_id"`
-	SessionID  string                 `json:"session_id"`
+	Type       string            `json:"type"` // authenticate, check_session, refresh_session, revoke_session
+	UserID     string            `json:"user_id"`
+	SourceIP   string            `json:"source_ip"`
+	UserAgent  string            `json:"user_agent"`
+	TargetHost string            `json:"target_host"`
+	LoginType  string            `json:"login_type"` // ssh, console, gui
+	DeviceID   string            `json:"device_id"`
+	SessionID  string            `json:"session_id"`
 	Metadata   map[string]string `json:"metadata"`
 }
 
@@ -56,32 +62,44 @@ type Request struct {
 // The one exception is the revoke_session reply, which carries no Status; there
 // Success means "the session was revoked".
 type Response struct {
-	Success          bool                   `json:"success"`
-	Status           string                 `json:"status"`
-	UserID           string                 `json:"user_id"`
-	Email            string                 `json:"email"`
-	Groups           []string               `json:"groups"`
-	SessionID        string                 `json:"session_id"`
-	DeviceCode       string                 `json:"device_code"`
-	DeviceURL        string                 `json:"device_url"`
-	QRCode           string                 `json:"qr_code"`
-	ExpiresAt        time.Time              `json:"expires_at"`
-	RequiresDevice   bool                   `json:"requires_device"`
-	RequiresApproval bool                   `json:"requires_approval"`
-	ErrorCode        string                 `json:"error_code"`
-	ErrorMessage     string                 `json:"error_message"`
-	Instructions     string                 `json:"instructions"`
+	Success          bool              `json:"success"`
+	Status           string            `json:"status"`
+	UserID           string            `json:"user_id"`
+	Email            string            `json:"email"`
+	Groups           []string          `json:"groups"`
+	SessionID        string            `json:"session_id"`
+	DeviceCode       string            `json:"device_code"`
+	DeviceURL        string            `json:"device_url"`
+	QRCode           string            `json:"qr_code"`
+	ExpiresAt        time.Time         `json:"expires_at"`
+	RequiresDevice   bool              `json:"requires_device"`
+	RequiresApproval bool              `json:"requires_approval"`
+	ErrorCode        string            `json:"error_code"`
+	ErrorMessage     string            `json:"error_message"`
+	Instructions     string            `json:"instructions"`
 	Metadata         map[string]string `json:"metadata"`
 }
 
 // NewServer creates a new IPC server.
 func NewServer(socketPath string, broker *auth.Broker, cfg *config.Config) (*Server, error) {
 	rl := newRateLimiter(cfg.Security.RateLimiting.MaxRequestsPerMinute)
+
+	readTimeout := cfg.Server.ReadTimeout
+	if readTimeout <= 0 {
+		readTimeout = defaultIOTimeout
+	}
+	writeTimeout := cfg.Server.WriteTimeout
+	if writeTimeout <= 0 {
+		writeTimeout = defaultIOTimeout
+	}
+
 	return &Server{
-		socketPath:  socketPath,
-		broker:      broker,
-		rateLimiter: rl,
-		stopChan:    make(chan struct{}),
+		socketPath:   socketPath,
+		broker:       broker,
+		rateLimiter:  rl,
+		readTimeout:  readTimeout,
+		writeTimeout: writeTimeout,
+		stopChan:     make(chan struct{}),
 	}, nil
 }
 
@@ -185,7 +203,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	defer s.wg.Done()
 	defer func() { _ = conn.Close() }()
 
-	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(s.readTimeout))
 
 	// Reject requests that exceed the size limit before JSON decoding.
 	limited := io.LimitReader(conn, maxRequestSize+1)
@@ -193,18 +211,21 @@ func (s *Server) handleConnection(conn net.Conn) {
 	var req Request
 	if err := json.NewDecoder(limited).Decode(&req); err != nil {
 		log.Error().Err(err).Msg("Decode IPC request")
+		_ = conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
 		s.sendError(conn, "INVALID_REQUEST", "Failed to decode request")
 		return
 	}
 
 	if err := validateRequest(&req); err != nil {
 		log.Warn().Err(err).Msg("Invalid IPC request fields")
+		_ = conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
 		s.sendError(conn, "INVALID_REQUEST", "Invalid request fields")
 		return
 	}
 
 	resp := s.dispatch(&req)
 
+	_ = conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
 	if err := json.NewEncoder(conn).Encode(resp); err != nil {
 		log.Error().Err(err).Msg("Encode IPC response")
 	}
@@ -353,7 +374,7 @@ func (s *Server) sendError(conn net.Conn, code, message string) {
 
 // sendErrorOnConn is used before the deadline is set (e.g. rate-limit rejection).
 func (s *Server) sendErrorOnConn(conn net.Conn, code, message string) {
-	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
 	s.sendError(conn, code, message)
 }
 

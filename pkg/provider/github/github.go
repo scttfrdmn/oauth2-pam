@@ -110,8 +110,8 @@ type gitHubOrg struct {
 
 // gitHubTeam is one element from GET /user/teams.
 type gitHubTeam struct {
-	Slug         string     `json:"slug"`
-	Organization gitHubOrg  `json:"organization"`
+	Slug         string    `json:"slug"`
+	Organization gitHubOrg `json:"organization"`
 }
 
 // New creates a new GitHub provider from the given config.
@@ -290,11 +290,11 @@ func (p *Provider) GetIdentity(ctx context.Context, token *Token) (*Identity, er
 
 	// Fetch orgs and teams concurrently; both are non-fatal.
 	var (
-		orgs      []string
-		teams     []string
-		orgsErr   error
-		teamsErr  error
-		wg        sync.WaitGroup
+		orgs     []string
+		teams    []string
+		orgsErr  error
+		teamsErr error
+		wg       sync.WaitGroup
 	)
 	wg.Add(2)
 	go func() {
