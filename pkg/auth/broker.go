@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"sync"
 	"time"
 
@@ -16,6 +17,56 @@ import (
 	"github.com/scttfrdmn/oauth2-pam/pkg/provider/github"
 	"github.com/scttfrdmn/oauth2-pam/pkg/security"
 )
+
+// Session status values. These are the wire values carried in the IPC
+// response's "status" field and are the authoritative signal a client uses to
+// decide what to do next.
+//
+// The central invariant, relied on by the PAM module and enforced by
+// successResponse/pendingResponse/errorResponse below:
+//
+//	Success == true  if and only if  Status == StatusAuthorized
+//
+// and UserID (the mapped local Unix username) is populated only in that case.
+// A client must never treat any other status as an authenticated user.
+const (
+	// StatusPending means a device flow is in progress: the user has been
+	// given a code and URL but has not yet completed authorization at the
+	// provider. The client should keep polling check_session.
+	StatusPending = "pending"
+
+	// StatusAuthorized means the device flow completed, the identity was
+	// mapped, and the mapped local user matched the requested login. This is
+	// the only status that grants access.
+	StatusAuthorized = "authorized"
+
+	// StatusDenied means the attempt was rejected: the user declined at the
+	// provider, access controls refused them, or the mapped local user did
+	// not match the requested login. Terminal; do not retry by polling.
+	StatusDenied = "denied"
+
+	// StatusExpired means the device code or session lifetime elapsed before
+	// authorization completed. Terminal.
+	StatusExpired = "expired"
+
+	// StatusError means the attempt failed for an operational reason (provider
+	// unreachable, mapping service down, internal error) rather than a
+	// decision about the user. Terminal.
+	StatusError = "error"
+)
+
+// terminalGrace is how long a failed session is retained so that a polling
+// client learns the real outcome instead of "session not found", which is
+// indistinguishable from a bad or forged session ID.
+const terminalGrace = 2 * time.Minute
+
+// maxPendingFlowsPerUser bounds how many device flows one requested username
+// may have in flight at once. Pending flows deliberately do not count toward
+// Authentication.MaxConcurrentSessions (abandoned SSH attempts would otherwise
+// lock the user out until cleanup ran), so this const keeps that state
+// bounded. Exceeding it evicts the oldest pending flow rather than rejecting
+// the new one, so a user opening several terminals is never locked out.
+const maxPendingFlowsPerUser = 3
 
 // Broker manages authentication requests, device flows, and sessions.
 type Broker struct {
@@ -32,7 +83,8 @@ type Broker struct {
 	ctx context.Context
 }
 
-// Session represents an active authentication session.
+// Session represents an authentication session in any state — pending,
+// authorized, or terminally failed.
 type Session struct {
 	ID                 string
 	TokenID            string // key into TokenManager for the stored access token
@@ -47,8 +99,13 @@ type Session struct {
 	LastAccessed       time.Time
 	SourceIP           string
 	TokenFingerprint   string
-	IsActive           bool
-	Metadata           map[string]string
+	// Status is one of the Status* constants. IsActive is retained as the
+	// single boolean gate on access and is true only when Status is
+	// StatusAuthorized.
+	Status       string
+	ErrorMessage string
+	IsActive     bool
+	Metadata     map[string]string
 }
 
 // AuthRequest is an authentication request from the PAM module.
@@ -65,9 +122,13 @@ type AuthRequest struct {
 }
 
 // AuthResponse is the broker's response to an auth request.
+//
+// Status is the field clients must branch on. Success is a convenience mirror
+// of Status == StatusAuthorized and nothing else; see the Status* constants.
 type AuthResponse struct {
 	Success          bool
-	UserID           string   // local Unix username
+	Status           string   // one of the Status* constants
+	UserID           string   // local Unix username; set only when authorized
 	Email            string
 	Groups           []string
 	SessionID        string
@@ -163,9 +224,12 @@ func (b *Broker) Stop() error {
 }
 
 // Authenticate handles an authentication request from the PAM module.
-// On first call it kicks off a Device Flow and returns RequiresDevice=true
-// with the user code. The PAM module then polls via CheckSession until the
-// device flow completes.
+//
+// It starts a Device Flow and returns Status == StatusPending with the user
+// code and URL. It deliberately never returns Success == true: at this point
+// the user has not yet visited the provider, so there is nothing to grant. The
+// client must display the instructions and then poll CheckSession until the
+// status becomes terminal.
 func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 	log.Debug().
 		Str("user_id", req.UserID).
@@ -173,26 +237,38 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 		Str("login_type", req.LoginType).
 		Msg("Processing authentication request")
 
+	b.auditLogger.LogAuthEvent(security.AuditEvent{
+		EventType:  "authentication_attempt",
+		UserID:     req.UserID,
+		SourceIP:   req.SourceIP,
+		TargetHost: req.TargetHost,
+		AuthMethod: req.LoginType,
+		Success:    false,
+		Timestamp:  time.Now(),
+	})
+
 	// Pick the first configured provider (single-provider for now)
 	if len(b.providers) == 0 {
-		return &AuthResponse{
-			Success:      false,
-			ErrorCode:    "NO_PROVIDER",
-			ErrorMessage: "No authentication provider configured",
-		}, nil
+		return errorResponse("NO_PROVIDER", "No authentication provider configured"), nil
 	}
 	provider := b.providers[0]
 
-	// Enforce per-user session limit before starting a new device flow.
+	// Enforce the per-user limit on *established* sessions. Pending flows are
+	// counted separately below: an abandoned SSH attempt must not consume a
+	// session slot.
 	if max := b.config.Authentication.MaxConcurrentSessions; max > 0 {
 		if b.countUserSessions(req.UserID) >= max {
 			return &AuthResponse{
 				Success:      false,
+				Status:       StatusDenied,
 				ErrorCode:    "SESSION_LIMIT_REACHED",
 				ErrorMessage: "Maximum concurrent sessions reached",
 			}, nil
 		}
 	}
+
+	// Bound in-flight device flows for this user, evicting the oldest.
+	b.evictExcessPendingFlows(req.UserID)
 
 	// Start device flow
 	deviceFlow, err := provider.StartDeviceFlow(b.ctx)
@@ -207,11 +283,7 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 			ErrorMessage: err.Error(),
 			Timestamp:    time.Now(),
 		})
-		return &AuthResponse{
-			Success:      false,
-			ErrorCode:    "DEVICE_FLOW_FAILED",
-			ErrorMessage: err.Error(),
-		}, nil
+		return errorResponse("DEVICE_FLOW_FAILED", err.Error()), nil
 	}
 
 	// Generate QR code (best-effort)
@@ -238,6 +310,7 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 		ExpiresAt:          deviceFlow.ExpiresAt,
 		LastAccessed:       time.Now(),
 		SourceIP:           req.SourceIP,
+		Status:             StatusPending,
 		IsActive:           false,
 		Metadata:           req.Metadata,
 	}
@@ -247,8 +320,10 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 	b.wg.Add(1)
 	go b.pollDeviceAuthorization(sessionID, provider, deviceFlow)
 
+	// Success is false: a started device flow is not an authenticated user.
 	return &AuthResponse{
-		Success:        true,
+		Success:        false,
+		Status:         StatusPending,
 		SessionID:      sessionID,
 		DeviceCode:     deviceFlow.UserCode,
 		DeviceURL:      deviceFlow.DeviceURL,
@@ -262,24 +337,51 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 	}, nil
 }
 
-// CheckSession returns the current state of a session.
+// CheckSession returns the current state of a session. This is the call the
+// PAM module polls while the user completes the device flow.
 func (b *Broker) CheckSession(sessionID string) (*AuthResponse, error) {
 	session := b.getSession(sessionID)
 	if session == nil {
 		return &AuthResponse{
 			Success:      false,
+			Status:       StatusError,
 			ErrorCode:    "SESSION_NOT_FOUND",
 			ErrorMessage: "Session not found",
 		}, nil
 	}
 
-	if !session.IsActive {
+	// Terminal failure recorded by the background poller. Reported verbatim so
+	// the client can stop polling immediately instead of waiting out its
+	// deadline on a flow that will never complete.
+	switch session.Status {
+	case StatusDenied, StatusExpired, StatusError:
 		return &AuthResponse{
-			Success:        true,
+			Success:      false,
+			Status:       session.Status,
+			SessionID:    sessionID,
+			ErrorCode:    terminalErrorCode(session.Status),
+			ErrorMessage: session.ErrorMessage,
+		}, nil
+	}
+
+	if !session.IsActive {
+		if session.ExpiresAt.Before(time.Now()) {
+			// Device code lifetime elapsed without the poller noticing yet.
+			b.failSession(sessionID, StatusExpired, "Device authorization expired")
+			return &AuthResponse{
+				Success:      false,
+				Status:       StatusExpired,
+				SessionID:    sessionID,
+				ErrorCode:    "SESSION_EXPIRED",
+				ErrorMessage: "Device authorization expired",
+			}, nil
+		}
+		return &AuthResponse{
+			Success:        false,
+			Status:         StatusPending,
 			SessionID:      sessionID,
 			RequiresDevice: true,
 			ExpiresAt:      session.ExpiresAt,
-			Metadata:       map[string]string{"status": "pending"},
 		}, nil
 	}
 
@@ -287,6 +389,7 @@ func (b *Broker) CheckSession(sessionID string) (*AuthResponse, error) {
 		b.removeSession(sessionID)
 		return &AuthResponse{
 			Success:      false,
+			Status:       StatusExpired,
 			ErrorCode:    "SESSION_EXPIRED",
 			ErrorMessage: "Session has expired",
 		}, nil
@@ -295,14 +398,34 @@ func (b *Broker) CheckSession(sessionID string) (*AuthResponse, error) {
 	return b.successResponse(session), nil
 }
 
+// terminalErrorCode maps a terminal status to the wire error code.
+func terminalErrorCode(status string) string {
+	switch status {
+	case StatusDenied:
+		return "AUTHENTICATION_DENIED"
+	case StatusExpired:
+		return "SESSION_EXPIRED"
+	default:
+		return "AUTHENTICATION_FAILED"
+	}
+}
+
 // RefreshSession extends a session if it is close to expiry.
 func (b *Broker) RefreshSession(sessionID string) (*AuthResponse, error) {
 	session := b.getSession(sessionID)
 	if session == nil {
+		return errorResponse("SESSION_NOT_FOUND", "Session not found"), nil
+	}
+
+	// Only an authorized session can be refreshed; a pending or failed one has
+	// nothing to extend.
+	if !session.IsActive || session.Status != StatusAuthorized {
 		return &AuthResponse{
 			Success:      false,
-			ErrorCode:    "SESSION_NOT_FOUND",
-			ErrorMessage: "Session not found",
+			Status:       session.Status,
+			SessionID:    sessionID,
+			ErrorCode:    "SESSION_NOT_ACTIVE",
+			ErrorMessage: "Session is not authorized",
 		}, nil
 	}
 
@@ -380,7 +503,7 @@ func (b *Broker) pollDeviceAuthorization(sessionID string, provider *github.Prov
 			log.Warn().
 				Str("session_id", sessionID).
 				Msg("Device flow expired")
-			b.removeSession(sessionID)
+			b.failSession(sessionID, StatusExpired, "Device authorization expired")
 			return
 
 		case <-ticker.C:
@@ -394,7 +517,7 @@ func (b *Broker) pollDeviceAuthorization(sessionID string, provider *github.Prov
 					ticker.Reset(interval)
 					continue
 				case github.ErrExpiredToken:
-					b.removeSession(sessionID)
+					b.failSession(sessionID, StatusExpired, "Device code expired before authorization")
 					return
 				case github.ErrAccessDenied:
 					b.auditLogger.LogAuthEvent(security.AuditEvent{
@@ -405,11 +528,11 @@ func (b *Broker) pollDeviceAuthorization(sessionID string, provider *github.Prov
 						ErrorMessage: "user denied authorization",
 						Timestamp:    time.Now(),
 					})
-					b.removeSession(sessionID)
+					b.failSession(sessionID, StatusDenied, "Authorization denied at provider")
 					return
 				default:
 					log.Error().Err(err).Str("session_id", sessionID).Msg("Device poll error")
-					b.removeSession(sessionID)
+					b.failSession(sessionID, StatusError, "Provider polling failed")
 					return
 				}
 			}
@@ -432,7 +555,9 @@ func (b *Broker) pollDeviceAuthorization(sessionID string, provider *github.Prov
 						ErrorMessage: err.Error(),
 						Timestamp:    time.Now(),
 					})
-					b.removeSession(sessionID)
+					// checkAccess failures (not in the required org/team) arrive
+					// here and are a decision about the user, not an outage.
+					b.failSession(sessionID, identityFailureStatus(err), "Identity could not be established")
 					return
 				}
 				log.Warn().Err(err).Int("attempt", attempt).
@@ -469,12 +594,49 @@ func (b *Broker) pollDeviceAuthorization(sessionID string, provider *github.Prov
 						ErrorMessage: err.Error(),
 						Timestamp:    time.Now(),
 					})
-					b.removeSession(sessionID)
+					// No mapping is a decision (this identity has no local
+					// account); anything else is an operational failure.
+					status := StatusError
+					if errors.Is(err, mapper.ErrNoMapping) {
+						status = StatusDenied
+					}
+					b.failSession(sessionID, status, "No local account mapping for this identity")
 					return
 				}
 				log.Warn().Err(err).Int("attempt", attempt).
 					Str("session_id", sessionID).Msg("Transient error mapping identity, retrying")
 				time.Sleep(2 * time.Second)
+			}
+
+			// The mapped local user must be the account the login was for.
+			// This is the authoritative check: the broker will not activate a
+			// session whose mapped user differs from the requested one, so a
+			// stale or hostile client cannot skip it. Without this, an
+			// identity mapping to "alice" would authorize `ssh root@host`.
+			if current.RequestedLocalUser != "" && mapResult.LocalUser != current.RequestedLocalUser {
+				log.Warn().
+					Str("session_id", sessionID).
+					Str("requested_user", current.RequestedLocalUser).
+					Str("mapped_user", mapResult.LocalUser).
+					Str("github_login", identity.Login).
+					Msg("Mapped local user does not match requested login; denying")
+				b.auditLogger.LogAuthEvent(security.AuditEvent{
+					EventType:    "authentication_denied",
+					UserID:       current.RequestedLocalUser,
+					SessionID:    sessionID,
+					Provider:     provider.Name(),
+					Success:      false,
+					ErrorMessage: "mapped local user does not match requested login",
+					Timestamp:    time.Now(),
+					Metadata: map[string]interface{}{
+						"github_login":   identity.Login,
+						"requested_user": current.RequestedLocalUser,
+						"mapped_user":    mapResult.LocalUser,
+					},
+				})
+				b.failSession(sessionID, StatusDenied,
+					"Authenticated identity is not authorized for this account")
+				return
 			}
 
 			// Store the token in the encrypted token manager.
@@ -489,7 +651,7 @@ func (b *Broker) pollDeviceAuthorization(sessionID string, provider *github.Prov
 			)
 			if err != nil {
 				log.Error().Err(err).Str("session_id", sessionID).Msg("Failed to store token")
-				b.removeSession(sessionID)
+				b.failSession(sessionID, StatusError, "Internal error storing credentials")
 				return
 			}
 
@@ -510,7 +672,12 @@ func (b *Broker) pollDeviceAuthorization(sessionID string, provider *github.Prov
 			current.Groups = mapResult.Groups
 			current.TokenFingerprint = token.Fingerprint
 			current.TokenID = tokenID
+			current.Status = StatusAuthorized
 			current.IsActive = true
+			// The session now governs a live login rather than a device code,
+			// so switch to the configured session lifetime.
+			current.ExpiresAt = time.Now().Add(tokenLifetime)
+			current.LastAccessed = time.Now()
 			b.setSession(current)
 
 			b.auditLogger.LogAuthEvent(security.AuditEvent{
@@ -538,6 +705,16 @@ func (b *Broker) pollDeviceAuthorization(sessionID string, provider *github.Prov
 			} // end inner block
 		}
 	}
+}
+
+// identityFailureStatus classifies a GetIdentity failure. A provider-level
+// access-control refusal (not in the required org or team) is a denial; an
+// unreachable API is an error.
+func identityFailureStatus(err error) string {
+	if errors.Is(err, github.ErrAccessForbidden) {
+		return StatusDenied
+	}
+	return StatusError
 }
 
 // isTransientError returns true for network/IO errors that may resolve on retry,
@@ -580,17 +757,92 @@ func (b *Broker) getSession(sessionID string) *Session {
 	return &snapshot
 }
 
-// countUserSessions returns the number of sessions associated with userID.
+// countUserSessions returns the number of *established* sessions for userID.
+//
+// Pending device flows are excluded deliberately. Counting them meant that
+// three abandoned SSH attempts (a user who closed the terminal without
+// visiting GitHub) exhausted max_concurrent_sessions and locked the account out
+// until the five-minute cleanup ticker ran. Pending state is bounded by
+// maxPendingFlowsPerUser instead.
 func (b *Broker) countUserSessions(userID string) int {
 	b.sessionMutex.RLock()
 	defer b.sessionMutex.RUnlock()
 	count := 0
 	for _, s := range b.sessions {
+		if !s.IsActive {
+			continue
+		}
 		if s.RequestedLocalUser == userID || s.LocalUser == userID {
 			count++
 		}
 	}
 	return count
+}
+
+// failSession marks a session terminally failed and retains it for
+// terminalGrace so a polling client learns the outcome. Removing the session
+// instead would report SESSION_NOT_FOUND, which a client cannot distinguish
+// from a bad session ID — so it would keep polling until its own deadline
+// rather than failing the login promptly.
+//
+// Any token already stored for the session is revoked: a failed flow must not
+// leave credentials behind.
+func (b *Broker) failSession(sessionID, status, message string) {
+	var tokenID string
+
+	b.sessionMutex.Lock()
+	s, ok := b.sessions[sessionID]
+	if ok {
+		tokenID = s.TokenID
+		s.Status = status
+		s.ErrorMessage = message
+		s.IsActive = false
+		s.TokenID = ""
+		s.ExpiresAt = time.Now().Add(terminalGrace)
+	}
+	b.sessionMutex.Unlock()
+
+	if !ok {
+		return
+	}
+	if tokenID != "" {
+		b.tokenManager.RevokeToken(tokenID)
+	}
+
+	log.Debug().
+		Str("session_id", sessionID).
+		Str("status", status).
+		Msg("Session marked terminally failed")
+}
+
+// evictExcessPendingFlows drops the oldest pending flows for userID until at
+// most maxPendingFlowsPerUser-1 remain, leaving room for the flow about to
+// start. Evicting rather than rejecting means a user with several terminals
+// open always gets a usable prompt in the newest one.
+func (b *Broker) evictExcessPendingFlows(userID string) {
+	b.sessionMutex.Lock()
+	defer b.sessionMutex.Unlock()
+
+	var pending []*Session
+	for _, s := range b.sessions {
+		if s.Status == StatusPending && !s.IsActive && s.RequestedLocalUser == userID {
+			pending = append(pending, s)
+		}
+	}
+	if len(pending) < maxPendingFlowsPerUser {
+		return
+	}
+
+	sort.Slice(pending, func(i, j int) bool {
+		return pending[i].CreatedAt.Before(pending[j].CreatedAt)
+	})
+	for _, s := range pending[:len(pending)-(maxPendingFlowsPerUser-1)] {
+		delete(b.sessions, s.ID)
+		log.Debug().
+			Str("session_id", s.ID).
+			Str("user_id", userID).
+			Msg("Evicted oldest pending device flow")
+	}
 }
 
 // generateSessionID creates a 16-byte cryptographically random session ID.
@@ -624,9 +876,20 @@ func (b *Broker) removeSession(sessionID string) {
 	delete(b.sessions, sessionID)
 }
 
+// errorResponse builds a terminal operational-failure response.
+func errorResponse(code, message string) *AuthResponse {
+	return &AuthResponse{
+		Success:      false,
+		Status:       StatusError,
+		ErrorCode:    code,
+		ErrorMessage: message,
+	}
+}
+
 func (b *Broker) successResponse(session *Session) *AuthResponse {
 	return &AuthResponse{
 		Success:   true,
+		Status:    StatusAuthorized,
 		UserID:    session.LocalUser,
 		Email:     session.Email,
 		Groups:    session.Groups,

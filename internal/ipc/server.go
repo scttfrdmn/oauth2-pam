@@ -47,8 +47,17 @@ type Request struct {
 }
 
 // Response is a message from the broker to the PAM module.
+//
+// Status is the authoritative field: it is one of the auth.Status* values
+// ("pending", "authorized", "denied", "expired", "error"). Success is true only
+// when Status is "authorized" — a client must not treat "pending" as an
+// authenticated user, and UserID is populated only when authorized.
+//
+// The one exception is the revoke_session reply, which carries no Status; there
+// Success means "the session was revoked".
 type Response struct {
 	Success          bool                   `json:"success"`
+	Status           string                 `json:"status"`
 	UserID           string                 `json:"user_id"`
 	Email            string                 `json:"email"`
 	Groups           []string               `json:"groups"`
@@ -261,6 +270,7 @@ func (s *Server) dispatch(req *Request) *Response {
 		// Already caught by validateRequest, but keep as a safety net.
 		return &Response{
 			Success:      false,
+			Status:       auth.StatusError,
 			ErrorCode:    "INVALID_REQUEST_TYPE",
 			ErrorMessage: "Unknown request type",
 		}
@@ -286,6 +296,7 @@ func (s *Server) handleAuthenticate(req *Request) *Response {
 		log.Error().Err(err).Str("user_id", req.UserID).Msg("Authenticate error")
 		return &Response{
 			Success:      false,
+			Status:       auth.StatusError,
 			ErrorCode:    "AUTHENTICATION_FAILED",
 			ErrorMessage: "Authentication failed",
 		}
@@ -303,6 +314,7 @@ func (s *Server) handleCheckSession(req *Request) *Response {
 	if err != nil {
 		return &Response{
 			Success:      false,
+			Status:       auth.StatusError,
 			ErrorCode:    "SESSION_CHECK_FAILED",
 			ErrorMessage: "Session check failed",
 		}
@@ -315,6 +327,7 @@ func (s *Server) handleRefreshSession(req *Request) *Response {
 	if err != nil {
 		return &Response{
 			Success:      false,
+			Status:       auth.StatusError,
 			ErrorCode:    "SESSION_REFRESH_FAILED",
 			ErrorMessage: "Session refresh failed",
 		}
@@ -334,7 +347,7 @@ func (s *Server) handleRevokeSession(req *Request) *Response {
 }
 
 func (s *Server) sendError(conn net.Conn, code, message string) {
-	resp := &Response{Success: false, ErrorCode: code, ErrorMessage: message}
+	resp := &Response{Success: false, Status: auth.StatusError, ErrorCode: code, ErrorMessage: message}
 	_ = json.NewEncoder(conn).Encode(resp)
 }
 
@@ -347,6 +360,7 @@ func (s *Server) sendErrorOnConn(conn net.Conn, code, message string) {
 func authResponseToIPC(ar *auth.AuthResponse) *Response {
 	return &Response{
 		Success:          ar.Success,
+		Status:           ar.Status,
 		UserID:           ar.UserID,
 		Email:            ar.Email,
 		Groups:           ar.Groups,

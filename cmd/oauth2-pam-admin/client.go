@@ -9,6 +9,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"github.com/scttfrdmn/oauth2-pam/internal/ipc"
+	"github.com/scttfrdmn/oauth2-pam/pkg/auth"
 	"github.com/scttfrdmn/oauth2-pam/pkg/config"
 	"github.com/scttfrdmn/oauth2-pam/pkg/mapper"
 	"github.com/scttfrdmn/oauth2-pam/pkg/provider/github"
@@ -44,62 +45,64 @@ func (c *ipcClient) send(req *ipc.Request) (*ipc.Response, error) {
 	return &resp, nil
 }
 
-// TestAuth initiates and polls a device flow for the given username.
+// TestAuth initiates and polls a device flow for the given username. It is the
+// same two-phase protocol the PAM module implements, so it doubles as a way to
+// exercise the broker end to end without an SSH login.
 func (c *ipcClient) TestAuth(username string) error {
-	sessionID := fmt.Sprintf("admin-test-%d", time.Now().UnixNano())
-
 	resp, err := c.send(&ipc.Request{
 		Type:      "authenticate",
 		UserID:    username,
 		LoginType: "ssh",
-		SessionID: sessionID,
 	})
 	if err != nil {
 		return err
 	}
 
-	if !resp.Success {
-		return fmt.Errorf("auth failed: %s", resp.ErrorMessage)
+	if resp.Status != auth.StatusPending {
+		return fmt.Errorf("auth failed (%s): %s", resp.Status, resp.ErrorMessage)
 	}
 
-	if resp.RequiresDevice {
-		fmt.Println(resp.Instructions)
-		fmt.Printf("\nPolling for authorization (session: %s)...\n", sessionID)
+	// The broker issues its own session ID; a client-supplied one is ignored to
+	// prevent session fixation, so poll with the ID it returned.
+	sessionID := resp.SessionID
+	if sessionID == "" {
+		return fmt.Errorf("broker returned no session id")
+	}
 
-		for i := 0; i < 60; i++ {
-			time.Sleep(5 * time.Second)
+	fmt.Println(resp.Instructions)
+	fmt.Printf("\nPolling for authorization (session: %s)...\n", sessionID)
 
-			check, err := c.send(&ipc.Request{
-				Type:      "check_session",
-				SessionID: sessionID,
-			})
-			if err != nil {
-				return err
-			}
+	for i := 0; i < 60; i++ {
+		time.Sleep(5 * time.Second)
 
-			if !check.RequiresDevice && check.Success {
-				log.Info().
-					Str("local_user", check.UserID).
-					Str("email", check.Email).
-					Strs("groups", check.Groups).
-					Msg("Authentication successful")
-				return nil
-			}
-
-			if !check.Success {
-				return fmt.Errorf("authorization failed: %s", check.ErrorMessage)
-			}
-
-			fmt.Printf("  Waiting... (%ds elapsed)\n", (i+1)*5)
+		check, err := c.send(&ipc.Request{
+			Type:      "check_session",
+			SessionID: sessionID,
+		})
+		if err != nil {
+			return err
 		}
-		return fmt.Errorf("timed out waiting for authorization")
-	}
 
-	log.Info().
-		Str("local_user", resp.UserID).
-		Str("email", resp.Email).
-		Msg("Authentication successful (cached session)")
-	return nil
+		switch check.Status {
+		case auth.StatusAuthorized:
+			if check.UserID != username {
+				// Should never happen: the broker enforces this before
+				// activating the session. Refuse anyway.
+				return fmt.Errorf("broker authorized %q for a request for %q", check.UserID, username)
+			}
+			log.Info().
+				Str("local_user", check.UserID).
+				Str("email", check.Email).
+				Strs("groups", check.Groups).
+				Msg("Authentication successful")
+			return nil
+		case auth.StatusPending:
+			fmt.Printf("  Waiting... (%ds elapsed)\n", (i+1)*5)
+		default:
+			return fmt.Errorf("authorization failed (%s): %s", check.Status, check.ErrorMessage)
+		}
+	}
+	return fmt.Errorf("timed out waiting for authorization")
 }
 
 // ListSessions requests a session list from the broker.

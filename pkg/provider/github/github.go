@@ -366,7 +366,7 @@ func (p *Provider) checkAccess(id *Identity) error {
 			}
 		}
 		if !found {
-			return fmt.Errorf("access denied: %s is not a member of GitHub org %q", id.Login, gh.RequireOrg)
+			return fmt.Errorf("%w: %s is not a member of GitHub org %q", ErrAccessForbidden, id.Login, gh.RequireOrg)
 		}
 	}
 
@@ -385,7 +385,7 @@ func (p *Provider) checkAccess(id *Identity) error {
 			}
 		}
 		if !found {
-			return fmt.Errorf("access denied: %s is not a member of any required team", id.Login)
+			return fmt.Errorf("%w: %s is not a member of any required team", ErrAccessForbidden, id.Login)
 		}
 	}
 
@@ -511,3 +511,9 @@ var ErrExpiredToken = fmt.Errorf("expired_token")
 
 // ErrAccessDenied means the user denied the authorization request.
 var ErrAccessDenied = fmt.Errorf("access_denied")
+
+// ErrAccessForbidden means the identity authenticated successfully but does not
+// satisfy the configured org/team/allowlist requirements. It wraps the
+// provider-level access-control refusals from checkAccess so callers can tell a
+// policy decision apart from an API outage.
+var ErrAccessForbidden = fmt.Errorf("access denied")
