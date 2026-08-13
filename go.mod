@@ -1,6 +1,6 @@
 module github.com/scttfrdmn/oauth2-pam
 
-go 1.25
+go 1.25.0
 
 require (
 	github.com/rs/zerolog v1.34.0
@@ -8,7 +8,7 @@ require (
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
 	go.yaml.in/yaml/v3 v3.0.4
-	golang.org/x/sys v0.40.0
+	golang.org/x/sys v0.47.0
 )
 
 require (
