@@ -284,6 +284,26 @@ func TestRateLimiterEvictsStaleWindows(t *testing.T) {
 	}
 }
 
+// TestUnknownPeerBucketIsNotRoot guards the reason unknownPeerBucket exists:
+// peerUID used to return 0 for every peer it could not identify, so unknown
+// callers and root shared a window and the logs called them root.
+func TestUnknownPeerBucketIsNotRoot(t *testing.T) {
+	if unknownPeerBucket == 0 {
+		t.Fatal("unknownPeerBucket is 0, which is root's real UID")
+	}
+
+	rl := newRateLimiter(1)
+	if !rl.allow(unknownPeerBucket) {
+		t.Fatal("first unidentified request denied")
+	}
+	if rl.allow(unknownPeerBucket) {
+		t.Error("second unidentified request allowed; the shared bucket is not counting")
+	}
+	if !rl.allow(0) {
+		t.Error("root was denied because unidentified callers exhausted its window")
+	}
+}
+
 func TestRateLimiterDefaultsWhenUnset(t *testing.T) {
 	for _, maxRPM := range []int{0, -1} {
 		rl := newRateLimiter(maxRPM)

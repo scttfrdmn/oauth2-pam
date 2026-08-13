@@ -128,7 +128,16 @@ func (s *Server) Start(ctx context.Context) error {
 		log.Warn().Err(err).Str("socket", s.socketPath).Msg("Failed to set socket permissions")
 	}
 
-	log.Info().Str("socket", s.socketPath).Msg("IPC server started")
+	// Say out loud whether the rate limiter can tell callers apart. Without peer
+	// credentials every caller shares one bucket, which is a materially weaker
+	// guarantee than the config's per-caller limit implies.
+	log.Info().
+		Str("socket", s.socketPath).
+		Bool("peer_credentials", peerCredsSupported).
+		Msg("IPC server started")
+	if !peerCredsSupported {
+		log.Warn().Msg("Peer credentials unavailable on this platform; all callers share one rate-limit bucket")
+	}
 
 	s.wg.Add(2)
 	go s.acceptConnections(ctx)
@@ -185,10 +194,15 @@ func (s *Server) acceptConnections(ctx context.Context) {
 			}
 		}
 
-		// Check rate limit before spawning a goroutine.
-		uid := peerUID(conn)
-		if !s.rateLimiter.allow(uid) {
-			log.Warn().Uint32("uid", uid).Msg("Rate limit exceeded, rejecting connection")
+		// Check rate limit before spawning a goroutine. An unidentifiable peer
+		// gets the shared bucket rather than being attributed to root.
+		uid, known := peerUID(conn)
+		bucket := uid
+		if !known {
+			bucket = unknownPeerBucket
+		}
+		if !s.rateLimiter.allow(bucket) {
+			log.Warn().Uint32("uid", uid).Bool("uid_known", known).Msg("Rate limit exceeded, rejecting connection")
 			s.sendErrorOnConn(conn, "RATE_LIMITED", "Too many requests; try again later")
 			_ = conn.Close()
 			continue
