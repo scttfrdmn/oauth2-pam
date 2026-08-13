@@ -1,0 +1,39 @@
+# The server side of the harness: the real broker daemon, plus the fake GitHub
+# it talks to. Both are built from this image; docker-compose.yml runs them as
+# two services so the broker reaches GitHub over the network, as it would in
+# production.
+#
+# Build context is the repository root.
+
+FROM golang:1.24-bookworm AS build
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN go build -trimpath -o /out/oauth2-pam-broker ./cmd/broker \
+ && go build -trimpath -o /out/oauth2-pam-admin  ./cmd/oauth2-pam-admin \
+ && go build -trimpath -o /out/fakegithub        ./test/integration/fakegithub
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl openssl \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /out/oauth2-pam-broker /out/oauth2-pam-admin /out/fakegithub /usr/local/bin/
+
+# The broker refuses a plain-http github.base_url, so the stub serves TLS and
+# its certificate goes into the system trust store — the same arrangement a
+# GitHub Enterprise Server with an internal CA would need.
+RUN mkdir -p /etc/fakegithub \
+ && openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+      -subj "/CN=fakegithub" -addext "subjectAltName=DNS:fakegithub" \
+      -keyout /etc/fakegithub/key.pem -out /etc/fakegithub/cert.pem \
+ && cp /etc/fakegithub/cert.pem /usr/local/share/ca-certificates/fakegithub.crt \
+ && update-ca-certificates
+
+COPY test/integration/broker.yaml /etc/oauth2-pam/broker.yaml
+RUN mkdir -p /var/log/oauth2-pam
+
+CMD ["oauth2-pam-broker", "--config", "/etc/oauth2-pam/broker.yaml"]

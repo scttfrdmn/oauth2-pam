@@ -45,6 +45,19 @@ func DefaultEndpoints() Endpoints {
 	}
 }
 
+// EnterpriseEndpoints derives the endpoints for a GitHub Enterprise Server
+// installation rooted at baseURL (e.g. "https://github.acme.internal"), which
+// serves the device and token endpoints at the same paths as github.com and the
+// REST API under /api/v3.
+func EnterpriseEndpoints(baseURL string) Endpoints {
+	base := strings.TrimSuffix(baseURL, "/")
+	return Endpoints{
+		DeviceAuth: base + "/login/device/code",
+		Token:      base + "/login/oauth/access_token",
+		APIBase:    base + "/api/v3",
+	}
+}
+
 // validate checks that every endpoint is set and parses, and returns the set of
 // hostnames redirects may target.
 func (e Endpoints) validate() (map[string]struct{}, error) {
@@ -157,8 +170,12 @@ type gitHubTeam struct {
 	Organization gitHubOrg `json:"organization"`
 }
 
-// New creates a new GitHub provider for github.com from the given config.
+// New creates a new GitHub provider from the given config. It targets
+// github.com unless the config names a GitHub Enterprise Server base_url.
 func New(cfg config.ProviderConfig) (*Provider, error) {
+	if cfg.GitHub.BaseURL != "" {
+		return NewWithEndpoints(cfg, EnterpriseEndpoints(cfg.GitHub.BaseURL))
+	}
 	return NewWithEndpoints(cfg, DefaultEndpoints())
 }
 

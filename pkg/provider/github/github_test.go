@@ -79,6 +79,50 @@ func TestDefaultEndpointsAreGitHubDotCom(t *testing.T) {
 	}
 }
 
+// TestEnterpriseEndpoints covers the config route to a non-github.com instance:
+// the device and token endpoints sit at the same paths as github.com, but the
+// REST API moves to /api/v3.
+func TestEnterpriseEndpoints(t *testing.T) {
+	// The trailing slash is the shape an operator is most likely to paste in.
+	e := EnterpriseEndpoints("https://github.acme.internal/")
+
+	if want := "https://github.acme.internal/login/device/code"; e.DeviceAuth != want {
+		t.Errorf("DeviceAuth = %q, want %q", e.DeviceAuth, want)
+	}
+	if want := "https://github.acme.internal/login/oauth/access_token"; e.Token != want {
+		t.Errorf("Token = %q, want %q", e.Token, want)
+	}
+	if want := "https://github.acme.internal/api/v3"; e.APIBase != want {
+		t.Errorf("APIBase = %q, want %q", e.APIBase, want)
+	}
+	if _, err := e.validate(); err != nil {
+		t.Errorf("enterprise endpoints do not validate: %v", err)
+	}
+}
+
+// TestNewHonorsBaseURL pins the wiring, not just the derivation: a base_url in
+// the config has to reach the provider, or the setting is decorative.
+func TestNewHonorsBaseURL(t *testing.T) {
+	cfg := providerConfig()
+	cfg.GitHub.BaseURL = "https://github.acme.internal"
+
+	p, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New = %v", err)
+	}
+	if want := EnterpriseEndpoints(cfg.GitHub.BaseURL); p.endpoints != want {
+		t.Errorf("endpoints = %+v, want %+v", p.endpoints, want)
+	}
+
+	onDotCom, err := New(providerConfig())
+	if err != nil {
+		t.Fatalf("New = %v", err)
+	}
+	if onDotCom.endpoints != DefaultEndpoints() {
+		t.Errorf("without base_url, endpoints = %+v, want github.com", onDotCom.endpoints)
+	}
+}
+
 func TestEndpointValidation(t *testing.T) {
 	tests := []struct {
 		name    string

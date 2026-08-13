@@ -60,6 +60,11 @@ func TestValidate(t *testing.T) {
 		{"provider without client id", func(c *Config) { c.Providers[0].ClientID = "" }, "client_id is required"},
 		{"provider without client secret", func(c *Config) { c.Providers[0].ClientSecret = "" }, "client_secret is required"},
 
+		// The client secret and the access token both travel to base_url.
+		{"plaintext enterprise base url", func(c *Config) { c.Providers[0].GitHub.BaseURL = "http://github.acme.internal" }, "must use HTTPS"},
+		{"https enterprise base url", func(c *Config) { c.Providers[0].GitHub.BaseURL = "https://github.acme.internal" }, ""},
+		{"empty base url means github.com", func(c *Config) { c.Providers[0].GitHub.BaseURL = "" }, ""},
+
 		{"zero token lifetime", func(c *Config) { c.Authentication.TokenLifetime = 0 }, "token_lifetime must be positive"},
 		{"negative refresh threshold", func(c *Config) { c.Authentication.RefreshThreshold = -time.Second }, "refresh_threshold must be positive"},
 		{"unlimited sessions is allowed", func(c *Config) { c.Authentication.MaxConcurrentSessions = 0 }, ""},

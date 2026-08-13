@@ -1,0 +1,61 @@
+# The client side of the harness: a real sshd with a real oauth2_pam.so in its
+# PAM stack. Logins are driven from run-tests.sh inside this container.
+#
+# Build context is the repository root.
+
+FROM golang:1.24-bookworm AS build
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libpam0g-dev libjson-c-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+
+# Build the module the way make build-pam does, then insist the entry points are
+# actually in it. A .so without pam_sm_authenticate is exactly the defect this
+# harness exists to catch, and it is silent at build time.
+RUN go build -buildmode=c-shared -trimpath -o /out/oauth2_pam.so ./cmd/pam-module \
+ && for sym in pam_sm_authenticate pam_sm_setcred pam_sm_acct_mgmt \
+               pam_sm_open_session pam_sm_close_session pam_sm_chauthtok; do \
+      nm -D --defined-only /out/oauth2_pam.so | grep -q " T $sym\$" \
+        || { echo "MISSING ENTRY POINT: $sym"; exit 1; }; \
+    done
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      openssh-server openssh-client libjson-c5 libpam-modules \
+      ca-certificates curl jq procps \
+ && rm -rf /var/lib/apt/lists/*
+
+# The PAM module directory differs by architecture (x86_64-linux-gnu vs
+# aarch64-linux-gnu), so ask dpkg where the stock modules live rather than
+# hardcoding a triplet.
+COPY --from=build /out/oauth2_pam.so /tmp/oauth2_pam.so
+RUN dir="$(dirname "$(dpkg -L libpam-modules | grep -m1 '/pam_permit\.so$')")" \
+ && echo "installing oauth2_pam.so into $dir" \
+ && install -m 0644 /tmp/oauth2_pam.so "$dir/oauth2_pam.so" \
+ && rm /tmp/oauth2_pam.so
+
+# alice is the account the mapping resolves to; bob exists so a login as bob can
+# be refused for the right reason (no such user is a different failure).
+#
+# Both get "*" as their password hash: no password can ever match it, so the
+# only way in is the module under test. ("!" would additionally mark the account
+# locked, which some sshd builds reject before PAM ever runs.)
+RUN useradd --create-home --shell /bin/bash --password '*' alice \
+ && useradd --create-home --shell /bin/bash --password '*' bob \
+ && mkdir -p /run/sshd
+
+COPY test/integration/pam-sshd /etc/pam.d/sshd
+COPY test/integration/sshd_config.d/oauth2-pam.conf /etc/ssh/sshd_config.d/oauth2-pam.conf
+COPY test/integration/askpass.sh test/integration/cases.sh /opt/tests/
+RUN chmod 0755 /opt/tests/askpass.sh /opt/tests/cases.sh
+
+# sshd stays in the foreground as the service under test; run-tests.sh drives it
+# from the host with `docker compose exec`.
+CMD ["/usr/sbin/sshd", "-D", "-e"]

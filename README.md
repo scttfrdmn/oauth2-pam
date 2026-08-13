@@ -102,6 +102,11 @@ mapper:
 
 The config holds the client secret in cleartext, so keep it `0600` and root-owned.
 
+For GitHub Enterprise Server, add `base_url: https://github.acme.internal` under
+`github:`. The device, token, and API endpoints are derived from it (the REST API
+at `/api/v3`), and it must be HTTPS — the client secret and the access token both
+travel to that host.
+
 ### 5. Start the broker
 
 ```bash
@@ -231,11 +236,13 @@ oauth2-pam-admin revoke-session <session-id>
 ## Development
 
 ```bash
-make test           # full suite
-go test -race ./...
+make test              # Go suite
+make test-integration  # container harness: real sshd + PAM vs a real broker
 ```
 
-The end-to-end tests in `internal/ipc` drive a real broker behind a real IPC server over a real Unix socket, with only GitHub itself faked, and they pin the contract that a started device flow is *not* an authentication. The C module's poll loop is not covered by them.
+The end-to-end tests in `internal/ipc` drive a real broker behind a real IPC server over a real Unix socket, with only GitHub itself faked, and they pin the contract that a started device flow is *not* an authentication.
+
+`make test-integration` covers the other half of the protocol, which Go tests cannot reach: two containers, one running `sshd` with `oauth2_pam.so` in `/etc/pam.d/sshd` and one running the broker, with logins driven over a real ssh connection. It needs Docker and nothing else — no OAuth app, no credentials, no network. See [test/integration/README.md](test/integration/README.md) for the cases and how a device-flow prompt is answered without a human.
 
 ## Project Structure
 
@@ -248,6 +255,8 @@ oauth2-pam/
 │   └── oauth2-pam-enroll/   # Self-enrollment CLI
 ├── internal/
 │   └── ipc/                 # Unix socket IPC server
+├── test/
+│   └── integration/         # Container harness (sshd + PAM vs broker)
 ├── pkg/
 │   ├── auth/                # Broker, session state machine, token manager
 │   ├── config/              # Configuration schema and loader

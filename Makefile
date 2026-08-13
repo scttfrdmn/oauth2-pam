@@ -1,4 +1,4 @@
-.PHONY: build test install clean lint fmt vet tidy help
+.PHONY: build test test-unit test-integration install clean lint fmt vet tidy help
 
 # Build variables
 BINARY_DIR := bin
@@ -81,6 +81,11 @@ test:
 test-unit:
 	@echo "Running unit tests..."
 	go test $(GO_TEST_FLAGS) ./pkg/... ./internal/...
+
+## Run the container integration harness (real sshd + PAM vs a real broker)
+test-integration:
+	@echo "Running container integration harness..."
+	test/integration/run-tests.sh
 
 ## Install binaries to system locations
 install: build
@@ -180,6 +185,7 @@ help:
 	@echo "  build-admin       Build admin CLI tool"
 	@echo "  test              Run all tests"
 	@echo "  test-unit         Run unit tests only"
+	@echo "  test-integration  Run the container harness (needs Docker)"
 	@echo "  install           Install binaries to system"
 	@echo "  install-dev       Install development version"
 	@echo "  clean             Clean build artifacts"

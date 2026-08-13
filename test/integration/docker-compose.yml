@@ -1,0 +1,51 @@
+# Two containers, one per side of the protocol:
+#
+#   client — real sshd, real oauth2_pam.so in /etc/pam.d/sshd
+#   broker — real oauth2-pam-broker, reached over the shared Unix socket
+#
+# plus fakegithub, which stands in for github.com so the suite needs no OAuth
+# app, no network, and no human with a phone. Nothing else is faked.
+#
+# The same file runs unchanged on an EC2 Linux instance if the containers ever
+# need to be checked against a non-Docker kernel.
+
+name: oauth2-pam-harness
+
+services:
+  fakegithub:
+    image: oauth2-pam-harness-broker
+    build:
+      context: ../..
+      dockerfile: test/integration/Dockerfile.broker
+    command: ["fakegithub"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/control/state"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  broker:
+    image: oauth2-pam-harness-broker
+    build:
+      context: ../..
+      dockerfile: test/integration/Dockerfile.broker
+    depends_on:
+      fakegithub:
+        condition: service_healthy
+    volumes:
+      - brokersock:/var/run/oauth2-pam
+
+  client:
+    image: oauth2-pam-harness-client
+    build:
+      context: ../..
+      dockerfile: test/integration/Dockerfile.client
+    depends_on:
+      - broker
+    volumes:
+      - brokersock:/var/run/oauth2-pam
+
+volumes:
+  # Carries the broker socket between the two containers, standing in for
+  # /run/oauth2-pam on a single host.
+  brokersock:

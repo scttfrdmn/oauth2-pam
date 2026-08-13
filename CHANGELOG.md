@@ -52,12 +52,23 @@ defects compounded, and this release fixes both. **Upgrade before putting
   learns *why* a login failed instead of watching the session vanish.
 - `github.Endpoints` and `NewWithEndpoints` — point the adapter at a GitHub
   Enterprise Server installation, or at a fake GitHub in tests.
+- `providers[].github.base_url` — the config route to a GitHub Enterprise Server
+  installation. Endpoints are derived from it (REST API at `/api/v3`) and it must
+  be HTTPS, since both the client secret and the access token travel there.
 - `auth.NewBrokerWithProviders` for injecting pre-built providers.
 - PAM module arguments `poll_interval=N` (1–60, default 5) and `timeout=N`
   (10–900, default 300).
 - A test suite, where there was none: unit tests across every package plus an
   end-to-end test that drives a real broker behind a real IPC server over a
   real Unix socket with only GitHub faked.
+- A container integration harness (`make test-integration`) covering the half of
+  the protocol Go tests cannot reach. Two containers — one running `sshd` with
+  `oauth2_pam.so` in `/etc/pam.d/sshd`, one running the broker — with logins
+  driven over a real ssh connection and only GitHub faked. Six cases, including
+  the two that matter most: an unapproved device flow must be refused at the
+  deadline, and a mapping that does not match the requested account must be
+  refused. Needs Docker and nothing else. Verified by mutation: reintroducing the
+  0.1.x "pending means success" logic makes the first of those cases fail.
 
 ### Fixed
 
@@ -98,9 +109,9 @@ defects compounded, and this release fixes both. **Upgrade before putting
   `oauth2-pam-admin` does.
 - **Breaking:** `pkg/pam` is deleted. Its Go wrapper was dead code, and its
   `IsSocketPathValid` accepted 107-byte paths where the C caps at 103.
-- Removed `TokenManager.getToken` (unused) and the stale `test-integration`
-  Makefile target, which ran a `test/integration/` directory that has never
-  existed.
+- Removed `TokenManager.getToken` (unused). The `test-integration` Makefile
+  target used to run a `test/integration/` directory that had never existed; it
+  now runs the container harness that lives there.
 - README documents the real two-phase flow, the mapped-user rule, the module
   arguments, `KbdInteractiveAuthentication`, and a Limitations section.
 
@@ -109,9 +120,11 @@ defects compounded, and this release fixes both. **Upgrade before putting
 - Supplementary `groups` from the mapper are still not applied to the session
   (#12); a provider interface (#13) and non-cleartext `client_secret` loading
   (#14) remain open.
-- A full `sshd` login against real GitHub is not covered by the test suite.
-  The broker half of the two-phase protocol is tested end to end; the C client
-  half is verified by review and by compiling in a Linux container.
+- A login against *real* GitHub is not covered by the test suite. Both halves of
+  the protocol are now exercised end to end — the broker by `internal/ipc`, the
+  module by a real `sshd` in the container harness — but github.com itself is
+  faked in both, so an incompatibility with GitHub's live device-flow behaviour
+  would not be caught.
 
 ## [0.1.1] - 2026-03-22
 

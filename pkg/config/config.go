@@ -69,8 +69,16 @@ type GitHubConfig struct {
 	// Format: "org/team-slug"
 	RequireTeams []string `mapstructure:"require_teams"`
 
-	// AllowUsers is an explicit allowlist of GitHub logins (bypasses org/team checks)
+	// AllowUsers is an explicit allowlist of GitHub logins (bypasses org/team
+	// checks). On its own it is still a restriction: a login that is not on the
+	// list and has no org/team requirement left to satisfy is refused.
 	AllowUsers []string `mapstructure:"allow_users"`
+
+	// BaseURL points the provider at a GitHub Enterprise Server installation
+	// instead of github.com — for example https://github.acme.internal. The
+	// device, token, and API endpoints are derived from it. Leave empty for
+	// github.com.
+	BaseURL string `mapstructure:"base_url"`
 }
 
 // MapperConfig defines how a GitHub identity is mapped to a local Unix user.
@@ -257,6 +265,10 @@ func (c *Config) Validate() error {
 		}
 		if p.ClientSecret == "" {
 			return fmt.Errorf("providers[%d].client_secret is required", i)
+		}
+		// The client secret and the access token both travel to this host.
+		if p.GitHub.BaseURL != "" && !strings.HasPrefix(p.GitHub.BaseURL, "https://") {
+			return fmt.Errorf("providers[%d].github.base_url must use HTTPS (got %q)", i, p.GitHub.BaseURL)
 		}
 	}
 

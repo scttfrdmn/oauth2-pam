@@ -1,0 +1,49 @@
+# Broker configuration for the container harness.
+#
+# The only thing that is not production-shaped here is github.base_url, which
+# points at the fake GitHub instead of github.com, and the short timeouts that
+# keep the test suite quick.
+
+server:
+  socket_path: /var/run/oauth2-pam/broker.sock
+  log_level: debug
+  read_timeout: 30s
+  write_timeout: 30s
+
+providers:
+  - name: fakegithub
+    type: github
+    client_id: Iv1.fakeclientid00
+    client_secret: fakeclientsecret0000000000000000
+    github:
+      # HTTPS is mandatory; the certificate is in the image's trust store.
+      base_url: https://fakegithub:8443
+      require_org: acme
+
+mapper:
+  rules:
+    # The fake GitHub reports login "alice" by default, so this resolves to the
+    # local alice. /control/login=bob changes the login without changing this
+    # rule, which is how the mismatch case is set up.
+    - match:
+        github_org: acme
+      local_user: "{{ .Login }}"
+
+authentication:
+  token_lifetime: 1h
+  refresh_threshold: 30m
+  max_concurrent_sessions: 10
+
+security:
+  secure_token_storage: true
+  token_encryption_key: harness-test-key-32-bytes-long!!
+  max_token_age: 2h
+  rate_limiting:
+    max_requests_per_minute: 600
+    max_concurrent_auths: 10
+
+audit:
+  enabled: true
+  format: json
+  outputs:
+    - type: stdout

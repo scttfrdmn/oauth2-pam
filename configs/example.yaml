@@ -31,9 +31,17 @@ providers:
       #   - my-org/engineers
       #   - my-org/ops
 
-      # Explicit user allowlist — bypasses org/team checks (optional)
+      # Explicit user allowlist — bypasses org/team checks (optional).
+      # On its own it is still a restriction: with no require_org/require_teams,
+      # a login that is not listed here is refused.
       # allow_users:
       #   - octocat
+
+      # GitHub Enterprise Server instead of github.com (optional). The device,
+      # token, and API endpoints are derived from it, with the REST API under
+      # /api/v3. Must be HTTPS — the client secret and the access token both
+      # travel to this host.
+      # base_url: https://github.acme.internal
 
 # ---------------------------------------------------------------------------
 # Identity Mapper
