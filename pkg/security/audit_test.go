@@ -245,6 +245,63 @@ func TestFullChannelDropsAreCounted(t *testing.T) {
 	}
 }
 
+// TestCriticalEventsAreWrittenSynchronously covers the reason
+// criticalAuditEvents exists: an access decision must be on disk when
+// LogAuthEvent returns, not sitting in a queue that a crash or a full channel can
+// discard. The logger here is deliberately never started, so nothing drains the
+// channel — anything that reaches disk did so on the calling goroutine.
+func TestCriticalEventsAreWrittenSynchronously(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.log")
+	al, err := NewAuditLogger(config.AuditConfig{
+		Enabled: true,
+		Outputs: []config.AuditOutput{{Type: "file", Path: path}},
+	})
+	if err != nil {
+		t.Fatalf("NewAuditLogger: %v", err)
+	}
+	defer func() { _ = al.Stop() }()
+
+	// Fill the queue past capacity, so a queued event would certainly be dropped.
+	for i := 0; i < 1100; i++ {
+		al.LogAuthEvent(AuditEvent{EventType: "authentication_attempt", UserID: "alice"})
+	}
+	if al.DroppedEvents() == 0 {
+		t.Fatal("test premise broken: the queue did not overflow")
+	}
+
+	for eventType := range criticalAuditEvents {
+		al.LogAuthEvent(AuditEvent{EventType: eventType, UserID: "alice"})
+	}
+
+	written := make(map[string]bool)
+	for _, e := range readEvents(t, path) {
+		written[e.EventType] = true
+	}
+	for eventType := range criticalAuditEvents {
+		if !written[eventType] {
+			t.Errorf("%s was not on disk when LogAuthEvent returned", eventType)
+		}
+	}
+	if written["authentication_attempt"] {
+		t.Error("authentication_attempt was written synchronously; it is the high-volume event the queue exists for")
+	}
+}
+
+// TestCriticalEventsStillRespectTheAllowlist guards against the synchronous path
+// becoming a way around audit.events.
+func TestCriticalEventsStillRespectTheAllowlist(t *testing.T) {
+	al, collect := fileLogger(t, config.AuditConfig{Events: []string{"authentication_attempt"}})
+
+	al.LogAuthEvent(AuditEvent{EventType: "authentication_success", UserID: "alice"})
+
+	if events := collect(); len(events) != 0 {
+		t.Errorf("got %d events, want 0: a filtered critical event was written anyway", len(events))
+	}
+	if got := al.FilteredEvents(); got != 1 {
+		t.Errorf("FilteredEvents = %d, want 1", got)
+	}
+}
+
 func TestStopFlushesQueuedEvents(t *testing.T) {
 	al, collect := fileLogger(t, config.AuditConfig{})
 

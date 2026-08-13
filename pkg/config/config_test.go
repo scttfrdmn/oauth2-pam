@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/scttfrdmn/oauth2-pam/pkg/security/keys"
 )
 
 // validConfig is the baseline every Validate test mutates one field of.
@@ -47,6 +49,11 @@ func TestValidateAcceptsBaseline(t *testing.T) {
 }
 
 func TestValidate(t *testing.T) {
+	generatedKey, err := keys.Generate()
+	if err != nil {
+		t.Fatalf("keys.Generate: %v", err)
+	}
+
 	tests := []struct {
 		name    string
 		mutate  func(*Config)
@@ -101,7 +108,10 @@ func TestValidate(t *testing.T) {
 		{"16-byte key", func(c *Config) { c.Security.TokenEncryptionKey = strings.Repeat("a", 16) }, ""},
 		{"24-byte key", func(c *Config) { c.Security.TokenEncryptionKey = strings.Repeat("a", 24) }, ""},
 		{"32-byte key", func(c *Config) { c.Security.TokenEncryptionKey = strings.Repeat("a", 32) }, ""},
-		{"20-byte key", func(c *Config) { c.Security.TokenEncryptionKey = strings.Repeat("a", 20) }, "16, 24, or 32 bytes"},
+		{"20-byte key", func(c *Config) { c.Security.TokenEncryptionKey = strings.Repeat("a", 20) }, "token_encryption_key"},
+		// The generated form: base64, 44 characters. Validate must accept what
+		// `oauth2-pam-admin gen-key` prints.
+		{"generated base64 key", func(c *Config) { c.Security.TokenEncryptionKey = generatedKey }, ""},
 		{
 			"key length is unchecked when encryption is off",
 			func(c *Config) {

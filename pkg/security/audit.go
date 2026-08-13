@@ -47,6 +47,10 @@ type AuditLogger struct {
 	// discarded the entire audit trail would be a trap.
 	enabledEvents map[string]struct{}
 	outputs       []AuditOutput
+	// writeMu serializes writes to the outputs. Critical events are written on the
+	// caller's goroutine (see criticalAuditEvents) while the dispatcher may be
+	// writing a queued one, and Stop closes the sinks underneath both.
+	writeMu       sync.Mutex
 	eventChan     chan AuditEvent
 	stopChan      chan struct{}
 	wg            sync.WaitGroup
@@ -125,14 +129,37 @@ func (al *AuditLogger) Stop() error {
 	}
 	close(al.stopChan)
 	al.wg.Wait()
+	al.writeMu.Lock()
+	defer al.writeMu.Unlock()
 	for _, out := range al.outputs {
 		_ = out.Close()
 	}
 	return nil
 }
 
-// LogAuthEvent queues an audit event for async writing. Events whose type is
-// not in the configured audit.events allowlist are discarded here.
+// criticalAuditEvents are the events that record an access decision. They are
+// written on the calling goroutine rather than queued, so they cannot be lost to
+// a full channel or to the process dying with events still buffered.
+//
+// The buffered channel is the right default for volume — a flood of attempts must
+// not slow authentication down — but it is the wrong default for the handful of
+// events that answer "was this login allowed, and for whom". Those are the ones
+// an incident is reconstructed from, and dropping one silently means the audit
+// trail is missing exactly the record that mattered.
+//
+// authentication_attempt is deliberately not here: it is the high-volume event,
+// and it is the one the buffer exists for.
+var criticalAuditEvents = map[string]struct{}{
+	"authentication_success": {},
+	"authentication_failed":  {},
+	"authentication_denied":  {},
+	"session_revoked":        {},
+}
+
+// LogAuthEvent records an audit event. Events whose type is not in the configured
+// audit.events allowlist are discarded here. Access decisions
+// (criticalAuditEvents) are written synchronously; everything else is queued for
+// the background dispatcher and may be dropped if that queue is full.
 func (al *AuditLogger) LogAuthEvent(event AuditEvent) {
 	if !al.config.Enabled {
 		return
@@ -148,6 +175,11 @@ func (al *AuditLogger) LogAuthEvent(event AuditEvent) {
 	}
 	if event.EventID == "" {
 		event.EventID = fmt.Sprintf("audit_%d", time.Now().UnixNano())
+	}
+
+	if _, critical := criticalAuditEvents[event.EventType]; critical {
+		al.writeEvent(event)
+		return
 	}
 
 	select {
@@ -186,6 +218,8 @@ func (al *AuditLogger) writeEvent(event AuditEvent) {
 		log.Error().Err(err).Str("event_type", event.EventType).Msg("Failed to marshal audit event")
 		return
 	}
+	al.writeMu.Lock()
+	defer al.writeMu.Unlock()
 	for _, out := range al.outputs {
 		if err := out.Write(data); err != nil {
 			log.Error().Err(err).Str("event_type", event.EventType).Msg("Failed to write audit event")

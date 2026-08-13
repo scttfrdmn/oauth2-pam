@@ -12,6 +12,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/scttfrdmn/oauth2-pam/pkg/config"
 	"github.com/scttfrdmn/oauth2-pam/pkg/security"
+	"github.com/scttfrdmn/oauth2-pam/pkg/security/keys"
 )
 
 // TokenManager handles token lifecycle management including encrypted storage
@@ -102,7 +103,13 @@ func (tm *TokenManager) StoreToken(sessionID, userID, accessToken, refreshToken 
 	}
 
 	if tm.encryption != nil {
-		encrypted, err := tm.encryption.Encrypt([]byte(accessToken))
+		// []byte(accessToken) is a fresh copy of the plaintext; zeroize it once the
+		// ciphertext exists. The token's string form, and every copy the provider
+		// and net/http already made of it, are beyond reach — see keys.Zero.
+		plaintext := []byte(accessToken)
+		defer keys.Zero(plaintext)
+
+		encrypted, err := tm.encryption.Encrypt(plaintext)
 		if err != nil {
 			return "", fmt.Errorf("encrypt token: %w", err)
 		}
@@ -192,6 +199,8 @@ func (tm *TokenManager) GetDecryptedAccessToken(tokenID string) (string, error) 
 	if err != nil {
 		return "", fmt.Errorf("decrypt token: %w", err)
 	}
+	// string(decrypted) copies, so the slice can go back to zeroes immediately.
+	defer keys.Zero(decrypted)
 	return string(decrypted), nil
 }
 

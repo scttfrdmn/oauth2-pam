@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/scttfrdmn/oauth2-pam/pkg/security/keys"
 	"github.com/spf13/viper"
 )
 
@@ -305,11 +306,11 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// AES key must be 16, 24, or 32 bytes for AES-128/192/256.
+	// What counts as a valid key is defined once, in pkg/security/keys, so this
+	// check and the one at cipher construction cannot drift apart.
 	if c.Security.SecureTokenStorage && c.Security.TokenEncryptionKey != "" {
-		keyLen := len(c.Security.TokenEncryptionKey)
-		if keyLen != 16 && keyLen != 24 && keyLen != 32 {
-			return fmt.Errorf("security.token_encryption_key must be 16, 24, or 32 bytes (got %d)", keyLen)
+		if err := keys.Validate(c.Security.TokenEncryptionKey); err != nil {
+			return fmt.Errorf("security.token_encryption_key %w", err)
 		}
 	}
 

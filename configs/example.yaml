@@ -125,16 +125,26 @@ authentication:
 
 security:
   secure_token_storage: true
-  # token_encryption_key must be exactly 16, 24, or 32 characters
-  # Generate with: openssl rand -hex 16
-  # token_encryption_key: "change-me-32-byte-key-here!!!!!"
+  # Generate the key; do not invent one. 32 typeable characters hold a
+  # passphrase's worth of entropy in a 256-bit slot.
+  #
+  #   oauth2-pam-admin gen-key
+  #
+  # That prints a base64-encoded 32 bytes (44 characters), which is the preferred
+  # form. 16, 24, or 32 raw characters are still accepted for compatibility.
+  # Rotating the key invalidates the tokens held in the broker's memory, so the
+  # users holding them must authenticate again; nothing on disk is affected.
+  # token_encryption_key: "paste the output of gen-key here"
 
   # Upper bound on how long a stored token may live. Must be >= token_lifetime
   # above; the broker refuses to start otherwise.
   max_token_age: 24h
 
   rate_limiting:
-    # Per-UID sliding window on IPC requests (Linux, via SO_PEERCRED).
+    # Per-UID sliding window on IPC requests. The UID comes from the socket's
+    # peer credentials (SO_PEERCRED on Linux, LOCAL_PEERCRED on macOS/FreeBSD);
+    # the broker logs peer_credentials=false at startup if it cannot get them, in
+    # which case every caller shares one window.
     max_requests_per_minute: 60
     # Ceiling on device flows awaiting approval broker-wide. Further
     # authenticate requests are refused until one finishes or expires.

@@ -7,6 +7,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/scttfrdmn/oauth2-pam/internal/ipc"
+	"github.com/scttfrdmn/oauth2-pam/pkg/security/keys"
 	"github.com/spf13/cobra"
 )
 
@@ -49,6 +50,7 @@ func main() {
 		newListSessionsCmd(),
 		newRevokeSessionCmd(),
 		newTestMappingCmd(),
+		newGenKeyCmd(),
 	)
 
 	if err := root.Execute(); err != nil {
@@ -66,6 +68,33 @@ func newVersionCmd() *cobra.Command {
 				Str("build_date", buildDate).
 				Str("git_commit", gitCommit).
 				Msg("oauth2-pam-admin")
+		},
+	}
+}
+
+func newGenKeyCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "gen-key",
+		Short: "Generate a token_encryption_key",
+		Long: "Generate a base64-encoded 32-byte key for security.token_encryption_key,\n" +
+			"read from the operating system's CSPRNG.\n\n" +
+			"The key is printed on stdout and nowhere else — it is not written to the\n" +
+			"config file, and it is not recoverable if lost. Rotating it invalidates the\n" +
+			"tokens currently held in the broker's memory, which forces the users holding\n" +
+			"them to authenticate again; it does not affect anything on disk.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			key, err := keys.Generate()
+			if err != nil {
+				return fmt.Errorf("generate key: %w", err)
+			}
+			// stdout, not the logger: this is meant to be piped or copied, and the
+			// logger writes to stderr with a timestamp prefix. The write error is
+			// returned rather than ignored — a key the caller never received but
+			// believes it has is worse than a visible failure.
+			if _, err := fmt.Fprintln(cmd.OutOrStdout(), key); err != nil {
+				return fmt.Errorf("write key: %w", err)
+			}
+			return nil
 		},
 	}
 }

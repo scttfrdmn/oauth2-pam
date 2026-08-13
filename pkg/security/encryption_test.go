@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+
+	"github.com/scttfrdmn/oauth2-pam/pkg/security/keys"
 )
 
 const testKey = "0123456789abcdef0123456789abcdef" // 32 bytes → AES-256
@@ -132,6 +134,56 @@ func TestDecryptRejectsTamperedCiphertext(t *testing.T) {
 			t.Errorf("Decrypt accepted ciphertext with byte %d flipped", i)
 		}
 	}
+}
+
+// TestGeneratedKeyWorksEndToEnd is the test that would have failed before
+// gen-key existed: the key an administrator is told to generate must be a key the
+// broker accepts.
+func TestGeneratedKeyWorksEndToEnd(t *testing.T) {
+	key, err := keys.Generate()
+	if err != nil {
+		t.Fatalf("keys.Generate: %v", err)
+	}
+
+	e, err := NewEncryption(key)
+	if err != nil {
+		t.Fatalf("NewEncryption with a generated key: %v", err)
+	}
+
+	ciphertext, err := e.Encrypt([]byte("gho_token"))
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+	plaintext, err := e.Decrypt(ciphertext)
+	if err != nil {
+		t.Fatalf("Decrypt: %v", err)
+	}
+	if string(plaintext) != "gho_token" {
+		t.Errorf("round trip = %q, want %q", plaintext, "gho_token")
+	}
+}
+
+func TestDestroyStopsFurtherUse(t *testing.T) {
+	e, err := NewEncryption(testKey)
+	if err != nil {
+		t.Fatalf("NewEncryption: %v", err)
+	}
+
+	ciphertext, err := e.Encrypt([]byte("token"))
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+
+	e.Destroy()
+
+	if _, err := e.Encrypt([]byte("token")); err == nil {
+		t.Error("Encrypt succeeded after Destroy, want an error rather than a panic")
+	}
+	if _, err := e.Decrypt(ciphertext); err == nil {
+		t.Error("Decrypt succeeded after Destroy, want an error rather than a panic")
+	}
+
+	e.Destroy() // idempotent
 }
 
 func TestDecryptShortInput(t *testing.T) {
