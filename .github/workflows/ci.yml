@@ -14,6 +14,13 @@ permissions:
 # any commit, and that commit then runs here with the checkout and the cache. The
 # comment is what keeps the pin readable, and it is what dependabot rewrites when
 # it bumps one — see .github/dependabot.yml.
+#
+# Take the SHA from the tags list or from `git rev-parse <tag>^{commit}`, not from
+# `/git/ref/tags/<tag>`: for an annotated tag the latter returns the tag object's
+# own SHA. Actions resolves that too, so it works and looks like a pin, but it
+# names a wrapper around the commit rather than the commit — opaque to review, and
+# a level of indirection nothing else in the ecosystem expects. security.yml had
+# four of them until 2026-08-13.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
