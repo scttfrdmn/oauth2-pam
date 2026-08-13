@@ -21,16 +21,59 @@ import (
 	"github.com/scttfrdmn/oauth2-pam/pkg/config"
 )
 
-const (
-	deviceAuthEndpoint = "https://github.com/login/device/code"
-	tokenEndpoint      = "https://github.com/login/oauth/access_token"
-	apiBase            = "https://api.github.com"
-)
+// Endpoints locates the GitHub instance to talk to. The zero value is not
+// usable; call DefaultEndpoints for github.com.
+//
+// This exists so the provider can be pointed at a GitHub Enterprise Server
+// installation, and so tests can drive the real code path against a fake
+// GitHub instead of the internet.
+type Endpoints struct {
+	// DeviceAuth is the device authorization endpoint (RFC 8628 §3.1).
+	DeviceAuth string
+	// Token is the token endpoint polled while the user authorizes.
+	Token string
+	// APIBase is the REST API root, with no trailing slash.
+	APIBase string
+}
+
+// DefaultEndpoints returns the endpoints for github.com.
+func DefaultEndpoints() Endpoints {
+	return Endpoints{
+		DeviceAuth: "https://github.com/login/device/code",
+		Token:      "https://github.com/login/oauth/access_token",
+		APIBase:    "https://api.github.com",
+	}
+}
+
+// validate checks that every endpoint is set and parses, and returns the set of
+// hostnames redirects may target.
+func (e Endpoints) validate() (map[string]struct{}, error) {
+	hosts := make(map[string]struct{}, 3)
+	for name, raw := range map[string]string{
+		"device_auth": e.DeviceAuth,
+		"token":       e.Token,
+		"api_base":    e.APIBase,
+	} {
+		if raw == "" {
+			return nil, fmt.Errorf("github endpoints: %s is required", name)
+		}
+		u, err := url.Parse(raw)
+		if err != nil {
+			return nil, fmt.Errorf("github endpoints: %s is not a valid URL: %w", name, err)
+		}
+		if u.Host == "" {
+			return nil, fmt.Errorf("github endpoints: %s must be absolute (got %q)", name, raw)
+		}
+		hosts[u.Hostname()] = struct{}{}
+	}
+	return hosts, nil
+}
 
 // Provider is a GitHub OAuth2 provider that supports Device Flow auth.
 type Provider struct {
 	name       string
 	cfg        config.ProviderConfig
+	endpoints  Endpoints
 	httpClient *http.Client
 }
 
@@ -114,8 +157,14 @@ type gitHubTeam struct {
 	Organization gitHubOrg `json:"organization"`
 }
 
-// New creates a new GitHub provider from the given config.
+// New creates a new GitHub provider for github.com from the given config.
 func New(cfg config.ProviderConfig) (*Provider, error) {
+	return NewWithEndpoints(cfg, DefaultEndpoints())
+}
+
+// NewWithEndpoints creates a GitHub provider that talks to the given endpoints.
+// Use it for GitHub Enterprise Server, or in tests to target a fake GitHub.
+func NewWithEndpoints(cfg config.ProviderConfig, endpoints Endpoints) (*Provider, error) {
 	if cfg.Type != "github" {
 		return nil, fmt.Errorf("github provider: unexpected type %q", cfg.Type)
 	}
@@ -126,17 +175,24 @@ func New(cfg config.ProviderConfig) (*Provider, error) {
 		return nil, fmt.Errorf("github provider: client_secret is required")
 	}
 
+	allowedHosts, err := endpoints.validate()
+	if err != nil {
+		return nil, err
+	}
+
 	return &Provider{
-		name: cfg.Name,
-		cfg:  cfg,
+		name:      cfg.Name,
+		cfg:       cfg,
+		endpoints: endpoints,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
-			// Only follow redirects to GitHub-owned hosts. A redirect to any
-			// other host would indicate a misconfiguration or a MITM attempt.
+			// Only follow redirects back to a host we were configured to talk
+			// to. A redirect anywhere else indicates a misconfiguration or a
+			// MITM attempt, and would leak the bearer token if followed.
 			CheckRedirect: func(req *http.Request, _ []*http.Request) error {
 				h := req.URL.Hostname()
-				if h != "github.com" && !strings.HasSuffix(h, ".github.com") {
-					return fmt.Errorf("redirect to non-GitHub host %q rejected", h)
+				if _, ok := allowedHosts[h]; !ok {
+					return fmt.Errorf("redirect to unconfigured host %q rejected", h)
 				}
 				return nil
 			},
@@ -155,7 +211,7 @@ func (p *Provider) StartDeviceFlow(ctx context.Context) (*DeviceFlow, error) {
 	data.Set("client_id", p.cfg.ClientID)
 	data.Set("scope", "read:org read:user user:email")
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, deviceAuthEndpoint, strings.NewReader(data.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoints.DeviceAuth, strings.NewReader(data.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("github device flow: build request: %w", err)
 	}
@@ -216,7 +272,7 @@ func (p *Provider) PollDeviceAuthorization(ctx context.Context, deviceCode strin
 	data.Set("device_code", deviceCode)
 	data.Set("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenEndpoint, strings.NewReader(data.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoints.Token, strings.NewReader(data.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("github poll: build request: %w", err)
 	}
@@ -351,9 +407,17 @@ func (p *Provider) checkAccess(id *Identity) error {
 		}
 	}
 
-	// If no org/team requirements are set and no allowlist, allow all
+	// With no requirements of any kind configured, any authenticated identity
+	// is acceptable — the mapper is then the only gate.
 	if gh.RequireOrg == "" && len(gh.RequireTeams) == 0 && len(gh.AllowUsers) == 0 {
 		return nil
+	}
+
+	// An allowlist on its own is a restriction, not a hint: reaching here means
+	// the login was not on it, and there is no org or team requirement left for
+	// it to satisfy instead.
+	if gh.RequireOrg == "" && len(gh.RequireTeams) == 0 {
+		return fmt.Errorf("%w: %s is not in allow_users", ErrAccessForbidden, id.Login)
 	}
 
 	// Check required org
@@ -427,7 +491,7 @@ func (p *Provider) getUserTeams(ctx context.Context, accessToken string) ([]stri
 }
 
 func (p *Provider) apiGet(ctx context.Context, accessToken, path string, dest interface{}) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiBase+path, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.endpoints.APIBase+path, nil)
 	if err != nil {
 		return fmt.Errorf("build request %s: %w", path, err)
 	}
@@ -475,7 +539,7 @@ func (p *Provider) RevokeAccessToken(ctx context.Context, accessToken string) er
 		return fmt.Errorf("marshal revoke request: %w", err)
 	}
 
-	apiURL := fmt.Sprintf("%s/applications/%s/token", apiBase, p.cfg.ClientID)
+	apiURL := fmt.Sprintf("%s/applications/%s/token", p.endpoints.APIBase, p.cfg.ClientID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, apiURL, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("build revoke request: %w", err)

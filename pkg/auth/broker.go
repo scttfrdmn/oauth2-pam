@@ -143,13 +143,11 @@ type AuthResponse struct {
 	Metadata         map[string]string
 }
 
-// NewBroker creates and validates a new Broker.
+// NewBroker creates and validates a new Broker whose providers talk to
+// github.com.
 func NewBroker(cfg *config.Config) (*Broker, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("config cannot be nil")
-	}
-	if cfg.Server.SocketPath == "" {
-		return nil, fmt.Errorf("server.socket_path is required")
 	}
 	if len(cfg.Providers) == 0 {
 		return nil, fmt.Errorf("at least one provider must be configured")
@@ -163,6 +161,24 @@ func NewBroker(cfg *config.Config) (*Broker, error) {
 			return nil, fmt.Errorf("provider %q: %w", pc.Name, err)
 		}
 		providers = append(providers, p)
+	}
+
+	return NewBrokerWithProviders(cfg, providers)
+}
+
+// NewBrokerWithProviders creates a Broker from already-constructed providers.
+// It exists so callers can supply providers pointed at a non-default GitHub
+// instance — a GitHub Enterprise Server, or the fake GitHub the end-to-end
+// tests run against.
+func NewBrokerWithProviders(cfg *config.Config, providers []*github.Provider) (*Broker, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("config cannot be nil")
+	}
+	if cfg.Server.SocketPath == "" {
+		return nil, fmt.Errorf("server.socket_path is required")
+	}
+	if len(providers) == 0 {
+		return nil, fmt.Errorf("at least one provider must be configured")
 	}
 
 	tokenManager, err := NewTokenManager(cfg)

@@ -82,11 +82,6 @@ test-unit:
 	@echo "Running unit tests..."
 	go test $(GO_TEST_FLAGS) ./pkg/... ./internal/...
 
-## Run integration tests
-test-integration:
-	@echo "Running integration tests..."
-	go test $(GO_TEST_FLAGS) ./test/integration/...
-
 ## Install binaries to system locations
 install: build
 	@echo "Installing binaries..."
@@ -185,7 +180,6 @@ help:
 	@echo "  build-admin       Build admin CLI tool"
 	@echo "  test              Run all tests"
 	@echo "  test-unit         Run unit tests only"
-	@echo "  test-integration  Run integration tests"
 	@echo "  install           Install binaries to system"
 	@echo "  install-dev       Install development version"
 	@echo "  clean             Clean build artifacts"
