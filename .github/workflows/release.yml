@@ -56,6 +56,11 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+          # The newest patch of the major go.mod names, not whatever patch the
+          # runner image happens to have cached. A released .so and the three
+          # binaries should not ship with known standard-library advisories
+          # compiled into them; see the note in security.yml.
+          check-latest: true
           cache: true
 
       - name: Install PAM and json-c headers

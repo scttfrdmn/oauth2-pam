@@ -28,10 +28,17 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # check-latest: go.mod names a major (`go 1.25`), and the default is to use
+      # whatever 1.25.x the runner image cached, which lags the current release by
+      # weeks. Building and testing on the newest patch of the pinned major is
+      # what keeps this job honest about the toolchain a release is built with —
+      # and it is what stops govulncheck in security.yml from failing on
+      # standard-library advisories already fixed upstream.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
+          check-latest: true
 
       - name: Install PAM and json-c headers
         run: |
@@ -67,6 +74,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+          check-latest: true
       - run: go build ./...
       - run: go vet ./...
       - run: go test ./...
@@ -80,6 +88,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+          check-latest: true
       - name: Install PAM and json-c headers
         run: |
           sudo apt-get update
