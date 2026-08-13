@@ -244,6 +244,8 @@ The end-to-end tests in `internal/ipc` drive a real broker behind a real IPC ser
 
 `make test-integration` covers the other half of the protocol, which Go tests cannot reach: two containers, one running `sshd` with `oauth2_pam.so` in `/etc/pam.d/sshd` and one running the broker, with logins driven over a real ssh connection. It needs Docker and nothing else — no OAuth app, no credentials, no network. See [test/integration/README.md](test/integration/README.md) for the cases and how a device-flow prompt is answered without a human.
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how work is tracked (labels, milestones, the roadmap board), what to run before pushing, and the two invariants that are easy to break.
+
 ## Project Structure
 
 ```
