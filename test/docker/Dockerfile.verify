@@ -14,11 +14,12 @@ RUN apt-get update \
       libjson-c-dev \
  && rm -rf /var/lib/apt/lists/*
 
-# The golang images set GOTOOLCHAIN=local, which pins the toolchain to the one in
-# the image. CI leaves it at the default (auto), and golangci-lint is built with a
-# newer Go than this project targets — so without this, the install below fails
-# here while succeeding in CI. Building the project itself still uses the image's
-# 1.24, because that is what go.mod asks for.
+# The golang images set GOTOOLCHAIN=local, and so does actions/setup-go v6+. That
+# is the right default for building this project — no silent toolchain
+# substitution — but golangci-lint is built with a newer Go than go.mod targets, so
+# installing it needs the default resolution back. ci.yml scopes the same override
+# to its install step. Building the project still uses the image's 1.24, because
+# that is what go.mod asks for.
 ENV GOTOOLCHAIN=auto
 
 # Pinned to the same version as .github/workflows/ci.yml. If these drift, a local

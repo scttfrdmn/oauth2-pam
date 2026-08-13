@@ -80,11 +80,21 @@ jobs:
       # the Security tab for triage. The gates that must stay hard are in ci.yml.
       - name: Run gosec
         continue-on-error: true
+        # setup-go v6+ exports GOTOOLCHAIN=local, which is what we want for
+        # building and testing this project — it must not silently compile with a
+        # toolchain nobody chose. But gosec is built with a newer Go than go.mod
+        # targets, so installing it needs the default resolution back.
+        env:
+          GOTOOLCHAIN: auto
         run: |
           go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
           gosec -fmt sarif -out gosec.sarif -exclude-dir=test ./...
 
+      # Only if gosec got far enough to write one. Without this guard a gosec
+      # crash fails the job on a missing file, defeating the continue-on-error
+      # above — the step's own failure is still visible in the run.
       - name: Upload results
+        if: hashFiles('gosec.sarif') != ''
         uses: github/codeql-action/upload-sarif@988661ebb5e81487b3fb31b2185d2856c0a10679 # v4
         with:
           sarif_file: gosec.sarif
@@ -109,6 +119,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends libpam0g-dev libjson-c-dev
 
       - name: Run govulncheck
+        # See the note on gosec: GOTOOLCHAIN=local from setup-go blocks installing
+        # a tool that requires a newer Go than go.mod targets.
+        env:
+          GOTOOLCHAIN: auto
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
