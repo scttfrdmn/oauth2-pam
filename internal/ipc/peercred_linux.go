@@ -18,7 +18,9 @@ func peerUID(conn net.Conn) uint32 {
 	if err != nil {
 		return 0
 	}
-	defer f.Close()
+	// uc.File() dups the descriptor, so this Close releases only the copy; the
+	// connection itself is unaffected and the error has nowhere useful to go.
+	defer func() { _ = f.Close() }()
 	ucred, err := syscall.GetsockoptUcred(int(f.Fd()), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
 	if err != nil {
 		return 0

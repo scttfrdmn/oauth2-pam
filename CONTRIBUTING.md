@@ -55,6 +55,15 @@ gofmt -l ./cmd ./pkg ./internal ./test
 make test-integration   # needs Docker; see test/integration/README.md
 ```
 
+On macOS, add a second lint pass for the files a Mac never compiles
+(`peercred_linux.go`, `cgo_bridge_linux.c`'s Go side):
+
+```sh
+GOOS=linux golangci-lint run ./...
+```
+
+Without it, `_linux.go` files are invisible to local lint and first fail in CI.
+
 CI runs all of it on every push and pull request: Linux (where the module
 compiles and `SO_PEERCRED` is real), macOS (where it must still build), lint, and
 the container harness.
