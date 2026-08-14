@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/syslog"
 	"os"
 	"path/filepath"
@@ -141,29 +142,27 @@ func TestAuditFilePermissions(t *testing.T) {
 }
 
 // TestEventAllowlistFilters is the point of audit.events: types outside the
-// list are dropped, and the drop is counted rather than silent.
+// list are dropped, and the drop is counted rather than silent. Only the
+// non-critical events are filterable, so those are what it uses.
 func TestEventAllowlistFilters(t *testing.T) {
 	al, collect := fileLogger(t, config.AuditConfig{
-		Events: []string{"authentication_success", "authentication_denied"},
+		Events: []string{"authentication_attempt"},
 	})
 
-	al.LogAuthEvent(AuditEvent{EventType: "authentication_success", UserID: "alice"})
-	al.LogAuthEvent(AuditEvent{EventType: "authentication_attempt", UserID: "alice"}) // filtered
-	al.LogAuthEvent(AuditEvent{EventType: "authentication_denied", UserID: "bob"})
-	al.LogAuthEvent(AuditEvent{EventType: "session_revoked", UserID: "alice"}) // filtered
+	al.LogAuthEvent(AuditEvent{EventType: "authentication_attempt", UserID: "alice"})
+	al.LogAuthEvent(AuditEvent{EventType: "device_flow_failed", UserID: "alice"}) // filtered
+	al.LogAuthEvent(AuditEvent{EventType: "device_flow_failed", UserID: "bob"})   // filtered
 
 	if got := al.FilteredEvents(); got != 2 {
 		t.Errorf("FilteredEvents = %d, want 2", got)
 	}
 
 	events := collect()
-	if len(events) != 2 {
-		t.Fatalf("got %d events, want 2", len(events))
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
 	}
-	for _, e := range events {
-		if e.EventType != "authentication_success" && e.EventType != "authentication_denied" {
-			t.Errorf("event type %q was written despite not being allowlisted", e.EventType)
-		}
+	if events[0].EventType != "authentication_attempt" {
+		t.Errorf("event type %q was written despite not being allowlisted", events[0].EventType)
 	}
 }
 
@@ -288,18 +287,82 @@ func TestCriticalEventsAreWrittenSynchronously(t *testing.T) {
 	}
 }
 
-// TestCriticalEventsStillRespectTheAllowlist guards against the synchronous path
-// becoming a way around audit.events.
-func TestCriticalEventsStillRespectTheAllowlist(t *testing.T) {
+// TestTheAllowlistCannotSuppressAnAccessDecision: audit.events is a volume
+// control, not a way to stop recording who was let in. A narrow allowlist that
+// names only authentication_attempt used to give a broker that granted logins and
+// wrote nothing about them, with a filteredCount as the only trace — which is the
+// shape of a deliberately blinded host as much as a misconfigured one.
+func TestTheAllowlistCannotSuppressAnAccessDecision(t *testing.T) {
 	al, collect := fileLogger(t, config.AuditConfig{Events: []string{"authentication_attempt"}})
 
-	al.LogAuthEvent(AuditEvent{EventType: "authentication_success", UserID: "alice"})
-
-	if events := collect(); len(events) != 0 {
-		t.Errorf("got %d events, want 0: a filtered critical event was written anyway", len(events))
+	for eventType := range criticalAuditEvents {
+		al.LogAuthEvent(AuditEvent{EventType: eventType, UserID: "alice", Success: true})
 	}
-	if got := al.FilteredEvents(); got != 1 {
-		t.Errorf("FilteredEvents = %d, want 1", got)
+
+	written := make(map[string]bool)
+	for _, e := range collect() {
+		written[e.EventType] = true
+	}
+	for eventType := range criticalAuditEvents {
+		if !written[eventType] {
+			t.Errorf("%s was suppressed by an audit.events allowlist that omits it", eventType)
+		}
+	}
+	if got := al.FilteredEvents(); got != 0 {
+		t.Errorf("FilteredEvents = %d, want 0: an access decision was counted as filtered", got)
+	}
+}
+
+// failingOutput is a sink that cannot write — a full disk, or a syslog socket that
+// has gone away.
+type failingOutput struct {
+	err    error
+	writes int
+}
+
+func (o *failingOutput) Write([]byte) error {
+	o.writes++
+	return o.err
+}
+
+func (o *failingOutput) Close() error { return nil }
+
+// TestAWriteFailureOnACriticalEventReachesTheCaller: a sink that cannot be written
+// to means a granted login recorded nowhere. That used to be a log line the calling
+// path never saw, so the broker went on to grant the session; now the failure comes
+// back and whoever made the decision can act on it.
+func TestAWriteFailureOnACriticalEventReachesTheCaller(t *testing.T) {
+	al, err := NewAuditLogger(config.AuditConfig{
+		Enabled: true,
+		Outputs: []config.AuditOutput{{Type: "stdout"}},
+	})
+	if err != nil {
+		t.Fatalf("NewAuditLogger: %v", err)
+	}
+	defer func() { _ = al.Stop() }()
+
+	sinkErr := errors.New("no space left on device")
+	broken := &failingOutput{err: sinkErr}
+	working := &failingOutput{}
+	al.outputs = []AuditOutput{broken, working}
+
+	err = al.LogAuthEventErr(AuditEvent{EventType: "authentication_success", UserID: "alice", Success: true})
+	if err == nil {
+		t.Fatal("LogAuthEventErr reported success for an access decision that reached no sink")
+	}
+	if !errors.Is(err, sinkErr) {
+		t.Errorf("err = %v, want it to wrap the sink's error", err)
+	}
+	// The other sink is still tried: a broken file output must not cost the record
+	// on syslog too.
+	if working.writes != 1 {
+		t.Errorf("the healthy sink saw %d writes, want 1", working.writes)
+	}
+
+	// A queued event has not been written when LogAuthEventErr returns, so it has
+	// nothing to report.
+	if err := al.LogAuthEventErr(AuditEvent{EventType: "authentication_attempt", UserID: "alice"}); err != nil {
+		t.Errorf("LogAuthEventErr on a queued event = %v, want nil", err)
 	}
 }
 
