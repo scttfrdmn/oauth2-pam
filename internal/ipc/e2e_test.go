@@ -451,6 +451,72 @@ func TestRefreshRejectsPendingSession(t *testing.T) {
 	}
 }
 
+// TestRefreshRefusesExpiredSessionOnTheWire is the wire half of the refusal
+// docs/wire-protocol.md now specifies: an expired session is refused with
+// SESSION_EXPIRED, not extended.
+//
+// The broker used to answer this exact request with `success: true`,
+// `status: "authorized"` and the mapped `user_id` — the tuple the PAM module
+// grants a login on — because RefreshSession had no expiry check and
+// `time.Until` of a past instant is simply negative. `check_session` has always
+// refused it, so the two verbs disagreed and calling this one first was a way
+// around the one that was right. Driven over the socket rather than in-process
+// because the disagreement is between two *wire verbs*, and a client picks which
+// one it sends.
+//
+// What this test pins is the *answer*, not which check produced it: a session and
+// its stored token are both given authentication.token_lifetime, so from out here
+// they run out together and either the expiry check or the token check will refuse
+// this request. Verified against the shipped code, which had neither, and it
+// returned `authorized`. The expiry check on its own is pinned by
+// TestRefreshRefusesExpiredAuthorizedSession in pkg/auth, where the session's
+// token can be given a lifetime of its own.
+func TestRefreshRefusesExpiredSessionOnTheWire(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) {
+		// Short enough for a test to outlive a session, long enough that the
+		// device flow has time to finish first.
+		c.Authentication.TokenLifetime = 2 * time.Second
+		c.Authentication.RefreshThreshold = time.Second
+	})
+
+	start := h.authenticate("alice")
+	h.fake.grant()
+
+	authorized := h.waitForTerminal(start.SessionID)
+	if !authorized.Success {
+		t.Fatalf("setup: flow did not authorize: %+v", authorized)
+	}
+
+	// The reply says when the session expires, so the wait is bounded by the
+	// broker's own answer rather than by a guess about timing.
+	time.Sleep(time.Until(authorized.ExpiresAt) + 250*time.Millisecond)
+
+	resp := h.roundtrip(Request{Type: "refresh_session", SessionID: start.SessionID})
+	if resp.Success {
+		t.Errorf("refresh_session extended an expired session: status=%q user_id=%q expires_at=%s",
+			resp.Status, resp.UserID, resp.ExpiresAt)
+	}
+	if resp.Status != auth.StatusExpired {
+		t.Errorf("status = %q, want %q", resp.Status, auth.StatusExpired)
+	}
+	if resp.ErrorCode != "SESSION_EXPIRED" {
+		t.Errorf("error_code = %q, want SESSION_EXPIRED", resp.ErrorCode)
+	}
+	if resp.UserID != "" {
+		t.Errorf("user_id = %q, want empty on a refusal", resp.UserID)
+	}
+
+	// And the refusal is not a "try again later": the session is gone, so a
+	// second attempt cannot find anything to extend either.
+	again := h.roundtrip(Request{Type: "refresh_session", SessionID: start.SessionID})
+	if again.Success {
+		t.Error("a second refresh_session authorized the expired session")
+	}
+	if after := h.check(start.SessionID); after.Success {
+		t.Error("check_session authorizes a session refresh_session had just refused")
+	}
+}
+
 // TestUnknownSessionIsNotAuthorized covers a forged or stale session ID.
 func TestUnknownSessionIsNotAuthorized(t *testing.T) {
 	h := newHarness(t)

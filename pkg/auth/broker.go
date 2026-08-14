@@ -487,6 +487,24 @@ func terminalErrorCode(status string) string {
 }
 
 // RefreshSession extends a session if it is close to expiry.
+//
+// A refresh is an extension of something that is still live, never a second
+// chance at an authorization. Three things must hold; only the first of them used
+// to be checked:
+//
+//   - The session is authorized. A pending or terminally failed session has
+//     nothing to extend.
+//   - It has not already expired. An expired session is removed and answered
+//     SESSION_EXPIRED, exactly as CheckSession does — the two verbs used to
+//     disagree, and a client that called refresh_session first never reached the
+//     check that would have noticed, so an expired session came back authorized
+//     with an hour added to it.
+//   - It is not past the absolute security.max_token_age ceiling. That is the
+//     one bound a refresh loop cannot talk its way around; see #43.
+//
+// The extension itself goes through extendSession, a compare-and-set, because
+// the session read here is a snapshot and writing it back wholesale undid any
+// concurrent revocation.
 func (b *Broker) RefreshSession(sessionID string) (*AuthResponse, error) {
 	session := b.getSession(sessionID)
 	if session == nil {
@@ -505,16 +523,109 @@ func (b *Broker) RefreshSession(sessionID string) (*AuthResponse, error) {
 		}, nil
 	}
 
+	now := time.Now()
+
+	if session.ExpiresAt.Before(now) {
+		b.removeSession(sessionID)
+		return expiredSessionResponse(sessionID, "Session has expired"), nil
+	}
+
+	// The absolute age ceiling, checked before the "no extension needed" branch
+	// below so that neither answer can report a session the operator's policy
+	// says is over as authorized. Past it the session is revoked rather than
+	// refused-and-left: its token is destroyed at the provider, which is the
+	// whole point of having a ceiling.
+	if b.pastMaxTokenAge(session, now) {
+		log.Info().
+			Str("session_id", sessionID).
+			Str("local_user", session.LocalUser).
+			Dur("age", now.Sub(session.CreatedAt)).
+			Dur("max_token_age", b.config.Security.MaxTokenAge).
+			Msg("Session reached security.max_token_age; revoking instead of extending")
+		if err := b.RevokeSession(sessionID); err != nil {
+			log.Warn().Err(err).Str("session_id", sessionID).
+				Msg("Failed to revoke a session past max_token_age")
+		}
+		return expiredSessionResponse(sessionID,
+			"Session has reached the maximum permitted age"), nil
+	}
+
+	// The token is what the session authorizes the use of. If it no longer
+	// resolves it has been revoked or has aged out of the store, and the session
+	// is a shell that must not be reported as authorized — let alone extended.
+	//
+	// This is deliberately a second, independent check on the same fact the
+	// compare-and-set below establishes: it is the one that catches a session
+	// that was resurrected, or was never torn down properly, by some path other
+	// than the window between the read above and the write below.
+	if session.TokenID != "" {
+		if _, err := b.tokenManager.GetDecryptedAccessToken(session.TokenID); err != nil {
+			log.Warn().Err(err).Str("session_id", sessionID).
+				Msg("Authorized session has no usable token; refusing to refresh")
+			b.removeSession(sessionID)
+			return expiredSessionResponse(sessionID, "Session credentials are no longer valid"), nil
+		}
+	}
+
 	if time.Until(session.ExpiresAt) > b.config.Authentication.RefreshThreshold {
 		return b.successResponse(session), nil
 	}
 
-	// Extend the session lifetime
-	session.ExpiresAt = time.Now().Add(b.config.Authentication.TokenLifetime)
-	session.LastAccessed = time.Now()
-	b.setSession(session)
+	// Extend the session lifetime, but only if it is still the same authorized
+	// session that was read above.
+	expiresAt := now.Add(b.config.Authentication.TokenLifetime)
+	if !b.extendSession(sessionID, session.CreatedAt, func(s *Session) {
+		s.ExpiresAt = expiresAt
+		s.LastAccessed = now
+	}) {
+		// Revoked, expired, or replaced while this call was deciding. Report what
+		// is true now rather than the snapshot's view of it. The error codes are
+		// the same two a caller would have got a moment earlier; the messages name
+		// the window, because "it was there when I read it" is the only distinction
+		// worth having in a log — and it is what a test can count to know the
+		// window was really exercised.
+		if live := b.getSession(sessionID); live != nil {
+			return &AuthResponse{
+				Success:      false,
+				Status:       live.Status,
+				SessionID:    sessionID,
+				ErrorCode:    "SESSION_NOT_ACTIVE",
+				ErrorMessage: msgDeactivatedWhileRefreshing,
+			}, nil
+		}
+		return errorResponse("SESSION_NOT_FOUND", msgRevokedWhileRefreshing), nil
+	}
+
+	// session is this call's private snapshot and never goes back into the map;
+	// bringing it up to date is only so the reply states the expiry that was
+	// actually stored.
+	session.ExpiresAt = expiresAt
+	session.LastAccessed = now
 
 	return b.successResponse(session), nil
+}
+
+// The two messages RefreshSession uses when its compare-and-set refuses, named
+// so the race regression test can count the interleavings it claims to exercise
+// instead of assuming they happened. error_message is diagnostic by contract —
+// see docs/wire-protocol.md — so no client decides anything on these.
+const (
+	msgRevokedWhileRefreshing     = "Session was revoked while it was being refreshed"
+	msgDeactivatedWhileRefreshing = "Session stopped being authorized while it was being refreshed"
+)
+
+// expiredSessionResponse is the reply for a session that has run out of time,
+// whether by its own expiry or by the absolute age ceiling. Both are
+// SESSION_EXPIRED: from a client's point of view the session ran out of time,
+// and the reason is the broker's log's business.
+func expiredSessionResponse(sessionID, message string) *AuthResponse {
+	return &AuthResponse{
+		Success:      false,
+		Status:       StatusExpired,
+		SessionID:    sessionID,
+		ErrorCode:    "SESSION_EXPIRED",
+		ErrorMessage: message,
+	}
 }
 
 // RevokeSession removes a session and revokes its stored access token.
@@ -889,6 +1000,47 @@ func (b *Broker) activateSession(sessionID string, createdAt time.Time, mutate f
 	return true
 }
 
+// extendSession pushes an authorized session's lifetime out under a single lock,
+// applying mutate to the stored entry. It returns false — changing nothing — if
+// the session is gone, is no longer an authorized one, or is not the same
+// session the caller read: as in activateSession, CreatedAt distinguishes a
+// session that was removed and had its ID reused from the one being refreshed.
+//
+// It exists for the same reason activateSession does. RefreshSession decides on a
+// snapshot, and writing that snapshot back with setSession was a lost update: a
+// RevokeSession or a cleanup pass that deleted the session in between was
+// silently undone, and the re-inserted entry named a TokenID that had already
+// been destroyed at the provider. The result was an authorized session with no
+// token, no poller, and a brand-new hour to live, which check_session answered
+// with success. Reproduced on 1 of 200 unassisted attempts before this.
+func (b *Broker) extendSession(sessionID string, createdAt time.Time, mutate func(*Session)) bool {
+	b.sessionMutex.Lock()
+	defer b.sessionMutex.Unlock()
+
+	s, ok := b.sessions[sessionID]
+	if !ok || !s.IsActive || s.Status != StatusAuthorized || !s.CreatedAt.Equal(createdAt) {
+		return false
+	}
+	mutate(s)
+	return true
+}
+
+// pastMaxTokenAge reports whether a session has outlived
+// security.max_token_age, the absolute ceiling on how old a session may become
+// however many times it is refreshed. Measured from CreatedAt, which no
+// extension moves.
+//
+// 0 means unset, matching the config-consistency check in pkg/config that was
+// for a while the only place this value was read at all. The comparison is
+// strictly greater-than, so a session exactly at the ceiling is still inside it.
+func (b *Broker) pastMaxTokenAge(s *Session, now time.Time) bool {
+	max := b.config.Security.MaxTokenAge
+	if max <= 0 {
+		return false
+	}
+	return now.Sub(s.CreatedAt) > max
+}
+
 // baseContext is the parent for per-session polling contexts. Start records the
 // broker's context; a broker used without Start (some tests, and any future
 // caller that only wants Authenticate) still needs a usable parent.
@@ -1159,26 +1311,38 @@ func (b *Broker) sessionCleanup(ctx context.Context) {
 		case <-b.stopChan:
 			return
 		case <-ticker.C:
-			now := time.Now()
-			var expired []string
-
-			b.sessionMutex.RLock()
-			for id, s := range b.sessions {
-				if s.ExpiresAt.Before(now) {
-					expired = append(expired, id)
-				}
-			}
-			b.sessionMutex.RUnlock()
-
-			for _, id := range expired {
-				if err := b.RevokeSession(id); err != nil {
-					log.Warn().Err(err).Str("session_id", id).Msg("Failed to revoke expired session during cleanup")
-				}
-			}
-
-			if len(expired) > 0 {
-				log.Info().Int("count", len(expired)).Msg("Cleaned up expired sessions")
-			}
+			b.cleanupExpiredSessions(time.Now())
 		}
 	}
+}
+
+// cleanupExpiredSessions revokes every session that has run out of time and
+// returns how many it revoked. A session is out of time either because its own
+// ExpiresAt has passed or because it has outlived security.max_token_age — the
+// ceiling has to be swept for as well as checked on refresh, or a session nobody
+// ever calls refresh_session on simply lives to its extended expiry.
+//
+// Split out of sessionCleanup's ticker loop, and takes `now` as an argument, so
+// a test can drive one sweep instead of waiting five minutes for the tick.
+func (b *Broker) cleanupExpiredSessions(now time.Time) int {
+	var expired []string
+
+	b.sessionMutex.RLock()
+	for id, s := range b.sessions {
+		if s.ExpiresAt.Before(now) || b.pastMaxTokenAge(s, now) {
+			expired = append(expired, id)
+		}
+	}
+	b.sessionMutex.RUnlock()
+
+	for _, id := range expired {
+		if err := b.RevokeSession(id); err != nil {
+			log.Warn().Err(err).Str("session_id", id).Msg("Failed to revoke expired session during cleanup")
+		}
+	}
+
+	if len(expired) > 0 {
+		log.Info().Int("count", len(expired)).Msg("Cleaned up expired sessions")
+	}
+	return len(expired)
 }
