@@ -50,6 +50,14 @@ var unixUsernameRe = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
 // DefaultMinUID is the floor applied when mapper.min_uid is unset. 1000 is the
 // first non-system UID on Debian, Ubuntu, RHEL 7+, and SUSE; UID_MIN in
 // /etc/login.defs is 1000 on all of them.
+//
+// There is no way to switch the floor off. A negative min_uid used to do that,
+// and config.Validate now refuses one: a site with real accounts below 1000 says
+// so by setting the floor to the lowest UID it means to allow, and a site with a
+// real person named after a service account uses mapper.allow_system_users, which
+// exempts a name from the denylist and not from the floor. New() clamps a negative
+// value it is handed to this default rather than honouring it, so the two agree
+// however the Config was built.
 const DefaultMinUID = 1000
 
 // systemAccounts are local accounts a provider identity may never be mapped to,
@@ -137,6 +145,20 @@ var errUserUnknown = errors.New("no such local user")
 func New(cfg config.MapperConfig) *Chain {
 	minUID := cfg.MinUID
 	if minUID == 0 {
+		// 0 is "unset", so a Config built in code rather than loaded from a file
+		// still gets the floor.
+		minUID = DefaultMinUID
+	}
+	if minUID < 0 {
+		// A negative min_uid was once how the floor was turned off. config.Validate
+		// rejects one now, so a loaded config cannot reach here — but a Config built
+		// in code can, and honouring it would leave a broker running with no floor
+		// and only the name denylist, which on an LDAP or SSSD host a broker built
+		// without cgo cannot even resolve a name against. Clamped to the default and
+		// said out loud, because the quiet version of this is a host that believes
+		// it has a floor.
+		log.Warn().Int("min_uid", cfg.MinUID).Int("using", DefaultMinUID).
+			Msg("mapper: a negative mapper.min_uid does not disable the UID floor; using the default")
 		minUID = DefaultMinUID
 	}
 	allowSystem := make(map[string]bool, len(cfg.AllowSystemUsers))
@@ -686,7 +708,9 @@ func (c *Chain) checkLocalUser(tier, name string) error {
 			Msg("mapper: refusing to map an identity to UID 0")
 		return fmt.Errorf("%w: %s produced %q, which is UID 0", ErrForbiddenLocalUser, tier, name)
 	}
-	if c.minUID >= 0 && uid < c.minUID {
+	// Unconditional: minUID is always positive here (see New), so there is no
+	// value of mapper.min_uid that reaches this line with the floor switched off.
+	if uid < c.minUID {
 		log.Warn().Str("tier", tier).Str("local_user", name).Int("uid", uid).Int("min_uid", c.minUID).
 			Msg("mapper: refusing to map an identity to an account below the UID floor")
 		return fmt.Errorf("%w: %s produced %q (uid %d), below mapper.min_uid %d",

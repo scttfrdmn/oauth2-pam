@@ -82,9 +82,15 @@ type Token struct {
 	Scope       string
 	ExpiresAt   time.Time
 
-	// Fingerprint is a short, non-reversible label for logs and audit records.
-	// It is not a cryptographic identifier — TokenManager computes a SHA-256
-	// fingerprint for that.
+	// Fingerprint identifies this token in logs and audit records without
+	// containing any of it: the hex encoding of the first 16 bytes of the token's
+	// SHA-256 digest. An implementation must produce exactly that, because
+	// TokenManager fingerprints the stored token the same way and an audit trail
+	// lines a session up with its token by comparing the two.
+	//
+	// It replaced a prefix…suffix elision of the token itself, which put 16 bytes
+	// of the live secret in a field labelled "for audit logs". Nothing here may
+	// carry any part of AccessToken.
 	Fingerprint string
 }
 

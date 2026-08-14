@@ -116,15 +116,25 @@ func TestUIDFloorRefusesAccountsBelowIt(t *testing.T) {
 		t.Errorf("min_uid 100 refused uid 120: %v", err)
 	}
 
-	// UID 0 is refused even with the floor disabled and the name allowlisted,
+	// A negative min_uid does not turn the floor off. It used to, config.Validate
+	// refuses one now, and New clamps one it is handed to DefaultMinUID — so the
+	// two cannot disagree for a Config built in code, which is the only way a
+	// negative value still reaches the mapper at all.
+	negative := cfg
+	negative.MinUID = -1
+	c = chainWithPasswd(t, negative, passwd)
+	if _, err := c.Map(context.Background(), identityWithLogin("svc"), ""); !errors.Is(err, ErrForbiddenLocalUser) {
+		t.Errorf("min_uid -1 admitted uid 120: error = %v; a negative floor must not disable the floor", err)
+	}
+
+	// UID 0 is refused whatever the floor says and even with the name allowlisted,
 	// because the name is not what is being checked.
-	off := cfg
-	off.MinUID = -1
+	off := negative
 	off.AllowSystemUsers = []string{"zero"}
 	c = chainWithPasswd(t, off, passwd)
 	_, err := c.Map(context.Background(), identityWithLogin("zero"), "")
 	if !errors.Is(err, ErrForbiddenLocalUser) {
-		t.Errorf("uid 0 with the floor disabled: error = %v, want ErrForbiddenLocalUser", err)
+		t.Errorf("uid 0 with a negative min_uid: error = %v, want ErrForbiddenLocalUser", err)
 	}
 	if err != nil && !strings.Contains(err.Error(), "UID 0") {
 		t.Errorf("error = %q, want it to name UID 0 as the reason", err)
