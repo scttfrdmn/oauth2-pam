@@ -350,8 +350,27 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 		return errorResponse("DEVICE_FLOW_FAILED", err.Error()), nil
 	}
 
-	// Generate QR code (best-effort)
-	qrCode, err := GenerateQRCode(deviceFlow.DeviceURL)
+	// The provider chose these two strings, and they are printed to a terminal by
+	// a root process before anyone has authenticated — so they are sanitized here,
+	// once, at the point they enter an AuthResponse.
+	//
+	// Sanitizing them in the prompt formatters is not sufficient, and it was
+	// tempting to stop there. The reply also carries device_url and device_code as
+	// their own fields, and docs/wire-protocol.md describes them as "the parts, for
+	// a client that wants to format its own prompt" — an invitation this project
+	// extends to consumers it does not control. A consumer that accepts it would
+	// receive raw provider bytes and draw them on a pre-auth tty. The contract has
+	// to be clean at the boundary, not merely clean by the time this
+	// implementation's own formatter is done with it.
+	//
+	// For github.com this is theoretical. For a configured Enterprise base_url it
+	// is not: that server picks verification_uri and user_code, so without this it
+	// picks what every host configured against it draws on screen. See #45.
+	deviceURL := SanitizePromptValue(deviceFlow.DeviceURL)
+	userCode := SanitizePromptValue(deviceFlow.UserCode)
+
+	// Generated from the sanitized URL, so the QR encodes what the text says.
+	qrCode, err := GenerateQRCode(deviceURL)
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to generate QR code")
 		qrCode = ""
@@ -401,8 +420,8 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 		Success:        false,
 		Status:         StatusPending,
 		SessionID:      sessionID,
-		DeviceCode:     deviceFlow.UserCode,
-		DeviceURL:      deviceFlow.DeviceURL,
+		DeviceCode:     userCode,
+		DeviceURL:      deviceURL,
 		QRCode:         qrCode,
 		ExpiresAt:      expiresAt,
 		RequiresDevice: true,

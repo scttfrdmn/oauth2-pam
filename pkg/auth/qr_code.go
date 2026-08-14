@@ -23,9 +23,20 @@ func GenerateQRCode(url string) (string, error) {
 // So none of these may promise that authorization completes on its own. It
 // does not — a user who approves on their phone and waits, having been told
 // waiting is all that is required, sits there until the login times out.
+//
+// They are also printed by the module's conversation function, as root, before
+// authentication completes, so every formatter below sanitizes its
+// provider-supplied arguments before writing them into the template. Doing it
+// here rather than at the call site in internal/ipc covers all three prompts
+// however they are reached, and cannot be forgotten by a fourth. See
+// sanitize.go for the policy and why it differs between a value and a block.
 
 // FormatDeviceInstructions formats the device flow prompt for SSH / generic terminal.
 func FormatDeviceInstructions(deviceURL, userCode, qrCode string) string {
+	deviceURL = SanitizePromptValue(deviceURL)
+	userCode = SanitizePromptValue(userCode)
+	qrCode = SanitizePromptBlock(qrCode)
+
 	var b strings.Builder
 
 	b.WriteString("GitHub Authentication Required\n")
@@ -53,6 +64,10 @@ func FormatDeviceInstructions(deviceURL, userCode, qrCode string) string {
 
 // FormatConsoleInstructions formats the device flow prompt for a console login.
 func FormatConsoleInstructions(deviceURL, userCode, qrCode string) string {
+	deviceURL = SanitizePromptValue(deviceURL)
+	userCode = SanitizePromptValue(userCode)
+	qrCode = SanitizePromptBlock(qrCode)
+
 	var b strings.Builder
 
 	b.WriteString("\nGitHub Authentication Required\n\n")
@@ -74,6 +89,11 @@ func FormatConsoleInstructions(deviceURL, userCode, qrCode string) string {
 
 // FormatGUIInstructions formats the device flow prompt for a GUI login manager.
 func FormatGUIInstructions(deviceURL, userCode, qrCode string) string {
+	// qrCode is deliberately not used: a GUI login dialog renders plain text and
+	// ASCII art would be unreadable there. Nothing to sanitize as a result.
+	deviceURL = SanitizePromptValue(deviceURL)
+	userCode = SanitizePromptValue(userCode)
+
 	var b strings.Builder
 
 	b.WriteString("Authentication Required\n\n")
