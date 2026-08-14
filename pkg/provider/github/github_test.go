@@ -2,6 +2,8 @@ package github
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,7 +26,8 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// realisticToken is long enough that tokenDisplayLabel actually elides it.
+// realisticToken has the length and shape of a real GitHub access token, so a
+// fingerprint of it is being asked to hide something worth hiding.
 const realisticToken = "gho_16C7e42F292c6912E7710c838347Ae178B4a"
 
 func providerConfig() config.ProviderConfig {
@@ -479,13 +482,13 @@ func TestPollSendsClientCredentialsAndDeviceCode(t *testing.T) {
 	if tok.AccessToken != realisticToken {
 		t.Errorf("AccessToken = %q", tok.AccessToken)
 	}
-	// The label is what reaches the logs, so it must be an elision rather than
-	// the token itself.
+	// The fingerprint is what reaches the logs and the session record, so it must
+	// be a digest rather than any part of the token itself.
 	if tok.Fingerprint == tok.AccessToken {
 		t.Error("Fingerprint is the raw token")
 	}
-	if strings.Contains(tok.Fingerprint, realisticToken) {
-		t.Error("Fingerprint contains the raw token")
+	if want := tokenFingerprint(realisticToken); tok.Fingerprint != want {
+		t.Errorf("Fingerprint = %q, want the token's digest %q", tok.Fingerprint, want)
 	}
 }
 
@@ -1004,17 +1007,41 @@ func TestRevokeAccessTokenReportsFailure(t *testing.T) {
 	}
 }
 
-func TestTokenDisplayLabelDoesNotRevealTheToken(t *testing.T) {
-	label := tokenDisplayLabel(realisticToken)
-	if strings.Contains(label, realisticToken) {
-		t.Error("the label contains the whole token")
+// TestTokenFingerprintRetainsNothingOfTheToken: the label this replaced was
+// prefix…suffix, so it carried 16 bytes of a live secret into the session record
+// and would have carried them into the first log line that printed it.
+func TestTokenFingerprintRetainsNothingOfTheToken(t *testing.T) {
+	fp := tokenFingerprint(realisticToken)
+
+	sum := sha256.Sum256([]byte(realisticToken))
+	if want := hex.EncodeToString(sum[:16]); fp != want {
+		t.Errorf("fingerprint = %q, want %q", fp, want)
 	}
-	if !strings.Contains(label, "...") {
-		t.Errorf("label = %q, want an elided form", label)
+
+	// Every substring of the token long enough to be useful must be absent — the
+	// eight-byte head and tail of the old label above all.
+	for n := 4; n <= len(realisticToken); n++ {
+		if strings.Contains(fp, realisticToken[:n]) {
+			t.Errorf("fingerprint contains the token's first %d bytes", n)
+		}
+		if strings.Contains(fp, realisticToken[len(realisticToken)-n:]) {
+			t.Errorf("fingerprint contains the token's last %d bytes", n)
+		}
 	}
-	// Short strings cannot be elided meaningfully; they are returned as-is.
-	if got := tokenDisplayLabel("short"); got != "short" {
-		t.Errorf("tokenDisplayLabel(short) = %q", got)
+
+	// A short token is hashed like any other: returning it as-is, as the old
+	// label did, hands over the whole secret.
+	if got := tokenFingerprint("short"); got == "short" {
+		t.Error("a short token was returned in the clear")
+	}
+
+	// Stable for one token and distinct between two, or it cannot identify a
+	// token in an audit trail.
+	if tokenFingerprint(realisticToken) != fp {
+		t.Error("the fingerprint is not stable")
+	}
+	if tokenFingerprint(realisticToken+"x") == fp {
+		t.Error("two different tokens share a fingerprint")
 	}
 }
 

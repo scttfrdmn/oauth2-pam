@@ -11,6 +11,8 @@ package github
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -379,7 +381,7 @@ func (p *Provider) PollDeviceAuthorization(ctx context.Context, deviceCode strin
 		AccessToken: tr.AccessToken,
 		TokenType:   tr.TokenType,
 		Scope:       tr.Scope,
-		Fingerprint: tokenDisplayLabel(tr.AccessToken),
+		Fingerprint: tokenFingerprint(tr.AccessToken),
 	}
 
 	// Fail fast if any required scope is absent. Missing scopes cause silent
@@ -718,14 +720,23 @@ func decodeJSONBody(body io.Reader, limit int64, dest interface{}) error {
 	return err
 }
 
-// tokenDisplayLabel returns a human-readable prefix…suffix label for audit logs.
-// It is NOT cryptographic — use the SHA-256 fingerprint in TokenManager for
-// collision-resistant identification.
-func tokenDisplayLabel(accessToken string) string {
-	if len(accessToken) < 16 {
-		return accessToken
-	}
-	return accessToken[:8] + "..." + accessToken[len(accessToken)-8:]
+// tokenFingerprint returns a label that identifies an access token in logs and
+// audit records without containing any of it: the first 16 bytes of its SHA-256
+// digest, hex-encoded.
+//
+// It replaces a prefix…suffix elision that carried 16 bytes of the live secret
+// into Session.TokenFingerprint. That was not being written anywhere, but "for
+// audit logs" is an invitation to write it later, and by the time someone does
+// the decision has already been made.
+//
+// An unkeyed digest is enough here: the input is a high-entropy secret, so there
+// is no dictionary to walk back from the digest, and an HMAC would only add a key
+// to manage and rotate. Truncating to 16 bytes matches TokenManager's
+// fingerprintToken, so a session and its stored token show the same value and can
+// be lined up in an audit trail.
+func tokenFingerprint(accessToken string) string {
+	sum := sha256.Sum256([]byte(accessToken))
+	return hex.EncodeToString(sum[:16])
 }
 
 // RevokeAccessToken revokes an OAuth2 access token via the GitHub API.
