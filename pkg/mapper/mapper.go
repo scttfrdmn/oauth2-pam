@@ -545,6 +545,30 @@ func lookupSystemUID(name string) (int, error) {
 	return uid, nil
 }
 
+// ValidateLocalUser applies checkLocalUser — the gate below, the one every tier's
+// answer passes through — to a candidate local account name outside of a mapping,
+// so that something which *writes* a mapping (an enrollment, today) can refuse a
+// name at the moment it is typed rather than leaving it to be refused at the login
+// it will deny. source names the caller in the error ("enrollment").
+//
+// It calls checkLocalUser deliberately, rather than re-stating the regexp and the
+// denylist: a second copy of the rules could drift from the gate it exists to
+// predict, and a write-time check more permissive than the login-time one is
+// exactly the confusion it is meant to remove. A name this accepts is a name Map
+// will accept, on this host, with this config.
+//
+// This is not the control. Map gates every tier including tier 0, so a record
+// naming root or a system account fails closed at authentication whether or not it
+// was ever validated here; this is so the operator hears about it at the point they
+// can still fix it cheaply.
+//
+// An account that does not resolve on this host is accepted with a warning,
+// exactly as at login time: without a UID the floor cannot be applied, and
+// enrolling a user before their account is created is legitimate.
+func (c *Chain) ValidateLocalUser(source, name string) error {
+	return c.checkLocalUser(source, name)
+}
+
 // checkLocalUser is the gate every tier's answer passes through. It refuses names
 // that are not valid Unix usernames, system accounts, and accounts below the UID
 // floor.

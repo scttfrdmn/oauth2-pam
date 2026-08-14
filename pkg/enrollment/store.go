@@ -41,6 +41,25 @@ type Store struct {
 	Enrollments []Record `yaml:"enrollments"`
 }
 
+// LocalUserValidator reports whether localUser is a name a *new* enrollment may
+// use. Add takes one.
+//
+// It is a function rather than a check written out here because the authoritative
+// rules — the Unix-name shape, the system-account denylist, the mapper.min_uid
+// floor — belong to pkg/mapper, which imports this package. Restating them here
+// would mean a second copy that can drift from the gate it is predicting, and a
+// write-time rule that is looser than the login-time one is worse than no
+// write-time rule at all. So the writer supplies the mapper's own gate:
+// mapper.Chain.ValidateLocalUser.
+type LocalUserValidator func(localUser string) error
+
+// Unvalidated is what a caller passes to Add when it has no mapper configuration
+// to validate against, and therefore cannot say whether the name it is recording
+// could ever authenticate. Named rather than a bare nil so that the callers making
+// that choice can be found by grep. Production writers should pass the mapper's
+// gate; a record that fails it is one the mapper will refuse at login.
+var Unvalidated LocalUserValidator
+
 // Load reads the enrollment file at path. If the file does not exist, an
 // empty Store is returned without error.
 func Load(path string) (*Store, error) {
@@ -172,11 +191,24 @@ func (s *Store) FindByLocalUser(localUser string) *Record {
 }
 
 // Add appends a new enrollment record. Returns an error if a record for the
-// same local user already exists (use Remove first to re-enroll).
-func (s *Store) Add(rec Record) error {
+// same local user already exists (use Remove first to re-enroll), or if validate
+// refuses rec.LocalUser.
+//
+// validate is applied to the new record only, and only here — never on Load or
+// Save. A record already in the file, however it got there, must not stop the
+// store from loading or from being written back: the mapper refuses such a record
+// at login on its own, and making Load fail would turn one unusable enrollment
+// into a broken enrollment file for everybody, including the operator trying to
+// remove it. Pass Unvalidated if there is no configuration to validate against.
+func (s *Store) Add(rec Record, validate LocalUserValidator) error {
 	if existing := s.FindByLocalUser(rec.LocalUser); existing != nil {
 		return fmt.Errorf("local user %q is already enrolled as %q; remove first",
 			rec.LocalUser, existing.Login)
+	}
+	if validate != nil {
+		if err := validate(rec.LocalUser); err != nil {
+			return fmt.Errorf("local user %q may not be enrolled: %w", rec.LocalUser, err)
+		}
 	}
 	s.Enrollments = append(s.Enrollments, rec)
 	return nil

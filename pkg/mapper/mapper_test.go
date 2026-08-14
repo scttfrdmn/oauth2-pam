@@ -306,6 +306,102 @@ func TestEnrollmentWithInvalidUsernameIsSkipped(t *testing.T) {
 	}
 }
 
+// --- the exported gate, for write-time callers ---
+
+// TestValidateLocalUserRefusesWhatTheTiersRefuse pins the exported gate against
+// the same cases checkLocalUser refuses for a tier: the name shape, the
+// system-account denylist, root by UID, and the min_uid floor.
+func TestValidateLocalUserRefusesForbiddenAccounts(t *testing.T) {
+	passwd := map[string]int{"root": 0, "www-data": 33, "svc": 120, "alice": 1000}
+	cfg := config.MapperConfig{}
+
+	forbidden := []struct {
+		name, why string
+	}{
+		{"root", "UID 0"},
+		{"www-data", "a denylisted service account"},
+		{"systemd-resolve", "a denylisted prefix"},
+		{"svc", "below the min_uid floor"},
+		{"Alice", "uppercase"},
+		{"1alice", "leading digit"},
+		{strings.Repeat("a", 33), "over 32 characters"},
+		{"al/ice", "an embedded slash"},
+		{"al\x00ice", "an embedded NUL"},
+		{"", "empty"},
+	}
+	for _, tc := range forbidden {
+		t.Run(tc.why, func(t *testing.T) {
+			c := chainWithPasswd(t, cfg, passwd)
+			err := c.ValidateLocalUser("enrollment", tc.name)
+			if !errors.Is(err, ErrForbiddenLocalUser) {
+				t.Fatalf("ValidateLocalUser(%q) error = %v, want ErrForbiddenLocalUser", tc.name, err)
+			}
+			if !strings.Contains(err.Error(), "enrollment") {
+				t.Errorf("error = %q, want it to name the caller so the operator knows what refused", err)
+			}
+		})
+	}
+
+	// The control: an ordinary account above the floor is accepted.
+	c := chainWithPasswd(t, cfg, passwd)
+	if err := c.ValidateLocalUser("enrollment", "alice"); err != nil {
+		t.Errorf("ValidateLocalUser(alice): %v", err)
+	}
+
+	// And an account that does not resolve here is accepted, deliberately: the
+	// floor cannot be applied without a UID, and enrolling a user before their
+	// account exists — or one who lives in LDAP on a broker built without cgo — is
+	// legitimate. This mirrors login time exactly; see
+	// TestUnresolvableAccountPassesTheFloorButNotTheDenylist.
+	c = chainWithPasswd(t, cfg, passwd)
+	if err := c.ValidateLocalUser("enrollment", "notyetcreated"); err != nil {
+		t.Errorf("ValidateLocalUser refused an account that does not exist yet: %v", err)
+	}
+}
+
+// TestValidateLocalUserAgreesWithMap is the reason the write-time check calls the
+// mapper's gate instead of restating its rules: a name accepted at enrollment must
+// be one the login path accepts, and vice versa. If the two ever drift, this fails.
+func TestValidateLocalUserAgreesWithMap(t *testing.T) {
+	passwd := map[string]int{"root": 0, "www-data": 33, "svc": 120, "alice": 1000, "bob": 1001}
+	// "" is left out because it is not a name a login can request: Map skips tier 0
+	// entirely when requestedLocalUser is empty, so there is no read-time answer to
+	// compare against.
+	names := []string{
+		"root", "www-data", "systemd-resolve", "svc", "Alice", "1alice",
+		strings.Repeat("a", 33), "alice", "bob", "notyetcreated",
+	}
+
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			id := identityWithLogin("attacker")
+
+			// Write-time: what the enroll path would be told.
+			gate := chainWithPasswd(t, config.MapperConfig{}, passwd)
+			writeErr := gate.ValidateLocalUser("enrollment", name)
+
+			// Read-time: the same name reaching Map through tier 0.
+			path := writeEnrollment(t, enrollment.Record{
+				LocalUser: name,
+				Login:     "attacker",
+				Provider:  "github",
+			})
+			c := chainWithPasswd(t, config.MapperConfig{
+				EnrollmentEnabled: true,
+				EnrollmentFile:    path,
+			}, passwd)
+			_, readErr := c.Map(context.Background(), id, name)
+
+			// Map can refuse either as forbidden or as no-mapping (an unusable name
+			// is skipped by tier 0); what must agree is whether it refuses at all.
+			if (writeErr != nil) != (readErr != nil) {
+				t.Fatalf("local_user %q: write-time err = %v, login-time err = %v; the two gates disagree",
+					name, writeErr, readErr)
+			}
+		})
+	}
+}
+
 func TestMissingEnrollmentFileFallsThrough(t *testing.T) {
 	c := New(config.MapperConfig{
 		EnrollmentEnabled: true,
