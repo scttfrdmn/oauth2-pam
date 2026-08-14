@@ -63,14 +63,22 @@ type Server struct {
 	// why the two cannot share a bucket.
 	rateLimiter    *rateLimiter
 	sessionLimiter *rateLimiter
+	// newSessionLimiter charges, per calling UID, the act of naming a session ID
+	// the sessionLimiter has never seen. See allowRequest and
+	// maxNewSessionsPerMinute.
+	newSessionLimiter *rateLimiter
 	// handlerSlots bounds concurrent connection handlers. See
 	// maxConcurrentHandlers.
 	handlerSlots chan struct{}
 	readTimeout  time.Duration
 	writeTimeout time.Duration
-	stopChan     chan struct{}
-	wg           sync.WaitGroup
-	stopOnce     sync.Once
+	// evictInterval is how often stale rate-limit windows are swept. A field
+	// rather than a literal so a test can watch the sweep actually happen instead
+	// of asserting that a function it calls by hand does the right thing.
+	evictInterval time.Duration
+	stopChan      chan struct{}
+	wg            sync.WaitGroup
+	stopOnce      sync.Once
 }
 
 // defaultIOTimeout applies when server.read_timeout / server.write_timeout are
@@ -93,6 +101,39 @@ const maxConcurrentHandlers = 64
 // login, so this leaves 2x headroom and only catches a client that has stopped
 // honouring the interval.
 const maxSessionRequestsPerMinute = 120
+
+// maxSessionLimiterKeys bounds how many session windows the session limiter will
+// hold at once.
+//
+// It exists because the session limiter's key space is chosen by the caller: a
+// request naming a session ID the broker has never issued still allocated a
+// window, so any client could mint windows faster than the five-minute eviction
+// sweep removed them. The better check is "refuse a session the broker does not
+// have" before the limiter sees it, but the broker exports no session-existence
+// lookup to ask with; until it does, the map has a ceiling instead.
+//
+// 8192 live windows means 8192 distinct sessions polled inside the same minute.
+// A host with that many concurrent logins in flight has run out of something
+// else first, and the ceiling costs well under a megabyte if it is ever reached.
+const maxSessionLimiterKeys = 8192
+
+// maxNewSessionsPerMinute bounds how many *previously unseen* session IDs one
+// caller may introduce per minute.
+//
+// This is the charge that makes an unknown-session flood cost the caller
+// something. It is deliberately not a charge on session requests in general:
+// every PAM caller is sshd as root, so charging each poll to the caller is the
+// host-wide login DoS that sessionKey exists to avoid. Introducing a session ID
+// is different — a legitimate login does it once, when its first check_session
+// arrives, so a real caller spends one or two units per login while a flood of
+// invented IDs spends one per request.
+//
+// 600/minute is ten new logins a second sustained from a single caller, far above
+// what a login node does and far below what the map ceiling cares about.
+const maxNewSessionsPerMinute = 600
+
+// defaultEvictInterval is how often stale rate-limit windows are swept.
+const defaultEvictInterval = 5 * time.Minute
 
 // ProtocolVersion is the wire contract this broker speaks. It is documented in
 // docs/wire-protocol.md, which is the specification both this project and its
@@ -188,14 +229,16 @@ func NewServer(socketPath string, broker *auth.Broker, cfg *config.Config) (*Ser
 	}
 
 	return &Server{
-		socketPath:     socketPath,
-		broker:         broker,
-		rateLimiter:    rl,
-		sessionLimiter: newRateLimiter(maxSessionRequestsPerMinute),
-		handlerSlots:   make(chan struct{}, maxConcurrentHandlers),
-		readTimeout:    readTimeout,
-		writeTimeout:   writeTimeout,
-		stopChan:       make(chan struct{}),
+		socketPath:        socketPath,
+		broker:            broker,
+		rateLimiter:       rl,
+		sessionLimiter:    newBoundedRateLimiter(maxSessionRequestsPerMinute, maxSessionLimiterKeys),
+		newSessionLimiter: newRateLimiter(maxNewSessionsPerMinute),
+		handlerSlots:      make(chan struct{}, maxConcurrentHandlers),
+		readTimeout:       readTimeout,
+		writeTimeout:      writeTimeout,
+		evictInterval:     defaultEvictInterval,
+		stopChan:          make(chan struct{}),
 	}, nil
 }
 
@@ -426,6 +469,14 @@ func validateRequest(req *Request) error {
 // Session operations are charged to the session instead: a poll's cost belongs
 // to one login, and bucketing them by caller made every login on the host share
 // a single budget.
+//
+// The one thing a session operation is charged to its caller for is *introducing*
+// a session ID the session limiter has not seen. That allocation is the only part
+// of a session request whose cost outlives the request — the window survives the
+// reply, and nothing here can tell an invented session ID from a real one — so it
+// is charged, and charged before the window exists. Polling an established
+// session stays free to the caller, which is what keeps concurrent logins from
+// competing for one budget.
 func (s *Server) allowRequest(conn net.Conn, req *Request) bool {
 	if req.Type == "authenticate" {
 		uid, known := peerUID(conn)
@@ -436,7 +487,17 @@ func (s *Server) allowRequest(conn net.Conn, req *Request) bool {
 		}
 		return true
 	}
-	if !s.sessionLimiter.allow(sessionKey(req.SessionID)) {
+
+	key := sessionKey(req.SessionID)
+	if !s.sessionLimiter.hasLiveWindow(key) {
+		uid, known := peerUID(conn)
+		if !s.newSessionLimiter.allow(callerKey(uid, known)) {
+			log.Warn().Uint32("uid", uid).Bool("uid_known", known).Str("type", req.Type).
+				Msg("Rate limit exceeded for new session IDs from this caller")
+			return false
+		}
+	}
+	if !s.sessionLimiter.allow(key) {
 		log.Warn().Str("type", req.Type).Msg("Rate limit exceeded for session operation")
 		return false
 	}
@@ -591,9 +652,18 @@ func formatInstructions(loginType, deviceURL, deviceCode, qrCode string) string 
 }
 
 // evictRateLimitWindows periodically cleans up stale rate-limit entries.
+//
+// Every limiter the server owns has to be swept here. This used to sweep only
+// rateLimiter, whose key space is the host's UIDs and therefore tiny; the one it
+// missed, sessionLimiter, is the one keyed on something a caller supplies, so it
+// grew one permanent entry per session ID ever named.
 func (s *Server) evictRateLimitWindows(ctx context.Context) {
 	defer s.wg.Done()
-	ticker := time.NewTicker(5 * time.Minute)
+	interval := s.evictInterval
+	if interval <= 0 {
+		interval = defaultEvictInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -602,7 +672,14 @@ func (s *Server) evictRateLimitWindows(ctx context.Context) {
 		case <-s.stopChan:
 			return
 		case <-ticker.C:
-			s.rateLimiter.evict()
+			s.evictNow()
 		}
 	}
+}
+
+// evictNow sweeps every rate limiter once.
+func (s *Server) evictNow() {
+	s.rateLimiter.evict()
+	s.sessionLimiter.evict()
+	s.newSessionLimiter.evict()
 }
