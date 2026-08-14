@@ -58,27 +58,12 @@ fi
 "$HERE/verify-pam-symbols.sh" oauth2_pam.so \
     || die "do not install this artifact"
 
-# /lib/security is right on RHEL and wrong on Debian/Ubuntu multiarch. Ask the
-# package manager where the system's own modules live rather than guessing.
-#
-# A PAMDIR from the environment wins and is not second-guessed: it is the escape
-# hatch the failure at the end of this block names, and until now an unconditional
-# PAMDIR="" here threw it away before the discovery ever ran.
-PAMDIR="${PAMDIR:-}"
-if [ -n "$PAMDIR" ]; then
-    [ -d "$PAMDIR" ] || die "PAMDIR=$PAMDIR is not a directory"
-else
-    if command -v dpkg >/dev/null 2>&1; then
-        permit=$(dpkg -L libpam-modules 2>/dev/null | grep -m1 '/pam_permit\.so$' || true)
-        [ -n "$permit" ] && PAMDIR=$(dirname "$permit")
-    fi
-    if [ -z "$PAMDIR" ]; then
-        for d in /lib64/security /lib/security /usr/lib64/security /usr/lib/security; do
-            [ -d "$d" ] && { PAMDIR="$d"; break; }
-        done
-    fi
-fi
-[ -n "$PAMDIR" ] || die "cannot find the PAM module directory; set PAMDIR= explicitly"
+# Where the module goes. Asked, not assumed — and asked by the same script
+# `make install` uses, so the two install routes cannot answer it differently.
+# PAMDIR from the environment still wins; the helper handles that.
+[ -f "$HERE/pam-module-dir.sh" ] \
+    || die "pam-module-dir.sh is missing — unpack the whole archive and run install.sh from it"
+PAMDIR=$("$HERE/pam-module-dir.sh") || die "cannot determine where this system keeps its PAM modules"
 
 echo "Installing:"
 echo "  PAM module -> $PAMDIR/oauth2_pam.so"

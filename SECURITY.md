@@ -2,10 +2,18 @@
 
 ## Supported versions
 
+The newest minor release, and only that one. There are no maintenance branches and
+nothing is backported: a fix lands on `main` and ships in the next release, so
+"supported" here means "upgrade to the current release".
+
 | Version | Supported | Notes |
 |---|---|---|
-| 0.2.x | yes | |
-| 0.1.x | **no** | Contains an authentication bypass. Do not deploy. |
+| 0.3.x | yes | the current release |
+| anything earlier | **no** | No fix is backported. v0.1.x additionally contains an authentication bypass — do not deploy it, see below. |
+
+The row above is rewritten by `scripts/release.sh`, because a hand-maintained
+version claim is one that spends a release cycle wrong: v0.3.0 shipped while this
+table still said the newest supported version was 0.2.x.
 
 v0.1.0 and v0.1.1 shipped a PAM module that returned `PAM_SUCCESS` as soon as a
 device flow started, before anyone had approved anything. With the `auth
@@ -66,7 +74,7 @@ problem.
 
 ## What is verified, and what is not
 
-This is pre-1.0 software with no third-party audit. Concretely, as of v0.2.0:
+This is pre-1.0 software with no third-party audit. Concretely, as of v0.3.0:
 
 - The broker half of the protocol is covered end to end by
   `internal/ipc/e2e_test.go`, against a fake GitHub, including the assertion
@@ -78,8 +86,10 @@ This is pre-1.0 software with no third-party audit. Concretely, as of v0.2.0:
   `test/integration/mutations.sh` rebuilds the module with the v0.1.x bypass
   reintroduced and requires the harness to refuse the login; `test/cbridge/mutations.sh`
   reintroduces each of the six C bridge defects fixed in v0.2.0 and requires the
-  C unit tests to fail. Both run as their own CI jobs, so "these tests would
-  catch it" is a check rather than a claim.
+  C unit tests to fail. Both run in CI on every push and pull request — the
+  harness one as its own job (`integration-mutations`), the C bridge one as a step
+  in the `linux` job, alongside the suite it mutates — so "these tests would catch
+  it" is a check rather than a claim.
 - **A login against real github.com has never been verified by the test suite.**
   Everything above fakes the provider.
 - Tokens are held encrypted in memory (AES-256-GCM) and never written to disk.

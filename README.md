@@ -121,18 +121,33 @@ sudo make install
 ```
 
 This installs:
-- `/lib/security/oauth2_pam.so`
+- `oauth2_pam.so` into this distribution's PAM module directory — asked for with
+  `scripts/pam-module-dir.sh`, not assumed. It is `/lib64/security` on RHEL and
+  `/usr/lib/<triplet>/security` on Debian/Ubuntu multiarch, and a module in the
+  wrong one is a module PAM silently never loads. Override with
+  `PAMDIR=/path make install`.
 - `/usr/local/bin/oauth2-pam-broker`
 - `/usr/local/bin/oauth2-pam-admin`
 - `/usr/local/bin/oauth2-pam-enroll`
 - `/etc/systemd/system/oauth2-pam-broker.service`
 
+Unlike `install.sh`, it does not write a config: that is the next step.
+
 ### 4. Configure
 
+The release installer has already done this — skip to editing the file. From a
+source build:
+
 ```bash
+sudo install -d -m 0750 -o root -g root /etc/oauth2-pam
 sudo install -m 0600 -o root -g root configs/example.yaml /etc/oauth2-pam/broker.yaml
 sudo $EDITOR /etc/oauth2-pam/broker.yaml
 ```
+
+The directory is created explicitly, and `0750`. The broker checks the mode and
+owner of the file that holds the secret; nothing checks the directory around it,
+and a directory another user can write is a config file that user can *replace* —
+which would let them choose the OAuth app this host authenticates against.
 
 Minimal config:
 
@@ -446,7 +461,9 @@ make test-cbridge-mutations      # put each fixed bridge defect back; the C test
 make test-integration-mutations  # put the v0.1.x bypass back; the harness must refuse the login
 ```
 
-Those two are the check on the checks, and CI runs each as its own job. A green suite proves the code does what the tests say; it does not prove the tests would notice if it stopped — so each of the six C bridge defects fixed in v0.2.0, and the v0.1.x authentication bypass itself, is reintroduced in a copy of the tree and the suite is required to fail. A mutation that survives means that regression test is decoration.
+Those two are the check on the checks, and CI runs both on every push and pull
+request — the harness mutation check as its own job, the C bridge one as a step in
+the Linux job, next to the suite it mutates. A green suite proves the code does what the tests say; it does not prove the tests would notice if it stopped — so each of the six C bridge defects fixed in v0.2.0, and the v0.1.x authentication bypass itself, is reintroduced in a copy of the tree and the suite is required to fail. A mutation that survives means that regression test is decoration.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for how work is tracked (labels, milestones, the roadmap board), what to run before pushing, and the two invariants that are easy to break.
 

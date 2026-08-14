@@ -145,9 +145,10 @@ jobs:
           cp -r configs "$DIR/configs"
           cp README.md CHANGELOG.md SECURITY.md LICENSE "$DIR/"
           install -m 0755 scripts/install-release.sh "$DIR/install.sh"
-          # install.sh runs the same entry-point check this job just ran, so the
-          # helper has to travel with it.
+          # install.sh runs the same entry-point check this job just ran and asks
+          # the same script where PAM modules live, so both helpers travel with it.
           install -m 0755 scripts/verify-pam-symbols.sh "$DIR/verify-pam-symbols.sh"
+          install -m 0755 scripts/pam-module-dir.sh "$DIR/pam-module-dir.sh"
           tar czf "$DIR.tar.gz" "$DIR"
           sha256sum "$DIR.tar.gz" > "$DIR.tar.gz.sha256"
 
