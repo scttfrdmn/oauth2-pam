@@ -179,8 +179,8 @@ test-cbridge:
 ## Check that the C bridge tests would catch the defects they were written for
 ##
 ## A green suite proves the code does what the tests say; it does not prove the
-## tests would notice if it stopped. This reintroduces each of the six fixed
-## bridge defects in a copy of the source under $$TMPDIR and asserts the suite
+## tests would notice if it stopped. This reintroduces each fixed bridge defect
+## in turn in a copy of the source under $$TMPDIR and asserts the suite
 ## fails. An uncaught mutation means that regression test is decoration.
 test-cbridge-mutations:
 	@echo "Running C bridge mutation check..."

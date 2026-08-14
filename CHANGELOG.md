@@ -38,6 +38,15 @@ recommended stack omitted the `account` line that a whole round's work depends o
 Three of the five were found by reading a comment against the code it describes, which
 is now a habit worth keeping and, where possible, a check.
 
+A seventh round found one, and it is the counting error the previous six rounds were
+structurally unable to make: every one of them asked whether the mitigation was
+correct, and none asked how many callers were using it. `SanitizePromptValue` was
+written in round three for the pre-auth PAM terminal, is thoroughly tested, and had
+four call sites — all in `pkg/auth`. The fifth place a provider-chosen string reaches
+a terminal is `oauth2-pam-enroll`, which does not import `pkg/auth` and so inherited
+none of it. A test of a function cannot notice a caller that does not call it, and
+neither can a reviewer who starts from the function.
+
 **Upgrade notes.** `broker.yaml` must be mode 0600 regardless of where the client
 secret lives — the check used to apply only when the secret was inline, which left
 the file holding the token-encryption key unchecked in every deployment that did the
@@ -56,6 +65,22 @@ revocation; read the warning next to it first, because `account required
 oauth2_pam.so` on its own denies the publickey break-glass path.
 
 ### Fixed
+
+- **`oauth2-pam-enroll` drew the provider's `verification_uri` and `user_code` on a
+  root terminal without filtering them.** The broker sanitizes those two strings
+  before they reach a pre-auth tty, for a reason it states at length: with a GitHub
+  Enterprise `base_url` configured, that server picks both, so its operator picks what
+  every host configured against it draws on screen. `oauth2-pam-enroll` gets the same
+  two strings from the same `StartDeviceFlow` call and printed them with a bare `%s` —
+  it does not import `pkg/auth`, so it inherited nothing. The terminal here is worse,
+  not better: an operator runs this under `sudo`, so the escapes land on a root shell
+  moments after a real sudo password was typed into it, and because the command never
+  reads stdin, anything typed at a fake prompt is left in the tty queue for the
+  invoking shell to run as a command. Both values now go through
+  `SanitizePromptValue`, and the print is a function taking an `io.Writer` so that a
+  test can assert on what reaches the terminal — `runEnroll` needs a config, a real
+  local account and a reachable provider before it prints anything, which is how these
+  two lines came to be the last unfiltered path in the tree.
 
 - **The stalled-sink flag could still wedge fail-closed forever, and did so on CI one
   push after the round that thought it had fixed it.** An audit write runs on its own
