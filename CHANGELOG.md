@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Version 1 says what an absent `source_ip` means, and that a zoned IPv6
+  literal must be accepted.** Both were silences, and both cost a sister project a
+  real bug: a broker enforcing "private networks only" read `net.ParseIP("")` as
+  "not private" and refused *every* login on the host, reporting an unknown origin
+  as a public one. The spec now states that an absent value is `unknown`, a third
+  answer, and that `unknown` never satisfies a network requirement — while leaving
+  the resolution (deny, or an audited waiver) to the broker, since that is policy.
+  It also requires a receiver to accept `fe80::1%eth0`: it is inside the 45-byte
+  bound the field always had, and it is the one address shape a well-meaning
+  validator breaks, because `net.ParseIP` and `inet_pton` both fail on a zone. This
+  implementation length-bounds `source_ip` and parses nothing, so it already
+  conformed; `TestValidateRequest` now pins that. And `metadata.rhost` may be a
+  resolved hostname — which is what makes the address-only rule on `source_ip`
+  affordable, and is why nothing may read it for an authorization decision.
+  ([#52](https://github.com/scttfrdmn/oauth2-pam/issues/52))
+- **`RESPONSE_TOO_LARGE` is a registered `error_code`.** `oidc-pam` sends it, and
+  by version 1's own rule an error code a second implementation reads is contract
+  rather than local dialect. It is terminal, and it buys a client the difference
+  between "the broker sent something I could not parse" and "the broker had
+  something to say and it did not fit". Whether a broker is *obliged* to substitute
+  it — rather than writing an oversized reply and leaving the client to refuse —
+  is deliberately left open; that is a requirement this broker does not yet meet,
+  and both the spec and [#48](https://github.com/scttfrdmn/oauth2-pam/issues/48)
+  say so rather than implying a guarantee.
 - **The wire contract is written down and versioned.**
   [`docs/wire-protocol.md`](docs/wire-protocol.md) specifies the broker↔module
   protocol as a contract rather than as a description of one implementation, and
