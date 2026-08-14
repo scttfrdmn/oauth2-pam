@@ -19,6 +19,7 @@
  */
 
 #include "cgo_bridge.h"
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <time.h>
@@ -96,6 +97,79 @@ static int set_io_timeout(int sock, int seconds) {
     if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == -1 ||
         setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == -1) {
         log_pam_message(LOG_ERR, "Failed to set socket timeout: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+/* transfer_deadline and apply_remaining bound a whole request or reply, not each
+   syscall.
+ *
+ * SO_RCVTIMEO and SO_SNDTIMEO expire per recv() and per send() call, which bounds
+ * a peer that says nothing but not a peer that says one byte just inside every
+ * timeout: that peer extends the wait per byte, without limit. "A deadline on
+ * every receive" is then satisfied per syscall while the thing it was for — a
+ * wedged or hostile broker cannot hang a login — is defeated. The module's own
+ * timeout= does not help either; it is only consulted between polls, and does not
+ * start counting until after the PAM conversation.
+ *
+ * So the deadline is taken once, before the first syscall, and the socket's
+ * timeout is shrunk to whatever is left of it before each one. The budget is the
+ * timeout connect_to_broker already put on the socket — see AUTH_IO_TIMEOUT and
+ * POLL_IO_TIMEOUT — read back rather than passed in, so that no caller can bound
+ * a transfer differently from the connection it runs on. The shrunk value is left
+ * on the socket, which is fine because broker_roundtrip closes it after one
+ * request and one reply.
+ *
+ * CLOCK_MONOTONIC for the reason monotonic_seconds gives below: a clock that can
+ * be stepped would either extend the wait or abandon a transfer in progress.
+ *
+ * transfer_deadline returns -1 when there is no budget to enforce — no timeout on
+ * the socket, or no usable clock — and the caller then keeps the per-call bound it
+ * already had rather than refusing to talk. */
+static int transfer_deadline(int sock, int optname, struct timespec *deadline) {
+    struct timeval tv;
+    socklen_t len = sizeof(tv);
+
+    if (getsockopt(sock, SOL_SOCKET, optname, &tv, &len) != 0) return -1;
+    if (tv.tv_sec <= 0 && tv.tv_usec <= 0) return -1;
+    if (clock_gettime(CLOCK_MONOTONIC, deadline) != 0) return -1;
+
+    deadline->tv_sec  += tv.tv_sec;
+    deadline->tv_nsec += (long)tv.tv_usec * 1000;
+    if (deadline->tv_nsec >= 1000000000L) {
+        deadline->tv_sec++;
+        deadline->tv_nsec -= 1000000000L;
+    }
+    return 0;
+}
+
+/* apply_remaining shrinks the socket's timeout to the time left before the
+   deadline. It returns -1 once the deadline has passed, which is the caller's
+   signal to give up rather than start another syscall. */
+static int apply_remaining(int sock, int optname, const struct timespec *deadline) {
+    struct timespec now;
+    struct timeval tv;
+    long remaining_ms;
+
+    /* A clock that has stopped working mid-transfer cannot say how much of the
+       budget is left. Proceed on the timeout already set — the per-call bound the
+       module had before this existed — rather than fail a login in progress over a
+       condition that cannot happen on Linux with a valid clock id. */
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+
+    remaining_ms = (long)(deadline->tv_sec - now.tv_sec) * 1000 +
+                   (deadline->tv_nsec - now.tv_nsec) / 1000000L;
+    if (remaining_ms <= 0) return -1;
+
+    tv.tv_sec  = (time_t)(remaining_ms / 1000);
+    tv.tv_usec = (suseconds_t)(remaining_ms % 1000) * 1000;
+    /* A zero timeval means "no timeout at all" to setsockopt, so the last
+       fraction of a millisecond must never round down into one. */
+    if (tv.tv_sec == 0 && tv.tv_usec == 0) tv.tv_usec = 1000;
+
+    if (setsockopt(sock, SOL_SOCKET, optname, &tv, sizeof(tv)) != 0) {
+        log_pam_message(LOG_ERR, "Failed to shrink socket timeout: %s", strerror(errno));
         return -1;
     }
     return 0;
@@ -184,15 +258,25 @@ int get_user_info(pam_handle_t *pamh, const char **username, const char **servic
 
    The loop exists because a short send is legal on a stream socket. The old code
    treated one as a failure, which is at least fail-closed, but a partial request
-   also leaves the broker parsing a truncated JSON object. */
+   also leaves the broker parsing a truncated JSON object. A peer that accepts one
+   byte per timeout would otherwise keep the loop going indefinitely, so the whole
+   request is bounded by one deadline — see transfer_deadline. */
 static int send_json(int sock, json_object *req) {
     const char *req_str = json_object_to_json_string(req);
     size_t req_len = strlen(req_str);
     size_t total = 0;
+    struct timespec deadline;
+    int bounded = transfer_deadline(sock, SO_SNDTIMEO, &deadline) == 0;
 
     log_pam_message(LOG_DEBUG, "Sending request: %s", req_str);
 
     while (total < req_len) {
+        if (bounded && apply_remaining(sock, SO_SNDTIMEO, &deadline) != 0) {
+            log_pam_message(LOG_ERR,
+                            "Request deadline elapsed after sending %zu of %zu bytes",
+                            total, req_len);
+            return -1;
+        }
         ssize_t sent = send(sock, req_str + total, req_len - total, MSG_NOSIGNAL);
         if (sent <= 0) {
             if (sent == -1 && errno == EINTR) continue;
@@ -205,6 +289,30 @@ static int send_json(int sock, json_object *req) {
     return 0;
 }
 
+/* valid_zone_id reports whether s is a plausible IPv6 zone: an interface name or
+   a numeric scope id, as sshd's getnameinfo() appends it.
+ *
+ * Checked by charset rather than with if_nametoindex, deliberately. The zone
+ * names an interface, and whether this host can resolve that name is not the
+ * question being asked: an audit field that appears or disappears depending on the
+ * interface list is worse than one that reports what the peer said. The charset is
+ * what keeps the value safe to put on the wire — it is the only part of rhost that
+ * inet_pton is not vetting. */
+static int valid_zone_id(const char *s) {
+    size_t i;
+
+    if (s[0] == '\0') return 0;
+    /* IFNAMSIZ - 1. Anything longer is not an interface name, and a numeric scope
+       id is far shorter. */
+    if (strlen(s) > 15) return 0;
+
+    for (i = 0; s[i] != '\0'; i++) {
+        if (!isalnum((unsigned char)s[i]) && s[i] != '-' && s[i] != '_' && s[i] != '.')
+            return 0;
+    }
+    return 1;
+}
+
 /* copy_source_ip fills dst with rhost when rhost is an IP address literal, and
    with an empty string otherwise.
  *
@@ -212,17 +320,45 @@ static int send_json(int sock, json_object *req) {
  * `UseDNS yes` it is a hostname, and a fully qualified one can exceed the 45
  * bytes the broker allows for source_ip — which would make it reject the entire
  * request and fail the login. So the field carries an address or nothing, and the
- * raw value travels in metadata.rhost either way. */
+ * raw value travels in metadata.rhost either way.
+ *
+ * The %zone suffix is split off before validating, because inet_pton fails on a
+ * zoned literal: inet_pton(AF_INET6, "fe80::1%eth0", …) returns 0, so a
+ * link-local login was audited as origin-unknown rather than from the address it
+ * came from. docs/wire-protocol.md conformance item 8 names that exact address —
+ * "a validator that rejects fe80::1%eth0 refuses a login this contract sized a
+ * field for" — and per the source_ip rules in the same section, unknown must never
+ * satisfy a network requirement, so dropping the field silently degrades any
+ * policy that comes to depend on it.
+ *
+ * The whole string, zone included, goes on the wire: the zone is which interface
+ * the peer is on, which is not redundant with a link-local address — the same
+ * fe80:: address can be a different host on a different link. Only IPv6 takes a
+ * zone; a '%' in an IPv4 literal or a hostname is not a scope, so those are
+ * refused as before. */
 static void copy_source_ip(const char *rhost, char *dst, size_t dst_size) {
     unsigned char v4[4];
     unsigned char v6[16];
+    char addr[MAX_SOURCE_IP_LEN];
+    const char *zone;
+    size_t addr_len;
 
     dst[0] = '\0';
     if (rhost == NULL || rhost[0] == '\0') return;
     if (strlen(rhost) >= dst_size) return;
 
-    if (inet_pton(AF_INET, rhost, v4) != 1 && inet_pton(AF_INET6, rhost, v6) != 1)
+    zone = strchr(rhost, '%');
+    addr_len = zone != NULL ? (size_t)(zone - rhost) : strlen(rhost);
+    if (addr_len == 0 || addr_len >= sizeof(addr)) return;
+    memcpy(addr, rhost, addr_len);
+    addr[addr_len] = '\0';
+
+    if (zone != NULL) {
+        if (!valid_zone_id(zone + 1)) return;
+        if (inet_pton(AF_INET6, addr, v6) != 1) return;
+    } else if (inet_pton(AF_INET, addr, v4) != 1 && inet_pton(AF_INET6, addr, v6) != 1) {
         return;
+    }
 
     strncpy(dst, rhost, dst_size - 1);
     dst[dst_size - 1] = '\0';
@@ -307,8 +443,17 @@ int send_check_session_request(int sock, const char *session_id) {
 int receive_auth_response(int sock, char *response, size_t response_size) {
     size_t total = 0;
     int filled = 0;
+    struct timespec deadline;
+    int bounded;
 
     if (response == NULL || response_size < 2) return -1;
+
+    /* One deadline for the whole reply, not one per recv(). Without it the only
+       bound is SO_RCVTIMEO, which a peer sending a byte just inside every timeout
+       extends per byte: a 16 KB reply drip-fed at that rate holds the login open
+       for hours, and holds an sshd pre-auth child with it. See
+       transfer_deadline. */
+    bounded = transfer_deadline(sock, SO_RCVTIMEO, &deadline) == 0;
 
     /* Loop until the broker closes the connection (n==0) or an error occurs.
        The broker writes one JSON object then immediately closes the connection,
@@ -316,6 +461,12 @@ int receive_auth_response(int sock, char *response, size_t response_size) {
        it arrives across multiple recv() calls (e.g. large device-flow payloads
        containing base64-encoded QR codes). */
     while (total < response_size - 1) {
+        if (bounded && apply_remaining(sock, SO_RCVTIMEO, &deadline) != 0) {
+            log_pam_message(LOG_ERR,
+                            "Broker still sending after the reply deadline; got %zu bytes, rejecting",
+                            total);
+            return -1;
+        }
         ssize_t n = recv(sock, response + total, response_size - 1 - total, 0);
         if (n < 0) {
             if (errno == EINTR) continue;
@@ -341,6 +492,11 @@ int receive_auth_response(int sock, char *response, size_t response_size) {
     filled = 1;
     for (;;) {
         char extra;
+        if (bounded && apply_remaining(sock, SO_RCVTIMEO, &deadline) != 0) {
+            log_pam_message(LOG_ERR,
+                            "Reply deadline elapsed with the buffer full; rejecting");
+            return -1;
+        }
         ssize_t n = recv(sock, &extra, 1, 0);
         if (n > 0) {
             log_pam_message(LOG_ERR,
@@ -469,8 +625,27 @@ int parse_broker_response(const char *json_text, struct broker_response **out) {
     copy_json_field(root, "error_message", r->error_message, sizeof(r->error_message));
     copy_json_field(root, "instructions",  r->instructions,  sizeof(r->instructions));
 
+    /* success is read strictly, because json_object_get_boolean *coerces*: any
+       non-empty string and any non-zero number read as true, so "success":"false"
+       would arrive here as success = 1. That is a fail-open read of one of the two
+       conjuncts authorized_for requires — the module would grant a login off a
+       reply that spelled out the opposite.
+     *
+     * Go's encoding/json cannot emit that shape, so this broker never will. The
+     * module is specified to be independently defensible against a broker that is
+     * "an older version of itself", though, and that is the whole reason the check
+     * exists twice; a wrong type for this field is a malformed reply, and a
+     * malformed reply is a transport failure rather than a decision about the
+     * user. Same treatment as protocol_version below. */
     json_object *success_obj = NULL;
     if (json_object_object_get_ex(root, "success", &success_obj)) {
+        if (success_obj == NULL || json_object_get_type(success_obj) != json_type_boolean) {
+            log_pam_message(LOG_ERR,
+                            "Broker sent a non-boolean \"success\"; rejecting the reply");
+            free(r);
+            json_object_put(root);
+            return -1;
+        }
         r->success = json_object_get_boolean(success_obj) ? 1 : 0;
     }
 

@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 static int failures = 0;
 static int checks = 0;
@@ -38,16 +39,33 @@ static int checks = 0;
 
 /* ------------------------------------------------------------------ helpers */
 
-/* pair_with_timeout returns a connected socketpair whose first end has a short
-   receive timeout, standing in for the deadline connect_to_broker sets. Tests
-   read from fds[0] and play broker on fds[1]. */
-static void pair_with_timeout(int fds[2], int timeout_seconds) {
+/* pair_with_timeout_ms returns a connected socketpair whose first end carries the
+   I/O timeout connect_to_broker would have set, in milliseconds — sub-second
+   budgets keep the deadline cases quick. Both directions get it, because the
+   bridge reads the socket's own timeout back as the budget for a transfer and the
+   send path is bounded the same way as the receive path. Tests read from fds[0]
+   and play broker on fds[1]. */
+static void pair_with_timeout_ms(int fds[2], long timeout_ms) {
     struct timeval tv;
 
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
-    tv.tv_sec  = timeout_seconds;
-    tv.tv_usec = 0;
+    tv.tv_sec  = (time_t)(timeout_ms / 1000);
+    tv.tv_usec = (suseconds_t)(timeout_ms % 1000) * 1000;
     assert(setsockopt(fds[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0);
+    assert(setsockopt(fds[0], SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0);
+}
+
+static void pair_with_timeout(int fds[2], int timeout_seconds) {
+    pair_with_timeout_ms(fds, (long)timeout_seconds * 1000);
+}
+
+/* millis_now is the test's own monotonic clock. The deadline cases turn on tenths
+   of a second, which monotonic_seconds cannot see. */
+static long millis_now(void) {
+    struct timespec ts;
+
+    assert(clock_gettime(CLOCK_MONOTONIC, &ts) == 0);
+    return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000L;
 }
 
 static void write_n(int fd, char byte, size_t n) {
@@ -203,6 +221,104 @@ static void test_receive_rejects_a_full_buffer_without_eof(void) {
 
     CHECK(receive_auth_response(fds[0], buf, sizeof(buf)) != 0,
           "acted on a possibly-truncated response");
+
+    close(fds[0]);
+    close(fds[1]);
+}
+
+static void test_receive_bounds_a_drip_feeding_peer(void) {
+    printf("  receive_auth_response: peer sends one byte per timeout\n");
+
+    /* The defect a per-syscall timeout cannot catch. SO_RCVTIMEO bounds each
+       recv(), so a peer that sends a single byte just inside every timeout extends
+       the wait per byte and holds the login open for as long as it likes — a
+       16 KB buffer drip-fed at this rate is hours, with an sshd pre-auth child
+       held for all of them. "A deadline on every receive" was satisfied and the
+       thing it was for was not.
+
+       The child writes a byte every 200ms against a 500ms budget, so the reply
+       deadline must end the call after roughly one budget rather than after the
+       child stops talking. */
+    int fds[2];
+    char buf[RESPONSE_BUF_SIZE];
+    long start, elapsed;
+    pid_t child;
+
+    pair_with_timeout_ms(fds, 500);
+
+    child = fork();
+    assert(child != -1);
+    if (child == 0) {
+        int i;
+        close(fds[0]);
+        for (i = 0; i < 15; i++) {
+            if (write(fds[1], "x", 1) != 1) _exit(0);
+            usleep(200000);
+        }
+        /* Then hold the connection open without closing it, which is what makes
+           this a hang rather than a short reply. Bounded so that a module without
+           a reply deadline fails this case in a few seconds instead of running
+           until the 16 KB buffer fills, which at this rate is nearly an hour. */
+        sleep(5);
+        _exit(0);
+    }
+    close(fds[1]);
+
+    start = millis_now();
+    CHECK(receive_auth_response(fds[0], buf, sizeof(buf)) != 0,
+          "a drip-feeding peer was treated as a valid reply");
+    elapsed = millis_now() - start;
+    CHECK(elapsed < 1500, "took %ldms against a 500ms budget; the reply deadline did not apply",
+          elapsed);
+
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    close(fds[0]);
+}
+
+/* ------------------------------------------- transfer deadline helpers */
+
+static void test_transfer_deadline_bounds_a_whole_transfer(void) {
+    printf("  transfer_deadline: the budget is the socket's own timeout\n");
+
+    int fds[2];
+    struct timespec deadline;
+    struct timeval got;
+    socklen_t len = sizeof(got);
+    long left_ms;
+
+    /* A socket with no timeout has no budget to enforce. Refusing to talk would
+       be worse than leaving the caller the per-call bound it already had — and
+       connect_to_broker will not hand out such a socket in the first place. */
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    CHECK(transfer_deadline(fds[0], SO_RCVTIMEO, &deadline) == -1,
+          "invented a deadline for a socket with no timeout");
+    close(fds[0]);
+    close(fds[1]);
+
+    /* The send path, which the drip-feed case above cannot reach: making send()
+       block needs a peer that stops reading until the socket buffer fills, and the
+       module's requests are a few hundred bytes. Exercised through the helper
+       instead, on the option the send loop uses. */
+    pair_with_timeout_ms(fds, 2000);
+    CHECK(transfer_deadline(fds[0], SO_SNDTIMEO, &deadline) == 0,
+          "no deadline taken from a 2s SO_SNDTIMEO");
+
+    usleep(300000);
+    CHECK(apply_remaining(fds[0], SO_SNDTIMEO, &deadline) == 0,
+          "reported the budget spent while 1.7s of it was left");
+    assert(getsockopt(fds[0], SOL_SOCKET, SO_SNDTIMEO, &got, &len) == 0);
+    left_ms = (long)got.tv_sec * 1000 + got.tv_usec / 1000;
+    /* Shrunk, not renewed. A per-call timeout reset to the full budget on every
+       iteration is exactly the defect. */
+    CHECK(left_ms > 0 && left_ms <= 1700,
+          "per-call timeout is %ldms; the remaining budget was not applied", left_ms);
+
+    /* Once the budget is spent the answer is no, rather than one more syscall. */
+    assert(clock_gettime(CLOCK_MONOTONIC, &deadline) == 0);
+    deadline.tv_sec -= 1;
+    CHECK(apply_remaining(fds[0], SO_SNDTIMEO, &deadline) == -1,
+          "an elapsed deadline was treated as time remaining");
 
     close(fds[0]);
     close(fds[1]);
@@ -382,6 +498,14 @@ static void test_send_auth_request_fields(void) {
           "the resolved name was lost");
     json_object_put(req);
 
+    /* A link-local login, zone and all, has to reach the wire intact: the field is
+       sized for it (conformance item 8), and copy_source_ip getting it right proves
+       nothing if the request is assembled from something else. */
+    req = read_sent_request("alice", "sshd", "fe80::1%eth0", "ssh", NULL);
+    CHECK((v = field(req, "source_ip")) && strcmp(v, "fe80::1%eth0") == 0,
+          "source_ip = %s, want the zoned link-local address", v ? v : "(absent)");
+    json_object_put(req);
+
     /* A console login has no remote host at all. */
     req = read_sent_request("alice", "login", "", "tty1", NULL);
     CHECK((v = field(req, "login_type")) && strcmp(v, "console") == 0,
@@ -419,6 +543,49 @@ static void test_source_ip_takes_only_addresses(void) {
 
     copy_source_ip("not an address at all", ip, sizeof(ip));
     CHECK(ip[0] == '\0', "garbage accepted as an address: %s", ip);
+
+    /* docs/wire-protocol.md conformance item 8, by name: "a validator that rejects
+       fe80::1%eth0 refuses a login this contract sized a field for". A bare
+       inet_pton does reject it — inet_pton(AF_INET6, "fe80::1%eth0", …) returns 0 —
+       so a link-local ssh login was audited as origin-unknown, and unknown must
+       never satisfy a network requirement. The zone travels with the address
+       because it says which link the peer is on, and the same fe80:: address on
+       another link is another host. */
+    copy_source_ip("fe80::1%eth0", ip, sizeof(ip));
+    CHECK(strcmp(ip, "fe80::1%eth0") == 0, "zoned IPv6 dropped or stripped: got '%s'", ip);
+
+    /* getnameinfo emits a numeric scope id when the interface has no name. */
+    copy_source_ip("fe80::1%25", ip, sizeof(ip));
+    CHECK(strcmp(ip, "fe80::1%25") == 0, "numeric scope id dropped: got '%s'", ip);
+
+    copy_source_ip("fe80::abcd:1234%enp0s31f6", ip, sizeof(ip));
+    CHECK(strcmp(ip, "fe80::abcd:1234%enp0s31f6") == 0,
+          "a predictable-names interface was dropped: got '%s'", ip);
+
+    /* The zone is the one part of the value inet_pton never sees, so it is
+       validated on its own rather than trusted. */
+    copy_source_ip("fe80::1%", ip, sizeof(ip));
+    CHECK(ip[0] == '\0', "an empty zone was accepted: %s", ip);
+    copy_source_ip("fe80::1%eth0/../etc", ip, sizeof(ip));
+    CHECK(ip[0] == '\0', "a zone with a path separator was accepted: %s", ip);
+    copy_source_ip("fe80::1%eth 0", ip, sizeof(ip));
+    CHECK(ip[0] == '\0', "a zone with whitespace was accepted: %s", ip);
+    copy_source_ip("fe80::1%thisisnotaninterface", ip, sizeof(ip));
+    CHECK(ip[0] == '\0', "a zone longer than IFNAMSIZ was accepted: %s", ip);
+
+    /* A scope is an IPv6 notion. A '%' anywhere else is not one, and splitting on
+       it must not turn a non-address into an address. */
+    copy_source_ip("192.0.2.10%eth0", ip, sizeof(ip));
+    CHECK(ip[0] == '\0', "a zone on an IPv4 literal was accepted: %s", ip);
+    copy_source_ip("client.example.com%eth0", ip, sizeof(ip));
+    CHECK(ip[0] == '\0', "a zoned hostname was accepted: %s", ip);
+    copy_source_ip("%eth0", ip, sizeof(ip));
+    CHECK(ip[0] == '\0', "a zone with no address was accepted: %s", ip);
+
+    /* The 45-byte cap still applies to the whole value, zone included, because
+       that is what the broker measures. */
+    copy_source_ip("2001:db8:0000:0000:0000:0000:0000:0001%interfacename", ip, sizeof(ip));
+    CHECK(ip[0] == '\0', "a value over the broker's 45-byte cap was accepted: %s", ip);
 }
 
 static void test_target_host_is_this_host(void) {
@@ -479,6 +646,58 @@ static void test_parse_reads_the_error_code(void) {
 
     CHECK(parse_broker_response("not json", &r) != 0, "accepted non-JSON");
     CHECK(parse_broker_response("[1,2,3]", &r) != 0, "accepted a JSON array");
+}
+
+static void test_parse_reads_success_strictly(void) {
+    printf("  parse_broker_response: success is a boolean or nothing\n");
+
+    struct broker_response *r = NULL;
+
+    CHECK(parse_broker_response(
+              "{\"success\":true,\"status\":\"authorized\",\"user_id\":\"alice\"}", &r) == 0,
+          "failed to parse success=true");
+    if (r != NULL) {
+        CHECK(r->success == 1, "success=true read as %d", r->success);
+        free(r);
+        r = NULL;
+    }
+
+    CHECK(parse_broker_response("{\"success\":false,\"status\":\"denied\"}", &r) == 0,
+          "failed to parse success=false");
+    if (r != NULL) {
+        CHECK(r->success == 0, "success=false read as %d", r->success);
+        free(r);
+        r = NULL;
+    }
+
+    /* json_object_get_boolean coerces, so reading this field without checking its
+       type made "false" — a non-empty string — read as true, and the module would
+       grant a login off a reply that said the opposite. The wrong type here is a
+       malformed reply, refused outright, which the caller turns into
+       PAM_AUTHINFO_UNAVAIL. */
+    CHECK(parse_broker_response(
+              "{\"success\":\"false\",\"status\":\"authorized\",\"user_id\":\"alice\"}", &r) != 0,
+          "a string success was accepted; \"false\" would read as true");
+    CHECK(parse_broker_response(
+              "{\"success\":1,\"status\":\"authorized\",\"user_id\":\"alice\"}", &r) != 0,
+          "an integer success was accepted");
+    CHECK(parse_broker_response(
+              "{\"success\":null,\"status\":\"authorized\",\"user_id\":\"alice\"}", &r) != 0,
+          "a null success was accepted");
+    CHECK(parse_broker_response(
+              "{\"success\":{},\"status\":\"authorized\",\"user_id\":\"alice\"}", &r) != 0,
+          "an object success was accepted");
+
+    /* Absent is not malformed — nothing on the wire requires the field — but it
+       is not true either: authorized_for refuses a reply that never said it
+       succeeded. */
+    CHECK(parse_broker_response("{\"status\":\"pending\",\"session_id\":\"abc\"}", &r) == 0,
+          "a reply without success was rejected");
+    if (r != NULL) {
+        CHECK(r->success == 0, "absent success read as %d", r->success);
+        free(r);
+        r = NULL;
+    }
 }
 
 /* --------------------------------------------------- protocol versioning */
@@ -564,6 +783,171 @@ static void test_protocol_version(void) {
               json_object_get_int(pv) == PROTOCOL_VERSION,
           "authenticate did not declare protocol_version %d", PROTOCOL_VERSION);
     json_object_put(req);
+}
+
+/* ------------------------------------------------------- the grant decision */
+
+/* parsed returns the broker_response for one JSON reply, or NULL if it did not
+   parse. Caller frees. Going through parse_broker_response rather than filling
+   the struct by hand keeps these tests honest about the path a real reply
+   takes: the fields the decision reads are the fields the parser wrote. */
+static struct broker_response *parsed(const char *json_text) {
+    struct broker_response *r = NULL;
+
+    if (parse_broker_response(json_text, &r) != 0) return NULL;
+    return r;
+}
+
+static void test_authorized_for(void) {
+    printf("  authorized_for: the client half of the grant decision\n");
+
+    /* This is the whole client half of the contract docs/wire-protocol.md
+       describes as "two independent checks, because one of them is in a
+       different process and might be an older version of itself". The broker
+       enforces the same rule before it activates a session; this is the second,
+       independent check on the value the module is about to act on.
+
+       Until this test existed, nothing in the repository called it — neither the
+       unit suite nor any mutation nor the container harness, which drives an
+       honest broker and so can never answer "authorized" for the wrong user. So
+       `authorized_for() { return 1; }` was green in every suite here, which is
+       the exact shape of an authorization bypass that ships. */
+    struct broker_response *r;
+
+    r = parsed("{\"success\":true,\"status\":\"authorized\",\"user_id\":\"alice\"}");
+    CHECK(r != NULL, "a well-formed authorized reply did not parse");
+    if (r != NULL) {
+        CHECK(authorized_for(r, "alice") == 1, "refused an authorized reply for the right user");
+
+        /* The bypass. A reply that says "authorized" for a different account
+           must never open a shell as the one the login asked for. */
+        CHECK(authorized_for(r, "bob") == 0, "a reply authorizing alice opened a login for bob");
+
+        /* Not a prefix comparison: alic and alicia are different accounts, and a
+           strncmp with the wrong length is how this quietly stops being a
+           comparison at all. */
+        CHECK(authorized_for(r, "alic") == 0, "a prefix of the authorized user was accepted");
+        CHECK(authorized_for(r, "alicia") == 0, "an extension of the authorized user was accepted");
+        /* Unix accounts are case-sensitive, so Alice is not alice. */
+        CHECK(authorized_for(r, "Alice") == 0, "the comparison was case-insensitive");
+        CHECK(authorized_for(r, "") == 0, "an empty login name matched a named user");
+        free(r);
+    }
+
+    /* status and success are two statements about the same outcome, and a reply
+       where they disagree is not a reply this module can act on: whichever one is
+       wrong, it does not know which. Failing closed is the only answer. */
+    r = parsed("{\"success\":false,\"status\":\"authorized\",\"user_id\":\"alice\"}");
+    CHECK(r != NULL, "an authorized/success=false reply did not parse");
+    if (r != NULL) {
+        CHECK(authorized_for(r, "alice") == 0, "status=authorized with success=false granted a login");
+        free(r);
+    }
+
+    /* A reply that never says it succeeded has not. */
+    r = parsed("{\"status\":\"authorized\",\"user_id\":\"alice\"}");
+    CHECK(r != NULL, "a reply without success did not parse");
+    if (r != NULL) {
+        CHECK(authorized_for(r, "alice") == 0, "an absent success was read as true");
+        free(r);
+    }
+
+    /* An empty user_id is not "no opinion", it is a reply that authorized nobody
+       — and it would compare equal to an empty PAM username. Refused before the
+       comparison, so that neither side of it can be empty. */
+    r = parsed("{\"success\":true,\"status\":\"authorized\",\"user_id\":\"\"}");
+    CHECK(r != NULL, "a reply with an empty user_id did not parse");
+    if (r != NULL) {
+        CHECK(authorized_for(r, "") == 0, "an empty user_id authorized an empty username");
+        CHECK(authorized_for(r, "alice") == 0, "an empty user_id authorized alice");
+        free(r);
+    }
+}
+
+static void test_terminal_status_to_pam(void) {
+    printf("  terminal_status_to_pam: a terminal status is never a login\n");
+
+    /* The other half of the decision, and equally uncovered until now: deleting
+       this mapping was green in every suite here too.
+
+       Two things are asserted of every case. First that it is not PAM_SUCCESS —
+       no terminal status is a login. Second *which* failure it is, because the
+       two are not interchangeable in a stack: a decision about the user is
+       PAM_AUTH_ERR, while an operational failure is PAM_AUTHINFO_UNAVAIL, which
+       invites the rest of the stack to answer instead. Reporting a denial as
+       "ask someone else" is how a provider's "no" becomes somebody else's yes. */
+    struct broker_response *r;
+    int rc;
+
+    r = parsed("{\"status\":\"denied\",\"error_message\":\"not a member of the team\"}");
+    CHECK(r != NULL, "a denied reply did not parse");
+    if (r != NULL) {
+        rc = terminal_status_to_pam(r, "alice");
+        CHECK(rc == PAM_AUTH_ERR, "denied mapped to %d, want PAM_AUTH_ERR (%d)", rc, PAM_AUTH_ERR);
+        free(r);
+    }
+
+    r = parsed("{\"status\":\"expired\",\"error_message\":\"the code expired\"}");
+    CHECK(r != NULL, "an expired reply did not parse");
+    if (r != NULL) {
+        rc = terminal_status_to_pam(r, "alice");
+        CHECK(rc == PAM_AUTH_ERR, "expired mapped to %d, want PAM_AUTH_ERR (%d)", rc, PAM_AUTH_ERR);
+        free(r);
+    }
+
+    /* Capacity conditions are not decisions about the user: the host is busy,
+       not the account unwelcome. PAM_AUTHINFO_UNAVAIL — "ask someone else, or
+       try again" — is the honest answer. */
+    r = parsed("{\"status\":\"error\",\"error_code\":\"RATE_LIMITED\"}");
+    CHECK(r != NULL, "a rate-limited reply did not parse");
+    if (r != NULL) {
+        rc = terminal_status_to_pam(r, "alice");
+        CHECK(rc == PAM_AUTHINFO_UNAVAIL, "RATE_LIMITED mapped to %d, want PAM_AUTHINFO_UNAVAIL (%d)",
+              rc, PAM_AUTHINFO_UNAVAIL);
+        free(r);
+    }
+
+    r = parsed("{\"status\":\"error\",\"error_code\":\"AUTH_LIMIT_REACHED\"}");
+    CHECK(r != NULL, "an at-capacity reply did not parse");
+    if (r != NULL) {
+        rc = terminal_status_to_pam(r, "alice");
+        CHECK(rc == PAM_AUTHINFO_UNAVAIL,
+              "AUTH_LIMIT_REACHED mapped to %d, want PAM_AUTHINFO_UNAVAIL (%d)",
+              rc, PAM_AUTHINFO_UNAVAIL);
+        free(r);
+    }
+
+    r = parsed("{\"status\":\"error\",\"error_code\":\"DEVICE_FLOW_FAILED\","
+               "\"error_message\":\"provider unreachable\"}");
+    CHECK(r != NULL, "an error reply did not parse");
+    if (r != NULL) {
+        rc = terminal_status_to_pam(r, "alice");
+        CHECK(rc == PAM_AUTHINFO_UNAVAIL, "an operational error mapped to %d, want %d",
+              rc, PAM_AUTHINFO_UNAVAIL);
+        free(r);
+    }
+
+    /* A status this module does not know must fail closed. It is the branch a
+       future broker reaches first, and the one place where "unrecognized" could
+       most easily be read as "nothing wrong". */
+    r = parsed("{\"status\":\"granted\",\"user_id\":\"alice\",\"success\":true}");
+    CHECK(r != NULL, "a reply with an unknown status did not parse");
+    if (r != NULL) {
+        rc = terminal_status_to_pam(r, "alice");
+        CHECK(rc == PAM_AUTH_ERR, "an unknown status mapped to %d, want PAM_AUTH_ERR (%d)",
+              rc, PAM_AUTH_ERR);
+        free(r);
+    }
+
+    /* An absent status parses to the empty string, which is no status at all. */
+    r = parsed("{\"success\":true,\"user_id\":\"alice\"}");
+    CHECK(r != NULL, "a reply with no status did not parse");
+    if (r != NULL) {
+        rc = terminal_status_to_pam(r, "alice");
+        CHECK(rc == PAM_AUTH_ERR, "a missing status mapped to %d, want PAM_AUTH_ERR (%d)",
+              rc, PAM_AUTH_ERR);
+        free(r);
+    }
 }
 
 /* ------------------------------------------------------ parse_arguments */
@@ -662,13 +1046,18 @@ int main(void) {
     test_receive_rejects_an_empty_response();
     test_receive_times_out_on_a_silent_peer();
     test_receive_rejects_a_full_buffer_without_eof();
+    test_receive_bounds_a_drip_feeding_peer();
+    test_transfer_deadline_bounds_a_whole_transfer();
     test_connect_applies_the_io_timeout();
     test_send_json_survives_a_closed_peer();
     test_send_auth_request_fields();
     test_source_ip_takes_only_addresses();
     test_target_host_is_this_host();
     test_parse_reads_the_error_code();
+    test_parse_reads_success_strictly();
     test_protocol_version();
+    test_authorized_for();
+    test_terminal_status_to_pam();
     test_parse_arguments();
 
     printf("\n%d checks, %d failures", checks, failures);

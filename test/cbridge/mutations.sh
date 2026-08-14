@@ -8,9 +8,9 @@
 # the tests would notice if the code stopped doing it — and a regression test that
 # cannot fail is worse than none, because it reads as protection.
 #
-# So each case here reintroduces one of the six defects test/cbridge/README.md
-# lists, and asserts the suite *fails*. A mutation that goes uncaught means the
-# test meant to pin that defect down is not pinning anything.
+# So each case here reintroduces one of the defects test/cbridge/README.md lists,
+# and asserts the suite *fails*. A mutation that goes uncaught means the test meant
+# to pin that defect down is not pinning anything.
 #
 # Mutations are applied to a copy of the source under $TMPDIR. Nothing in the
 # repository is touched, so an interrupted run leaves no half-mutated file behind.
@@ -84,8 +84,20 @@ run() {
         return
     fi
 
-    "$WORK/cbridge_test" >"$WORK/out" 2>&1
+    # Capped, because the failure mode of a timeout defect is a suite that blocks
+    # rather than one that fails: a mutation that removes a deadline can leave a
+    # test waiting on a peer that will never speak, and without this the run wedges
+    # instead of reporting. The honest suite finishes in a few seconds.
+    timeout 120 "$WORK/cbridge_test" >"$WORK/out" 2>&1
     local status=$?
+
+    if [ "$status" -eq 124 ]; then
+        # Neither caught nor missed: the suite never answered, so this case is
+        # evidence about nothing. Reported as a failure so it cannot pass as one.
+        echo "HUNG     $name — the suite did not finish within 120s"
+        failures=$((failures + 1))
+        return
+    fi
 
     case "$expect" in
     pass)
@@ -138,11 +150,35 @@ run "a full buffer means too large" fail \
 run "no I/O timeout on the socket" fail \
     '$n = s/tv\.tv_sec  = seconds;/tv.tv_sec  = seconds * 0;/g'
 
+# The reply bounded per recv() again rather than as a whole. transfer_deadline
+# failing means no budget to enforce, which is the state the module was in: a peer
+# sending one byte just inside every SO_RCVTIMEO holds the login open per byte.
+run "no deadline on the whole reply, only on each recv()" fail \
+    '$n = s/(static int transfer_deadline\(int sock, int optname, struct timespec \*deadline\) \{\n)/$1    return -1;\n/g'
+
+# Mutating apply_remaining to hand back *more* time than is left is deliberately
+# not a case here: every version of it leaves a huge SO_RCVTIMEO on the socket, so
+# the silent-peer test blocks instead of failing and the run hangs rather than
+# reporting. The timeout wrapper in run() turns that into a HUNG failure rather
+# than a wedged CI job, but a mutation that can only hang is evidence about the
+# harness, not about the tests.
+
 # source_ip taking PAM_RHOST verbatim. Under `UseDNS yes` that is a hostname, and
 # a long FQDN overruns the 45 bytes the broker allows — which makes it reject the
 # whole request and fail the login.
 run "source_ip takes any rhost" fail \
-    '$n = s/(inet_pton\(AF_INET, rhost, v4\)) != 1 && (inet_pton\(AF_INET6, rhost, v6\)) != 1/$1 == 99 && $2 == 99/g'
+    '$n = s/(inet_pton\(AF_INET, addr, v4\)) != 1 && (inet_pton\(AF_INET6, addr, v6\)) != 1/$1 == 99 && $2 == 99/g'
+
+# The zone never split off, which is the bare-inet_pton behaviour: a link-local
+# login is audited as origin-unknown, and docs/wire-protocol.md conformance item 8
+# names the address it happens to.
+run "source_ip validated without splitting the %zone" fail \
+    "\$n = s/zone = strchr\\(rhost, '%'\\);/zone = NULL;/g"
+
+# The zone taken on trust. inet_pton never sees it, so this is the only thing
+# vetting the part of the value after the '%'.
+run "the IPv6 zone is not validated" fail \
+    '$n = s/(static int valid_zone_id\(const char \*s\) \{\n)/$1    return 1;\n/g'
 
 # target_host taking the client's name: the original defect, where every audit
 # record named the client as the host being logged into.
@@ -164,6 +200,38 @@ run "any protocol version is acceptable" fail \
 # invisible to a broker that starts enforcing one.
 run "protocol_version omitted from requests" fail \
     '$n = s/^.*json_object_object_add\(req, "protocol_version".*\n//mg'
+
+# success read with json-c's coercing accessor. Any non-empty string and any
+# non-zero number read as true, so "success":"false" would grant the login — a
+# fail-open read of a conjunct authorized_for depends on.
+run "success read with type coercion" fail \
+    '$n = s/json_object_get_type\(success_obj\) != json_type_boolean/0/g'
+
+# The grant decision itself, which until v0.4.0 no case here pointed at: both of
+# the mutations below were green in every suite this repository has, which is what
+# an authorization bypass looks like on the way in.
+#
+# authorized_for stops deciding anything. This is the client half of the two
+# independent checks docs/wire-protocol.md specifies — delete it and the module
+# acts on whatever a broker says "authorized" about, for whatever account.
+run "authorized_for accepts every reply" fail \
+    '$n = s/(static int authorized_for\(const struct broker_response \*r, const char \*username\) \{\n)/$1    return 1;\n/g'
+
+# And the specific comparison inside it: the broker authorized somebody, but not
+# the account this login is for.
+run "authorized_for ignores which user was authorized" fail \
+    '$n = s/if \(strcmp\(r->user_id, username\) != 0\) \{/if (0) {/g'
+
+# terminal_status_to_pam stops mapping, so denied, expired and error all read as
+# a successful login — the fail-open direction of the same decision.
+run "every terminal status is a successful login" fail \
+    '$n = s/(static int terminal_status_to_pam\(const struct broker_response \*r, const char \*username\) \{\n)/$1    return PAM_SUCCESS;\n/g'
+
+# Only the unrecognized-status branch fails open. A status this module has never
+# heard of is the one a future broker reaches first, and "unrecognized" is where
+# "nothing wrong" is easiest to write by accident.
+run "an unknown broker status grants the login" fail \
+    '$n = s/(    log_pam_message\(LOG_ERR, "Unknown broker status .*\n.*\n)    return PAM_AUTH_ERR;/$1    return PAM_SUCCESS;/g'
 
 echo
 if [ "$failures" -ne 0 ]; then
