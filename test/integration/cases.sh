@@ -172,6 +172,33 @@ case_mapped_user_match() {
     expect_login_ok bob
 }
 
+# The mapper refuses to resolve an identity to a system account by name. postgres
+# here is a perfectly ordinary account at UID 1500 — above the floor, with a real
+# shell — so the only thing refusing it is the denylist. The identity claims the
+# login "postgres", which is the actual attack: on a host mapping
+# local_user: "{{ .Login }}" gated only on org membership, a member who renames
+# themselves after a service account would otherwise get it.
+case_system_account_name_refused() {
+    control reset
+    curl -fsS "$CONTROL_URL/control/login?login=postgres" >/dev/null
+    AUTHORIZE_ON_PROMPT=1 attempt_login postgres
+    expect_login_refused
+    # It got as far as a device flow and a real approval: the refusal is the
+    # mapping decision, not an earlier failure.
+    expect_prompted
+}
+
+# The companion restriction, isolated: pgsvc is not on any denylist and fails only
+# for being below mapper.min_uid (400 < 1000). Together with the case above, and
+# with alice at 1001 succeeding, this pins each mechanism separately.
+case_below_uid_floor_refused() {
+    control reset
+    curl -fsS "$CONTROL_URL/control/login?login=pgsvc" >/dev/null
+    AUTHORIZE_ON_PROMPT=1 attempt_login pgsvc
+    expect_login_refused
+    expect_prompted
+}
+
 # provider= names which configured provider to authenticate against. The harness
 # broker configures exactly one, "fakegithub", so naming it must behave exactly
 # like omitting it: what this proves is that the name travels from the pam.d line

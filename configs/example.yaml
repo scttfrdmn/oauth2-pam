@@ -95,6 +95,35 @@ providers:
 
 mapper:
 
+  # --- Which local accounts may be mapped to at all ---
+  #
+  # These apply to every tier. Nothing below can produce a mapping that gets past
+  # them, including an external script or HTTP service you wrote yourself.
+  #
+  # min_uid is the lowest UID an identity may be mapped to. 1000 is UID_MIN on
+  # every mainstream distribution, so the default keeps identities off every
+  # system and service account the host has. Lower it if you have real human
+  # accounts below 1000; a negative value turns the floor off entirely and leaves
+  # only the name denylist.
+  #
+  # UID 0 is refused unconditionally — not by name, by UID, and neither of these
+  # settings can permit it. A device flow has no cryptographic binding to the SSH
+  # connection it is authorising, which makes it the weakest way to reach the most
+  # privilege. OpenSSH's own default (PermitRootLogin prohibit-password) already
+  # rules this out. Use an ordinary account and sudo.
+  #
+  # min_uid: 1000
+  #
+  # Alongside the floor there is a built-in denylist of system accounts (root,
+  # www-data, postgres, nobody, systemd-*, anything starting with _, and so on).
+  # It exists because the floor needs the account to resolve, and a broker built
+  # without cgo sees only /etc/passwd — so on an LDAP/SSSD host the floor cannot
+  # be applied and the denylist is what is left. If your site has a real person
+  # whose account collides with a name on that list, exempt it by name; they still
+  # have to satisfy min_uid, and root can never be exempted.
+  #
+  # allow_system_users: [mail]
+
   # --- Tier 0: enrollment file (optional) ---
   # Users self-enroll once with: sudo oauth2-pam-enroll --user <local-user>
   # The enrollment file maps local Unix usernames to their provider logins.
@@ -135,25 +164,38 @@ mapper:
   #             group: platform-team
   #         local_user: platformuser
 
-  rules:
-    # Org admins get sudo
-    - match:
-        github_org: my-org
-        github_team: my-org/admins
-      local_user: "{{ .Login }}"
-      groups: [users, sudo]
+  # Read this before copying the rules below.
+  #
+  # `local_user: "{{ .Login }}"` gated only on org membership means "whatever this
+  # person calls themselves at the provider is the local account they get". That is
+  # convenient and it is how most sites will want to start, but understand what it
+  # delegates: whoever can create or rename an account in my-org chooses local
+  # usernames on this host. On a GitHub Enterprise Server that may be a wider group
+  # than you think. min_uid and the system-account denylist above are what stop the
+  # obvious abuse of it (a member who renames themselves "postgres"), not the rule.
+  #
+  # Tighten it by listing accounts explicitly (github_login → local_user), by
+  # requiring a team rather than an org, or by enrolling users (Tier 0) so that the
+  # pairing is recorded on this host instead of inferred from a name.
 
-    # All org members get a normal account
+  rules:
+    # All org members get an account named after their login.
     - match:
         github_org: my-org
       local_user: "{{ .Login }}"
-      groups: [users]
 
     # Direct user mapping (overrides any org check)
     # - match:
     #     github_login: octocat
     #   local_user: octocat
-    #   groups: [users]
+
+  # `groups:` is parsed and reported but NOT applied — this module authenticates,
+  # it does not manage group membership, and nothing here adds a user to a Unix
+  # group. A rule saying `groups: [sudo]` grants no sudo. Manage privilege with
+  # the host's own groups (or your configuration management), not here. The
+  # shipped example deliberately no longer includes a `sudo` line, so that the day
+  # groups do get applied nobody is surprised by one.
+  # See https://github.com/scttfrdmn/oauth2-pam/issues/12
 
   # --- Tier 2: external script (optional) ---
   # The script receives an Identity JSON object on stdin and must write

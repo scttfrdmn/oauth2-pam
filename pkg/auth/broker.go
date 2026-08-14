@@ -691,10 +691,11 @@ func (b *Broker) pollDeviceAuthorization(
 							ErrorMessage: err.Error(),
 							Timestamp:    time.Now(),
 						})
-						// No mapping is a decision (this identity has no local
-						// account); anything else is an operational failure.
+						// No mapping, and a mapping to an account this path may not
+						// reach, are both decisions about the identity; anything
+						// else is an operational failure.
 						status := StatusError
-						if errors.Is(err, mapper.ErrNoMapping) {
+						if errors.Is(err, mapper.ErrNoMapping) || errors.Is(err, mapper.ErrForbiddenLocalUser) {
 							status = StatusDenied
 						}
 						b.failSession(sessionID, status, "No local account mapping for this identity")

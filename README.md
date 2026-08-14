@@ -217,29 +217,37 @@ The mapper resolves a GitHub identity to a local Unix user via a four-tier chain
 | 2 | `mapper.external_script` | External binary (JSON stdin/stdout) |
 | 3 | `mapper.http_endpoint` | HTTPS service (LDAP gateway, etc.) |
 
+### Which local accounts can be mapped to
+
+Every tier's answer passes the same gate, so no rule, script, or identity service can produce a mapping that gets past it:
+
+| Check | Default | Setting |
+|---|---|---|
+| Must be a valid POSIX username | always | — |
+| Not a system account by name (`root`, `www-data`, `postgres`, `nobody`, `systemd-*`, anything starting with `_`, …) | always | exempt one with `mapper.allow_system_users` |
+| UID at or above the floor | 1000 | `mapper.min_uid` (negative disables) |
+| **Never UID 0** | always | not overridable |
+
+The two mechanisms cover for each other. The floor is authoritative — it asks the host what the UID is — but it needs the account to resolve, and a broker built without cgo reads only `/etc/passwd`, so on an LDAP/SSSD host it cannot be applied. The name denylist needs no lookup. An account that does not resolve at all is allowed past the floor with a warning, because it cannot become a login anyway: sshd resolves the account itself before it starts a session.
+
+This matters because `local_user: "{{ .Login }}"` gated only on org membership delegates the choice of local username to whoever can create or rename an account in that org. Without a floor, a member who renamed themselves `postgres` logged in as `postgres`.
+
+Root is refused by UID, not by name, and neither setting can permit it: a device flow has no cryptographic binding to the SSH connection it authorises, which makes it the weakest route to the most privilege. OpenSSH's own default `PermitRootLogin prohibit-password` already rules it out. Use an ordinary account and `sudo`.
+
 ### Rule matching
 
 ```yaml
 mapper:
   rules:
-    # Match by org + team → sudo
-    - match:
-        github_org: my-org
-        github_team: my-org/admins
-      local_user: "{{ .Login }}"
-      groups: [users, sudo]
-
-    # Match by org only
+    # Match by org
     - match:
         github_org: my-org
       local_user: "{{ .Login }}"
-      groups: [users]
 
     # Match specific user
     - match:
         github_login: octocat
       local_user: octocat
-      groups: [users]
 ```
 
 All `match` fields within a rule are ANDed, and matching is case-insensitive. `local_user` supports `{{ .Login }}` (the provider username), `{{ .Email }}`, and `{{ .Name }}`; nothing else — an unknown field or a pipeline is rejected rather than expanded. The result must be a valid POSIX username or the mapping is refused. A provider whose logins are email addresses therefore cannot use `{{ .Login }}`; give those rules an explicit `local_user`, or map in Tier 2/3.
@@ -288,6 +296,8 @@ fi
 ```
 
 The script runs with a scrubbed environment (`PATH` and `HOME` only) and is killed at `external_script_timeout`.
+
+Its `local_user` is validated the same way a rule's is — a valid POSIX username, not a system account, at or above `mapper.min_uid`. The example above is worth reading as a warning as well as a template: its input is provider-controlled, and a shorter version that echoed `.login` straight back would hand over whatever the identity claimed. A refused answer ends the login; the chain does not fall through to Tier 3 looking for a more agreeable one.
 
 ### HTTP service (Tier 3)
 

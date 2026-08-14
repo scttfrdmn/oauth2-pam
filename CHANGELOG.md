@@ -87,6 +87,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot collide with a real UID, and the broker logs whether peer credentials are
   available at all. ([#23](https://github.com/scttfrdmn/oauth2-pam/issues/23))
 
+### Added
+
+- **A UID floor and a system-account denylist on every mapper tier.** Nothing —
+  not a rule, not an external script, not an HTTP identity service — can now
+  resolve an identity to root, to a system account by name (`www-data`,
+  `postgres`, `nobody`, `systemd-*`, anything starting with `_`, …), or to an
+  account below `mapper.min_uid` (new, default 1000, the UID_MIN of every
+  mainstream distribution; a negative value disables the floor).
+
+  There was no such check before, and the shipped example maps
+  `local_user: "{{ .Login }}"` gated only on org membership — so any member of the
+  org who renamed themselves after a service account logged in as it. Trivial on a
+  GitHub Enterprise Server; a matter of getting there first on github.com.
+
+  UID 0 is refused unconditionally: not by name, by UID, and neither
+  `mapper.min_uid` nor the new `mapper.allow_system_users` exemption list can
+  permit it. A device flow has no cryptographic binding to the SSH connection it
+  authorises, and OpenSSH's own default (`PermitRootLogin prohibit-password`)
+  already rules this out.
+
+  The floor and the denylist cover for each other: the floor is authoritative but
+  needs the account to resolve, and a broker built without cgo reads only
+  `/etc/passwd`, so on an LDAP/SSSD host only the denylist applies. An account
+  that does not resolve at all is allowed past the floor with a warning rather
+  than refused, because it cannot become a login anyway — sshd resolves the
+  account itself before it starts a session — and refusing would break every
+  NSS-backed site.
+
+- Tier 2 and Tier 3 answers are now checked against the Unix-username rules that
+  Tier 0 and Tier 1 already applied; previously they were only checked for
+  emptiness, so a script doing the obvious `jq -r .login` handed back whatever the
+  provider identity claimed. A refused answer also ends the login rather than
+  falling through to the next tier: a tier that says "this identity is www-data"
+  has answered, and asking the next one for something more convenient would turn a
+  refusal into a retry.
+
 ### Fixed
 
 Four defects found by a security review that reproduced each one against a
@@ -175,6 +211,15 @@ regression test in `pkg/auth/broker_limits_test.go` or
   unit granting `ReadWritePaths=/etc/oauth2-pam`, a typo in that setting destroyed
   a directory tree on the next restart. Startup now refuses to replace anything
   that is not a socket.
+
+- **`configs/example.yaml` no longer ships a rule granting `sudo`.** It had
+  `groups: [users, sudo]` on the org-admins rule, commented "Org admins get
+  sudo" — while `groups` is not applied to the login at all
+  ([#12](https://github.com/scttfrdmn/oauth2-pam/issues/12)). It promised
+  privilege it did not grant, and would have granted it the day the field starts
+  working. Both the example and the README now say plainly that `groups` grants
+  nothing today, and the example explains what
+  `local_user: "{{ .Login }}"` delegates before showing it.
 
 - **`revoke_session` replies carry a `status` (`"revoked"`)** like every other
   reply. It was the sole exception, so a client applying the documented "granted

@@ -45,4 +45,20 @@ RUN printf 'fakeclientsecret0000000000000000\n' > /etc/oauth2-pam/fakegithub.sec
 
 RUN mkdir -p /var/log/oauth2-pam
 
+# The same accounts the client container has, because the mapper's UID floor asks
+# *this* host's passwd database what a mapped name resolves to. In production the
+# broker and the login share a host by construction — the IPC transport is a Unix
+# socket — but the harness splits them across two containers, so without this the
+# floor would silently never apply and the cases covering it would pass for the
+# wrong reason. The UIDs must match Dockerfile.client.
+#
+#   alice    1001  an ordinary account: allowed
+#   bob      1002  an ordinary account: allowed
+#   pgsvc     400  below min_uid: refused by the floor alone
+#   postgres 1500  above min_uid, on the name denylist: refused by the name alone
+RUN useradd --no-create-home --uid 1001 --shell /usr/sbin/nologin alice \
+ && useradd --no-create-home --uid 1002 --shell /usr/sbin/nologin bob \
+ && useradd --no-create-home --uid 400  --shell /usr/sbin/nologin pgsvc \
+ && useradd --no-create-home --uid 1500 --shell /usr/sbin/nologin postgres
+
 CMD ["oauth2-pam-broker", "--config", "/etc/oauth2-pam/broker.yaml"]

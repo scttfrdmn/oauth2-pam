@@ -44,6 +44,8 @@ difference, so it is not worth paying for by default.
 | `denied_by_github` | a denial fails promptly rather than waiting out the deadline |
 | `mapped_user_mismatch` | GitHub says alice, the request is for bob: refused |
 | `mapped_user_match` | bob logs in when the mapping yields bob, so the case above fails for the right reason |
+| `system_account_name_refused` | a mapping to `postgres` is refused by the system-account denylist, even though that account is above the UID floor and perfectly usable |
+| `below_uid_floor_refused` | a mapping to `pgsvc` (UID 400) is refused by `mapper.min_uid` alone; it is on no denylist |
 | `named_provider` | `provider=fakegithub` on the `pam.d` line reaches the broker and is accepted, behaving exactly like omitting it |
 | `unknown_provider_refused` | `provider=nope` is refused immediately, with no prompt and no device flow started, rather than falling back to the default |
 | `broker_down` | an unreachable broker fails closed, immediately, and sshd survives |
@@ -86,13 +88,19 @@ never started", which is why `never_authorized` checks it.
 
 - The client's PAM stack contains **only** `oauth2_pam.so` — no
   `@include common-auth`. A fallback to `pam_unix` would let a case pass for the
-  wrong reason. `alice` and `bob` have `*` as their password hash for the same
+  wrong reason. Every test account has `*` as its password hash for the same
   reason.
+- The test accounts are created **in both containers, with the same UIDs**. The
+  mapper's UID floor asks the broker host's passwd database what a mapped name
+  resolves to; in production the broker and the login share a host by
+  construction, but the harness splits them, so without the duplicate accounts
+  the floor would silently never apply and `below_uid_floor_refused` would pass
+  for the wrong reason.
 - `Dockerfile.client` fails the build if the compiled `.so` is missing any
   `pam_sm_*` entry point. That defect shipped in 0.1.1 and is silent at build
   time.
 - `timeout=20 poll_interval=1` in `/etc/pam.d/sshd` keeps `never_authorized`
-  down to about twenty seconds; production defaults are 300 and 5.
+  down to about twenty seconds; production defaults are 90 and 5.
 - The two `provider=` cases rewrite the `oauth2_pam.so` line in
   `/etc/pam.d/sshd` and restore it before asserting. `sshd` re-reads that file
   for every session, so nothing needs restarting.

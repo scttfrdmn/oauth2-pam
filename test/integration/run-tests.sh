@@ -20,6 +20,8 @@ DEFAULT_CASES=(
     denied_by_github
     mapped_user_mismatch
     mapped_user_match
+    system_account_name_refused
+    below_uid_floor_refused
     named_provider
     unknown_provider_refused
 )

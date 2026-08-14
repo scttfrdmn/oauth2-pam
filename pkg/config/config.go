@@ -142,6 +142,18 @@ type MapperConfig struct {
 
 	// HTTPTimeout is how long to wait for the HTTP service (default 2s)
 	HTTPTimeout time.Duration `mapstructure:"http_timeout"`
+
+	// MinUID is the lowest UID an identity may be mapped to (default 1000, the
+	// UID_MIN of every mainstream distribution). It applies to every tier.
+	//
+	// A negative value disables the floor, leaving only the system-account name
+	// denylist. UID 0 is refused either way.
+	MinUID int `mapstructure:"min_uid"`
+
+	// AllowSystemUsers exempts named accounts from the built-in system-account
+	// denylist — for the site whose real person is called "mail". Those accounts
+	// still have to satisfy MinUID, and root is never exempt.
+	AllowSystemUsers []string `mapstructure:"allow_system_users"`
 }
 
 // MappingRule defines a single identity-to-user mapping rule.
@@ -305,6 +317,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("mapper.enrollment_file", "/etc/oauth2-pam/enrolled-users.yaml")
 	v.SetDefault("mapper.external_script_timeout", "5s")
 	v.SetDefault("mapper.http_timeout", "2s")
+	// Mirrors mapper.DefaultMinUID, which cannot be referenced here: pkg/mapper
+	// imports this package. A test in pkg/mapper pins the two together.
+	v.SetDefault("mapper.min_uid", 1000)
 
 	v.SetDefault("audit.enabled", true)
 	v.SetDefault("audit.format", "json")
@@ -392,6 +407,16 @@ func (c *Config) Validate() error {
 	if c.Security.SecureTokenStorage && c.Security.TokenEncryptionKey != "" {
 		if err := keys.Validate(c.Security.TokenEncryptionKey); err != nil {
 			return fmt.Errorf("security.token_encryption_key %w", err)
+		}
+	}
+
+	// No check on MinUID == 0: it means "unset, use the default", so that a Config
+	// built in code rather than loaded from a file gets the floor rather than an
+	// error. Disabling the floor is a negative value, which is deliberately harder
+	// to type by accident.
+	for i, name := range c.Mapper.AllowSystemUsers {
+		if strings.EqualFold(name, "root") {
+			return fmt.Errorf("mapper.allow_system_users[%d]: root cannot be allowed", i)
 		}
 	}
 

@@ -157,9 +157,13 @@ func runTestMapping(cfgPath, login, org, team string) error {
 	chain := mapper.New(cfg.Mapper)
 	result, err := chain.Map(context.Background(), id, "") // "" = skip Tier 0 enrollment in dry-run
 	if err != nil {
+		// Not necessarily "no mapping": a tier may have produced one and had it
+		// refused for resolving to root, a system account, or an account below
+		// mapper.min_uid. The error says which, and a dry run is exactly where an
+		// operator should find that out.
 		log.Error().Err(err).
 			Str("login", login).
-			Msg("No mapping found")
+			Msg("Mapping failed")
 		return err
 	}
 

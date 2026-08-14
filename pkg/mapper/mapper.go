@@ -13,11 +13,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os/exec"
+	"os/user"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,9 +33,69 @@ import (
 // ErrNoMapping is returned when no tier produces a mapping for the identity.
 var ErrNoMapping = fmt.Errorf("no mapping found for identity")
 
+// ErrForbiddenLocalUser is returned when a tier resolves to a local account that
+// must never be reached through this path: a system account, or one below
+// mapper.min_uid.
+//
+// It is a decision about the identity, not an outage, so the broker reports it as
+// "denied" and no later tier is consulted. A tier that answers "this identity is
+// www-data" has answered; asking the next tier for a more convenient answer would
+// turn a refusal into a retry.
+var ErrForbiddenLocalUser = errors.New("mapping resolves to a forbidden local account")
+
 // unixUsernameRe matches valid POSIX portable Unix usernames:
 // starts with letter or underscore, up to 32 chars of [a-z0-9_-].
 var unixUsernameRe = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+
+// DefaultMinUID is the floor applied when mapper.min_uid is unset. 1000 is the
+// first non-system UID on Debian, Ubuntu, RHEL 7+, and SUSE; UID_MIN in
+// /etc/login.defs is 1000 on all of them.
+const DefaultMinUID = 1000
+
+// systemAccounts are local accounts a provider identity may never be mapped to,
+// whatever the UID lookup says. The floor below is the real control — it is
+// authoritative about the host — but it needs the account to be resolvable, and
+// os/user built without cgo only reads /etc/passwd. This list is what still holds
+// when the lookup comes back empty.
+//
+// The threat is concrete. The shipped example maps `local_user: "{{ .Login }}"`
+// gated only on org membership, so before this existed, any member of the org who
+// named themselves "postgres" or "www-data" — trivial on a GitHub Enterprise
+// Server, and merely a matter of getting there first on github.com — logged in as
+// that service account.
+//
+// mapper.allow_system_users overrides an entry by name, for the site that has a
+// real person called "mail". Nothing overrides root; see checkLocalUser.
+var systemAccounts = map[string]bool{
+	// Debian/Ubuntu base
+	"root": true, "daemon": true, "bin": true, "sys": true, "sync": true,
+	"games": true, "man": true, "lp": true, "mail": true, "news": true,
+	"uucp": true, "proxy": true, "www-data": true, "backup": true, "list": true,
+	"irc": true, "gnats": true, "nobody": true, "nogroup": true,
+	// RHEL/Fedora base
+	"adm": true, "operator": true, "halt": true, "shutdown": true, "ftp": true,
+	"games-ftp": true, "nfsnobody": true, "rpc": true, "rpcuser": true,
+	// Common daemons
+	"messagebus": true, "dbus": true, "sshd": true, "ntp": true, "chrony": true,
+	"postfix": true, "sssd": true, "tss": true, "polkitd": true, "unbound": true,
+	"nscd": true, "avahi": true, "colord": true, "saned": true, "systemd": true,
+	// Service accounts that own data worth stealing
+	"postgres": true, "mysql": true, "mariadb": true, "redis": true,
+	"mongodb": true, "nginx": true, "apache": true, "apache2": true,
+	"httpd": true, "tomcat": true, "jenkins": true, "docker": true,
+	"containerd": true, "kubelet": true, "etcd": true, "elasticsearch": true,
+	"grafana": true, "prometheus": true, "git": true, "gitlab": true,
+	"slurm": true, "munge": true, "hdfs": true, "yarn": true, "spark": true,
+	"ceph": true, "vault": true, "consul": true,
+	// This project's own service account
+	"oauth2-pam": true,
+}
+
+// systemAccountPrefixes catch the families that are conventionally system
+// accounts and grow with every distro release: systemd-resolve,
+// systemd-timesync, _apt, _ssh, and so on. A leading underscore is the
+// BSD/macOS convention for a service account and Debian has adopted it too.
+var systemAccountPrefixes = []string{"systemd-", "_", "nix-", "gitlab-"}
 
 // Result is the output of a successful mapping.
 type Result struct {
@@ -47,12 +110,39 @@ type Result struct {
 type Chain struct {
 	cfg        config.MapperConfig
 	httpClient *http.Client
+
+	// minUID is the resolved floor; allowSystem is mapper.allow_system_users as a
+	// set. Resolved once here rather than per call so the defaulting rule lives in
+	// one place.
+	minUID      int
+	allowSystem map[string]bool
+
+	// lookupUID resolves a local account to its UID. A field so tests can present
+	// a passwd database without creating real accounts; production always uses
+	// os/user. Returns errUserUnknown when the account does not exist.
+	lookupUID func(string) (int, error)
 }
+
+// errUserUnknown reports that a local account could not be resolved. Not exported:
+// callers care whether the mapping is allowed, not how the passwd lookup went.
+var errUserUnknown = errors.New("no such local user")
 
 // New creates a new mapper Chain from the given config.
 func New(cfg config.MapperConfig) *Chain {
+	minUID := cfg.MinUID
+	if minUID == 0 {
+		minUID = DefaultMinUID
+	}
+	allowSystem := make(map[string]bool, len(cfg.AllowSystemUsers))
+	for _, name := range cfg.AllowSystemUsers {
+		allowSystem[strings.ToLower(name)] = true
+	}
+
 	return &Chain{
-		cfg: cfg,
+		cfg:         cfg,
+		minUID:      minUID,
+		allowSystem: allowSystem,
+		lookupUID:   lookupSystemUID,
 		httpClient: &http.Client{
 			Timeout: 5 * time.Second,
 			// Disallow all redirects: the mapper endpoint is operator-configured
@@ -71,10 +161,17 @@ func New(cfg config.MapperConfig) *Chain {
 // login) pair.
 // Pass "" to skip Tier 0 (e.g. in test-mapping dry runs).
 // The context is forwarded to Tier 2 (script) and Tier 3 (HTTP) calls.
+//
+// Every tier's answer passes through checkLocalUser before it is returned, so no
+// tier — including one added later — can produce a mapping to root, a system
+// account, or an account below mapper.min_uid.
 func (c *Chain) Map(ctx context.Context, id *provider.Identity, requestedLocalUser string) (*Result, error) {
 	// Tier 0: enrollment file
 	if c.cfg.EnrollmentEnabled && c.cfg.EnrollmentFile != "" && requestedLocalUser != "" {
 		if result := mapViaEnrollment(c.cfg.EnrollmentFile, requestedLocalUser, id); result != nil {
+			if err := c.checkLocalUser("tier0 (enrollment)", result.LocalUser); err != nil {
+				return nil, err
+			}
 			log.Debug().
 				Str("login", id.Login).
 				Str("local_user", result.LocalUser).
@@ -90,6 +187,9 @@ func (c *Chain) Map(ctx context.Context, id *provider.Identity, requestedLocalUs
 			return nil, err
 		}
 		if result != nil {
+			if err := c.checkLocalUser("tier1 (rules)", result.LocalUser); err != nil {
+				return nil, err
+			}
 			log.Debug().
 				Str("login", id.Login).
 				Str("local_user", result.LocalUser).
@@ -112,6 +212,11 @@ func (c *Chain) Map(ctx context.Context, id *provider.Identity, requestedLocalUs
 			log.Warn().Err(err).Str("script", c.cfg.ExternalScript).Msg("mapper tier2: script error")
 			// fall through to Tier 3
 		} else if result != nil {
+			// Not a fall-through: a forbidden target is an answer, and consulting
+			// Tier 3 for a different one would turn the refusal into a retry.
+			if err := c.checkLocalUser("tier2 (script)", result.LocalUser); err != nil {
+				return nil, err
+			}
 			log.Debug().
 				Str("login", id.Login).
 				Str("local_user", result.LocalUser).
@@ -134,6 +239,9 @@ func (c *Chain) Map(ctx context.Context, id *provider.Identity, requestedLocalUs
 			log.Warn().Err(err).Str("endpoint", c.cfg.HTTPEndpoint).Msg("mapper tier3: http error")
 			// fall through
 		} else if result != nil {
+			if err := c.checkLocalUser("tier3 (http)", result.LocalUser); err != nil {
+				return nil, err
+			}
 			log.Debug().
 				Str("login", id.Login).
 				Str("local_user", result.LocalUser).
@@ -374,5 +482,103 @@ func parseResult(data []byte) (*Result, error) {
 	if result.LocalUser == "" {
 		return nil, nil // treat empty local_user as no mapping
 	}
+	// Tier 2 and Tier 3 answers were previously checked only for emptiness, while
+	// Tier 0 and Tier 1 both applied this. An external mapper is operator-supplied
+	// but its *input* is provider-controlled, so a script doing the obvious
+	// `jq -r .login` handed back whatever the identity said.
+	if !unixUsernameRe.MatchString(result.LocalUser) {
+		return nil, fmt.Errorf("local_user %q is not a valid Unix username", result.LocalUser)
+	}
 	return &result, nil
+}
+
+// lookupSystemUID resolves a local account through NSS (or /etc/passwd when the
+// broker is built without cgo).
+func lookupSystemUID(name string) (int, error) {
+	u, err := user.Lookup(name)
+	if err != nil {
+		var unknown user.UnknownUserError
+		if errors.As(err, &unknown) {
+			return 0, errUserUnknown
+		}
+		return 0, err
+	}
+	uid, err := strconv.Atoi(u.Uid)
+	if err != nil {
+		return 0, fmt.Errorf("uid %q of user %q is not a number: %w", u.Uid, name, err)
+	}
+	return uid, nil
+}
+
+// checkLocalUser is the gate every tier's answer passes through. It refuses names
+// that are not valid Unix usernames, system accounts, and accounts below the UID
+// floor.
+//
+// The two mechanisms cover for each other. The floor is authoritative — it asks
+// the host what the UID actually is — but needs the account to resolve, and a
+// broker built without cgo sees only /etc/passwd, so an LDAP- or SSSD-provisioned
+// user comes back unknown. The name denylist needs no lookup but cannot know about
+// a site's own service accounts. An unresolvable name is therefore refused only if
+// the denylist catches it: it cannot become a login regardless, because sshd
+// resolves the account itself before it starts a session.
+//
+// root is refused unconditionally — not by name, by UID 0, and not overridable by
+// allow_system_users or by lowering min_uid. A device-flow login has no channel
+// binding to the SSH connection, so root here would be the weakest possible path
+// to the most privilege; OpenSSH's own default (PermitRootLogin prohibit-password)
+// already rules it out. Use an ordinary account and sudo.
+func (c *Chain) checkLocalUser(tier, name string) error {
+	if !unixUsernameRe.MatchString(name) {
+		return fmt.Errorf("%w: %s produced %q, which is not a valid Unix username",
+			ErrForbiddenLocalUser, tier, name)
+	}
+
+	if isSystemAccountName(name) && !c.allowSystem[name] {
+		log.Warn().Str("tier", tier).Str("local_user", name).
+			Msg("mapper: refusing to map an identity to a system account")
+		return fmt.Errorf("%w: %s produced the system account %q "+
+			"(add it to mapper.allow_system_users if that is deliberate)",
+			ErrForbiddenLocalUser, tier, name)
+	}
+
+	uid, err := c.lookupUID(name)
+	switch {
+	case errors.Is(err, errUserUnknown):
+		// Not a refusal: see the note above on NSS-backed hosts. The login cannot
+		// succeed anyway, and saying so here would break every site whose users
+		// live in LDAP.
+		log.Warn().Str("tier", tier).Str("local_user", name).
+			Msg("mapper: local account does not resolve on this host; the UID floor could not be applied")
+		return nil
+	case err != nil:
+		// A broken passwd source is an outage, not a decision. Refuse rather than
+		// skip the floor: this is the one branch where failing open would hand out
+		// exactly the account the floor exists to protect.
+		return fmt.Errorf("resolve local user %q: %w", name, err)
+	}
+
+	if uid == 0 {
+		log.Warn().Str("tier", tier).Str("local_user", name).
+			Msg("mapper: refusing to map an identity to UID 0")
+		return fmt.Errorf("%w: %s produced %q, which is UID 0", ErrForbiddenLocalUser, tier, name)
+	}
+	if c.minUID >= 0 && uid < c.minUID {
+		log.Warn().Str("tier", tier).Str("local_user", name).Int("uid", uid).Int("min_uid", c.minUID).
+			Msg("mapper: refusing to map an identity to an account below the UID floor")
+		return fmt.Errorf("%w: %s produced %q (uid %d), below mapper.min_uid %d",
+			ErrForbiddenLocalUser, tier, name, uid, c.minUID)
+	}
+	return nil
+}
+
+func isSystemAccountName(name string) bool {
+	if systemAccounts[name] {
+		return true
+	}
+	for _, prefix := range systemAccountPrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
 }

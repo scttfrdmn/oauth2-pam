@@ -47,8 +47,18 @@ RUN dir="$(dirname "$(dpkg -L libpam-modules | grep -m1 '/pam_permit\.so$')")" \
 # Both get "*" as their password hash: no password can ever match it, so the
 # only way in is the module under test. ("!" would additionally mark the account
 # locked, which some sshd builds reject before PAM ever runs.)
-RUN useradd --create-home --shell /bin/bash --password '*' alice \
- && useradd --create-home --shell /bin/bash --password '*' bob \
+#
+# pgsvc and postgres exist to cover the mapper's two account restrictions, and
+# they differ from alice and bob in exactly one attribute each: pgsvc is below
+# mapper.min_uid, postgres is on the system-account name denylist while being
+# above the floor. Both are otherwise perfectly usable accounts with a real
+# shell, so a case that refuses them cannot be passing because the login was
+# impossible anyway. The UIDs must match Dockerfile.broker, which is where the
+# floor is actually evaluated.
+RUN useradd --create-home --shell /bin/bash --password '*' --uid 1001 alice \
+ && useradd --create-home --shell /bin/bash --password '*' --uid 1002 bob \
+ && useradd --create-home --shell /bin/bash --password '*' --uid 400  pgsvc \
+ && useradd --create-home --shell /bin/bash --password '*' --uid 1500 postgres \
  && mkdir -p /run/sshd
 
 COPY test/integration/pam-sshd /etc/pam.d/sshd
