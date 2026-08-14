@@ -175,7 +175,7 @@ with `status`.
 | `user_id` | string | The **local account being logged into** — the PAM username, not the provider's. Required and non-empty for `authenticate`. Max 256 bytes, no NUL. |
 | `session_id` | string | Required for the session verbs. Max 128 bytes. |
 | `provider` | string | Optional. Names a configured provider; absent means the broker's default. A name that is not configured is refused rather than replaced by the default. Max 256 bytes, no NUL. |
-| `source_ip` | string | The client address, if the login has one and it really is an address. Max 45 bytes (an IPv6 literal with a scope). A resolved hostname does not belong here. |
+| `source_ip` | string | The client address, if the login has one and it really is an address. Max 45 bytes (an IPv6 literal with a scope). A resolved hostname does not belong here. See below: a receiver **must** accept a zone, and an absent value means *origin unknown*. |
 | `target_host` | string | The host being logged **into** — this host. Max 253 bytes. |
 | `login_type` | string | `ssh`, `console`, or `gui`. Optional; empty is treated as `ssh`. Any other value is refused. It selects how instructions are formatted, nothing more. |
 | `user_agent`, `device_id` | string | Optional, carried into the audit trail. |
@@ -187,6 +187,46 @@ authorized. The whole authorization decision is that those two agree, so a clien
 that conflates them has no check left. `source_ip` is where the login came from
 and `target_host` is where it is going; this project shipped them backwards once,
 which made every audit record name the client as the host being logged into.
+
+#### `source_ip`, in three parts
+
+All three of these were silences in this document that cost a real implementation a
+real bug (`oidc-pam#169`, where both ends sent `PAM_RHOST` as `target_host` and no
+`source_ip` at all). They are stated normatively because a client cannot otherwise
+know whether what it sends is safe.
+
+**A receiver must accept a zoned IPv6 literal.** `fe80::1%eth0` is inside the
+45-byte bound and is what a link-local login looks like, but the obvious validator
+rejects it: Go's `net.ParseIP` fails on a zone and C's `inet_pton(AF_INET6, …)`
+fails on one too. So a broker that validates the naive way refuses a login whose
+length this table explicitly sized for. Strip the zone, validate the address,
+and — if the value is forwarded or logged — forward it with the zone intact: the
+zone is which interface the peer is on, which is not redundant with the address.
+
+**An absent `source_ip` means the origin is unknown, and unknown is never
+equivalent to a satisfied network requirement.** A console login genuinely has no
+source address, so absence is legitimate and a broker must not treat it as a
+malformed request. But a broker enforcing something like "private networks only"
+cannot answer that requirement from an absent value, and both of the readings it
+might reach for on its own are silent failures: treating absent as *not* private
+refuses every console login and reports the origin as public when it is merely
+unknown, and treating absent as *satisfying* the requirement makes the requirement
+bypassable by omitting one optional field.
+
+This document does not choose the resolution — deny by default, or an explicit
+operator waiver, is a broker's policy decision. What it fixes is the premise: an
+absent value is `unknown`, a third answer, and a network requirement is not met by
+it. A broker that has such a requirement configured must decide what `unknown`
+does *before* it can be asked, and say so in its own configuration rather than
+arriving at it by accident inside a validator.
+
+**`metadata.rhost` may be a resolved hostname.** That is the reason the
+address-only restriction on `source_ip` is affordable: a hostname is not discarded,
+it moves to a field nothing decides on. Which is also the constraint — by rule 2 of
+the extension rules, a receiver must not read `metadata.rhost` for an
+authorization decision. It is audit context. If a peer ever needs a hostname to
+decide something, that is a new field in this document at a new version, not a
+reinterpretation of this one.
 
 ### `authenticate`
 
@@ -333,6 +373,21 @@ treat the reply as a failure, which for all of these is the right answer:
 | `SESSION_EXPIRED` | broker | the session or device code ran out of time |
 | `SESSION_NOT_ACTIVE` | broker | a session verb was used on a session that is not authorized |
 | `AUTHENTICATION_FAILED`, `SESSION_CHECK_FAILED`, `SESSION_REFRESH_FAILED`, `SESSION_REVOCATION_FAILED` | broker | the verb's handler returned an internal error; details are in the broker's log, deliberately not on the wire |
+| `RESPONSE_TOO_LARGE` | broker | the reply for this request did not fit the reply cap and was replaced by this one. Terminal |
+
+`RESPONSE_TOO_LARGE` is registered here because `oidc-pam` sends it (`oidc-pam#162`:
+an 8 KiB client buffer against a reply whose QR art was serialized twice refused
+every login on the host, with nothing in the log but "failed to parse broker
+response"), and by rule 3 above a code a second implementation reads is contract
+rather than dialect. A client that gets it learns the difference between "the broker
+sent something I could not parse" and "the broker had something to say and it did
+not fit" — which is the whole value of substituting it.
+
+Whether a version-1 broker is *obliged* to substitute it, rather than writing an
+oversized reply and leaving the client to refuse, is not settled here: that is a
+requirement on brokers, this one does not yet meet it, and specifying it is
+[#48](https://github.com/scttfrdmn/oauth2-pam/issues/48). Sending it is permitted
+today; relying on receiving it is not.
 
 ## What this contract deliberately does not do
 
@@ -393,6 +448,16 @@ A **broker**:
    it.
 7. Never puts internal error detail on the wire. `error_code` is a category;
    the detail belongs in the broker's log.
+8. Accepts a zoned IPv6 `source_ip` — a validator that rejects `fe80::1%eth0`
+   refuses a login this contract sized a field for.
+9. Never satisfies a network requirement from an absent `source_ip`. Absent is
+   `unknown`, and what `unknown` does is a decision the broker must have made
+   before it is asked, not one a validator makes for it by returning false.
+
+Both ends: **an extension field is never load-bearing for the grant.** Not a
+separate item because it is not a separate test — it is the property the other
+items are protecting, and the way to check it is to delete the field and see
+whether the decision changes.
 
 ## Testing this contract
 

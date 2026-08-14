@@ -39,6 +39,16 @@ func TestValidateRequest(t *testing.T) {
 		{"session id at the limit", Request{Type: "check_session", SessionID: strings.Repeat("a", 128)}, ""},
 		{"session id over the limit", Request{Type: "check_session", SessionID: strings.Repeat("a", 129)}, "session_id too long"},
 		{"source ip over the limit", Request{Type: "authenticate", UserID: "alice", SourceIP: strings.Repeat("a", 46)}, "source_ip too long"},
+		// docs/wire-protocol.md requires a receiver to accept a zoned IPv6
+		// literal, and it is the one address shape a well-meaning validator
+		// breaks: net.ParseIP fails on a zone, as does inet_pton. This request is
+		// accepted because source_ip is length-bounded audit context here and
+		// nothing parses it — pinned so that stays a decision rather than a
+		// detail someone "fixes" into refusing link-local logins.
+		{"zoned IPv6 source ip", Request{Type: "authenticate", UserID: "alice", SourceIP: "fe80::1%eth0"}, ""},
+		// A console login has no source address at all. Absent means "origin
+		// unknown", never a malformed request.
+		{"absent source ip", Request{Type: "authenticate", UserID: "alice", SourceIP: ""}, ""},
 		{"target host over the limit", Request{Type: "authenticate", UserID: "alice", TargetHost: strings.Repeat("a", 254)}, "target_host too long"},
 
 		{"login type ssh", Request{Type: "authenticate", UserID: "alice", LoginType: "ssh"}, ""},
