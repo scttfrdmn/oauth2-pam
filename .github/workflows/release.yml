@@ -82,6 +82,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libpam0g-dev libjson-c-dev
 
+      # Both outputs carry the tag name, and every step below reads them through
+      # env: rather than ${{ }} inside a run: block. A ${{ }} expression is pasted
+      # into the script before the shell ever sees it, and a tag name legally
+      # contains a backtick, `$(...)`, `;` and `|` — so interpolating one would let
+      # whoever can push a tag run commands in the jobs that build and publish the
+      # release artifacts. As an environment variable it is data, never syntax.
+      # verify-version above is already written this way, with ${GITHUB_REF_NAME}.
       - name: Set build variables
         id: vars
         run: |
@@ -96,20 +103,22 @@ jobs:
       - name: Build the three binaries
         env:
           CGO_ENABLED: 0
+          LDFLAGS: ${{ steps.vars.outputs.ldflags }}
         run: |
           mkdir -p bin
           for c in broker:oauth2-pam-broker \
                    oauth2-pam-admin:oauth2-pam-admin \
                    oauth2-pam-enroll:oauth2-pam-enroll; do
-            go build -trimpath -ldflags="${{ steps.vars.outputs.ldflags }}" \
+            go build -trimpath -ldflags="$LDFLAGS" \
               -o "bin/${c#*:}" "./cmd/${c%%:*}"
           done
 
       - name: Build the PAM module
         env:
           CGO_ENABLED: 1
+          LDFLAGS: ${{ steps.vars.outputs.ldflags }}
         run: |
-          go build -buildmode=c-shared -trimpath -ldflags="${{ steps.vars.outputs.ldflags }}" \
+          go build -buildmode=c-shared -trimpath -ldflags="$LDFLAGS" \
             -o bin/oauth2_pam.so ./cmd/pam-module
           rm -f bin/oauth2_pam.h
 
@@ -127,8 +136,11 @@ jobs:
           echo "All six pam_sm_* entry points present."
 
       - name: Create archive
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+          ARCH: ${{ matrix.arch }}
         run: |
-          DIR="oauth2-pam-${{ steps.vars.outputs.version }}-linux-${{ matrix.arch }}"
+          DIR="oauth2-pam-$VERSION-linux-$ARCH"
           mkdir -p "$DIR"
           cp bin/oauth2-pam-broker bin/oauth2-pam-admin bin/oauth2-pam-enroll \
              bin/oauth2_pam.so "$DIR/"
