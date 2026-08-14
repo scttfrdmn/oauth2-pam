@@ -27,6 +27,7 @@ cannot make the broker misbehave in specific ways. These can, over a
 | a peer that sends one byte per timeout | `SO_RCVTIMEO` bounds each `recv()`, not the reply, so a drip-feeding peer extended the wait per byte and held the login open for as long as it liked; the bound is now one absolute deadline for the whole transfer |
 | a peer that hangs up mid-request | without `MSG_NOSIGNAL`, `send()` raises SIGPIPE and **terminates sshd's pre-auth child** — a broker restart would drop the connection instead of failing the module |
 | the assembled `authenticate` request | the module sent `PAM_RHOST` as `target_host` and never sent `source_ip`, so every audit record named the client as the target and left the origin blank |
+| a zoned IPv6 `source_ip` | `inet_pton` fails on `fe80::1%eth0`, so a link-local login was audited as origin-unknown — the address `docs/wire-protocol.md` conformance item 8 names by hand |
 | `error_code` parsing | `RATE_LIMITED` arrives as `status: "error"` and was treated as terminal, failing logins that were only being asked to slow down |
 | `validate_socket_path` | `/run/oauth2-pam/` — where systemd's `RuntimeDirectory=` puts the socket — was refused as unsafe |
 | `authorized_for` and `terminal_status_to_pam` | the grant decision had **no coverage of any kind**: `authorized_for() { return 1; }` was green in every suite here, and the harness drives an honest broker that can never answer "authorized" for the wrong user |

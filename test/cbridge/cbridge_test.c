@@ -498,6 +498,14 @@ static void test_send_auth_request_fields(void) {
           "the resolved name was lost");
     json_object_put(req);
 
+    /* A link-local login, zone and all, has to reach the wire intact: the field is
+       sized for it (conformance item 8), and copy_source_ip getting it right proves
+       nothing if the request is assembled from something else. */
+    req = read_sent_request("alice", "sshd", "fe80::1%eth0", "ssh", NULL);
+    CHECK((v = field(req, "source_ip")) && strcmp(v, "fe80::1%eth0") == 0,
+          "source_ip = %s, want the zoned link-local address", v ? v : "(absent)");
+    json_object_put(req);
+
     /* A console login has no remote host at all. */
     req = read_sent_request("alice", "login", "", "tty1", NULL);
     CHECK((v = field(req, "login_type")) && strcmp(v, "console") == 0,
@@ -535,6 +543,49 @@ static void test_source_ip_takes_only_addresses(void) {
 
     copy_source_ip("not an address at all", ip, sizeof(ip));
     CHECK(ip[0] == '\0', "garbage accepted as an address: %s", ip);
+
+    /* docs/wire-protocol.md conformance item 8, by name: "a validator that rejects
+       fe80::1%eth0 refuses a login this contract sized a field for". A bare
+       inet_pton does reject it — inet_pton(AF_INET6, "fe80::1%eth0", …) returns 0 —
+       so a link-local ssh login was audited as origin-unknown, and unknown must
+       never satisfy a network requirement. The zone travels with the address
+       because it says which link the peer is on, and the same fe80:: address on
+       another link is another host. */
+    copy_source_ip("fe80::1%eth0", ip, sizeof(ip));
+    CHECK(strcmp(ip, "fe80::1%eth0") == 0, "zoned IPv6 dropped or stripped: got '%s'", ip);
+
+    /* getnameinfo emits a numeric scope id when the interface has no name. */
+    copy_source_ip("fe80::1%25", ip, sizeof(ip));
+    CHECK(strcmp(ip, "fe80::1%25") == 0, "numeric scope id dropped: got '%s'", ip);
+
+    copy_source_ip("fe80::abcd:1234%enp0s31f6", ip, sizeof(ip));
+    CHECK(strcmp(ip, "fe80::abcd:1234%enp0s31f6") == 0,
+          "a predictable-names interface was dropped: got '%s'", ip);
+
+    /* The zone is the one part of the value inet_pton never sees, so it is
+       validated on its own rather than trusted. */
+    copy_source_ip("fe80::1%", ip, sizeof(ip));
+    CHECK(ip[0] == '\0', "an empty zone was accepted: %s", ip);
+    copy_source_ip("fe80::1%eth0/../etc", ip, sizeof(ip));
+    CHECK(ip[0] == '\0', "a zone with a path separator was accepted: %s", ip);
+    copy_source_ip("fe80::1%eth 0", ip, sizeof(ip));
+    CHECK(ip[0] == '\0', "a zone with whitespace was accepted: %s", ip);
+    copy_source_ip("fe80::1%thisisnotaninterface", ip, sizeof(ip));
+    CHECK(ip[0] == '\0', "a zone longer than IFNAMSIZ was accepted: %s", ip);
+
+    /* A scope is an IPv6 notion. A '%' anywhere else is not one, and splitting on
+       it must not turn a non-address into an address. */
+    copy_source_ip("192.0.2.10%eth0", ip, sizeof(ip));
+    CHECK(ip[0] == '\0', "a zone on an IPv4 literal was accepted: %s", ip);
+    copy_source_ip("client.example.com%eth0", ip, sizeof(ip));
+    CHECK(ip[0] == '\0', "a zoned hostname was accepted: %s", ip);
+    copy_source_ip("%eth0", ip, sizeof(ip));
+    CHECK(ip[0] == '\0', "a zone with no address was accepted: %s", ip);
+
+    /* The 45-byte cap still applies to the whole value, zone included, because
+       that is what the broker measures. */
+    copy_source_ip("2001:db8:0000:0000:0000:0000:0000:0001%interfacename", ip, sizeof(ip));
+    CHECK(ip[0] == '\0', "a value over the broker's 45-byte cap was accepted: %s", ip);
 }
 
 static void test_target_host_is_this_host(void) {

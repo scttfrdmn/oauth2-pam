@@ -167,7 +167,18 @@ run "no deadline on the whole reply, only on each recv()" fail \
 # a long FQDN overruns the 45 bytes the broker allows — which makes it reject the
 # whole request and fail the login.
 run "source_ip takes any rhost" fail \
-    '$n = s/(inet_pton\(AF_INET, rhost, v4\)) != 1 && (inet_pton\(AF_INET6, rhost, v6\)) != 1/$1 == 99 && $2 == 99/g'
+    '$n = s/(inet_pton\(AF_INET, addr, v4\)) != 1 && (inet_pton\(AF_INET6, addr, v6\)) != 1/$1 == 99 && $2 == 99/g'
+
+# The zone never split off, which is the bare-inet_pton behaviour: a link-local
+# login is audited as origin-unknown, and docs/wire-protocol.md conformance item 8
+# names the address it happens to.
+run "source_ip validated without splitting the %zone" fail \
+    "\$n = s/zone = strchr\\(rhost, '%'\\);/zone = NULL;/g"
+
+# The zone taken on trust. inet_pton never sees it, so this is the only thing
+# vetting the part of the value after the '%'.
+run "the IPv6 zone is not validated" fail \
+    '$n = s/(static int valid_zone_id\(const char \*s\) \{\n)/$1    return 1;\n/g'
 
 # target_host taking the client's name: the original defect, where every audit
 # record named the client as the host being logged into.

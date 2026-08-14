@@ -19,6 +19,7 @@
  */
 
 #include "cgo_bridge.h"
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <time.h>
@@ -288,6 +289,30 @@ static int send_json(int sock, json_object *req) {
     return 0;
 }
 
+/* valid_zone_id reports whether s is a plausible IPv6 zone: an interface name or
+   a numeric scope id, as sshd's getnameinfo() appends it.
+ *
+ * Checked by charset rather than with if_nametoindex, deliberately. The zone
+ * names an interface, and whether this host can resolve that name is not the
+ * question being asked: an audit field that appears or disappears depending on the
+ * interface list is worse than one that reports what the peer said. The charset is
+ * what keeps the value safe to put on the wire — it is the only part of rhost that
+ * inet_pton is not vetting. */
+static int valid_zone_id(const char *s) {
+    size_t i;
+
+    if (s[0] == '\0') return 0;
+    /* IFNAMSIZ - 1. Anything longer is not an interface name, and a numeric scope
+       id is far shorter. */
+    if (strlen(s) > 15) return 0;
+
+    for (i = 0; s[i] != '\0'; i++) {
+        if (!isalnum((unsigned char)s[i]) && s[i] != '-' && s[i] != '_' && s[i] != '.')
+            return 0;
+    }
+    return 1;
+}
+
 /* copy_source_ip fills dst with rhost when rhost is an IP address literal, and
    with an empty string otherwise.
  *
@@ -295,17 +320,45 @@ static int send_json(int sock, json_object *req) {
  * `UseDNS yes` it is a hostname, and a fully qualified one can exceed the 45
  * bytes the broker allows for source_ip — which would make it reject the entire
  * request and fail the login. So the field carries an address or nothing, and the
- * raw value travels in metadata.rhost either way. */
+ * raw value travels in metadata.rhost either way.
+ *
+ * The %zone suffix is split off before validating, because inet_pton fails on a
+ * zoned literal: inet_pton(AF_INET6, "fe80::1%eth0", …) returns 0, so a
+ * link-local login was audited as origin-unknown rather than from the address it
+ * came from. docs/wire-protocol.md conformance item 8 names that exact address —
+ * "a validator that rejects fe80::1%eth0 refuses a login this contract sized a
+ * field for" — and per the source_ip rules in the same section, unknown must never
+ * satisfy a network requirement, so dropping the field silently degrades any
+ * policy that comes to depend on it.
+ *
+ * The whole string, zone included, goes on the wire: the zone is which interface
+ * the peer is on, which is not redundant with a link-local address — the same
+ * fe80:: address can be a different host on a different link. Only IPv6 takes a
+ * zone; a '%' in an IPv4 literal or a hostname is not a scope, so those are
+ * refused as before. */
 static void copy_source_ip(const char *rhost, char *dst, size_t dst_size) {
     unsigned char v4[4];
     unsigned char v6[16];
+    char addr[MAX_SOURCE_IP_LEN];
+    const char *zone;
+    size_t addr_len;
 
     dst[0] = '\0';
     if (rhost == NULL || rhost[0] == '\0') return;
     if (strlen(rhost) >= dst_size) return;
 
-    if (inet_pton(AF_INET, rhost, v4) != 1 && inet_pton(AF_INET6, rhost, v6) != 1)
+    zone = strchr(rhost, '%');
+    addr_len = zone != NULL ? (size_t)(zone - rhost) : strlen(rhost);
+    if (addr_len == 0 || addr_len >= sizeof(addr)) return;
+    memcpy(addr, rhost, addr_len);
+    addr[addr_len] = '\0';
+
+    if (zone != NULL) {
+        if (!valid_zone_id(zone + 1)) return;
+        if (inet_pton(AF_INET6, addr, v6) != 1) return;
+    } else if (inet_pton(AF_INET, addr, v4) != 1 && inet_pton(AF_INET6, addr, v6) != 1) {
         return;
+    }
 
     strncpy(dst, rhost, dst_size - 1);
     dst[dst_size - 1] = '\0';
