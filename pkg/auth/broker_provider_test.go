@@ -28,10 +28,20 @@ type fakeProvider struct {
 	pollErr    error
 	identity   *provider.Identity
 	revoked    []string
+
+	// flows counts issued device codes and polls records how many times each was
+	// polled. Together they let a test observe that a poller stopped — the only
+	// external evidence that a cancelled flow is no longer talking to the
+	// provider.
+	flows int
+	polls map[string]int
+	// codeLifetime is how long an issued device code stays valid at the provider.
+	// Deliberately much longer than any login, like github.com's 15 minutes.
+	codeLifetime time.Duration
 }
 
 func newFakeProvider(name string) *fakeProvider {
-	f := &fakeProvider{name: name}
+	f := &fakeProvider{name: name, polls: make(map[string]int), codeLifetime: 15 * time.Minute}
 	f.identity = &provider.Identity{
 		Provider: name,
 		Type:     f.Type(),
@@ -48,18 +58,25 @@ func (f *fakeProvider) Name() string { return f.name }
 func (f *fakeProvider) Type() string { return "acme-sso" }
 
 func (f *fakeProvider) StartDeviceFlow(context.Context) (*provider.DeviceFlow, error) {
+	f.mu.Lock()
+	f.flows++
+	code := fmt.Sprintf("device-code-%s-%d", f.name, f.flows)
+	lifetime := f.codeLifetime
+	f.mu.Unlock()
+
 	return &provider.DeviceFlow{
-		DeviceCode:      "device-code-" + f.name,
+		DeviceCode:      code,
 		UserCode:        "ABCD-1234",
 		DeviceURL:       "https://sso.acme.example/device",
-		ExpiresAt:       time.Now().Add(2 * time.Minute),
+		ExpiresAt:       time.Now().Add(lifetime),
 		PollingInterval: 1,
 	}, nil
 }
 
-func (f *fakeProvider) PollDeviceAuthorization(context.Context, string) (*provider.Token, error) {
+func (f *fakeProvider) PollDeviceAuthorization(_ context.Context, deviceCode string) (*provider.Token, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.polls[deviceCode]++
 	if f.pollErr != nil {
 		return nil, fmt.Errorf("acme-sso poll: %w", f.pollErr)
 	}
@@ -97,6 +114,14 @@ func (f *fakeProvider) failWith(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pollErr = err
+}
+
+// pollCount reports how many times the nth issued device code (1-based) has been
+// polled. A count that stops rising is how a test sees a poller shut down.
+func (f *fakeProvider) pollCount(n int) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.polls[fmt.Sprintf("device-code-%s-%d", f.name, n)]
 }
 
 // brokerConfig is a minimal valid config whose only mapper rule matches a flat

@@ -36,6 +36,8 @@ host   └───────────────────────�
 
 **The mapped `local_user` must equal the login name.** If `alice` on GitHub maps to local user `alice` but the login attempt is for `bob`, the broker denies it — it does not switch the account. This is enforced server-side in the broker, so an old or modified client cannot skip it, and re-checked client-side in the module. Log in as the account you map to.
 
+The comparison is unconditional: an `authenticate` request that names no account at all is refused rather than activated as whatever the identity maps to.
+
 ## Requirements
 
 - Go 1.25+ (1.24 is end-of-life and no longer receives security backports)
@@ -189,10 +191,20 @@ UsePAM yes
 | `socket=PATH` | `/var/run/oauth2-pam/broker.sock` | Broker socket. Must be under `/var/run/oauth2-pam/` and at most 103 bytes. |
 | `provider=NAME` | the broker's default | Which configured provider (`providers[].name`) to authenticate against. Omit it and the broker uses the first one configured; a name it does not have is refused rather than substituted. |
 | `poll_interval=N` | 5 (1–60) | Seconds between `check_session` calls. The broker's requested interval wins when it supplies one. |
-| `timeout=N` | 300 (10–900) | Seconds to wait for the user to approve before giving up. |
+| `timeout=N` | 90 (10–900) | Seconds to wait for the user to approve before giving up. |
 | `debug` | off | Log at `LOG_DEBUG` to syslog `authpriv`. |
 
 The local Unix account must already exist — this module authenticates, it does not create users.
+
+#### `timeout=` has two other deadlines around it
+
+Three limits bound one login, and only the smallest one is ever reached:
+
+- **`LoginGraceTime`** in `sshd_config`, default **120s**. sshd disconnects when it elapses, whatever PAM is doing. Raising `timeout=` above it does not give the user longer — it just means the module's own deadline never fires, and the user gets an abrupt disconnect instead of a message saying authentication timed out. Raise both together or neither.
+- **`timeout=`** here, default 90s, chosen to sit under that grace period with room for the final poll and the PAM conversation.
+- **`authentication.device_flow_timeout`** in the broker, default **3m**. This one must be the *largest*, or the broker abandons the flow while the user is still being told to wait. It is what releases a `max_concurrent_auths` slot when someone closes the terminal without approving.
+
+Approving on a phone takes longer than people expect. If you raise `timeout=`, raise `LoginGraceTime` to match and keep `device_flow_timeout` above both.
 
 ## Identity Mapper
 

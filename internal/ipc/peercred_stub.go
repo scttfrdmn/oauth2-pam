@@ -6,7 +6,7 @@ import "net"
 
 // No peer-credential mechanism on this platform, so the rate limiter cannot tell
 // two callers apart. It falls back to one shared bucket and the broker says so at
-// startup — see unknownPeerBucket.
+// startup — see unknownPeerKey.
 const peerCredsSupported = false
 
 // peerUID cannot identify the peer here, and says so rather than guessing.

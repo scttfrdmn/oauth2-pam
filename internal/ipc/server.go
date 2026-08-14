@@ -22,12 +22,50 @@ import (
 // memory exhaustion attacks.
 const maxRequestSize = 64 * 1024 // 64 KB
 
+// ErrorCodeRateLimited is returned when a request was refused by the rate
+// limiter. It is exported because it is part of the wire contract: a client must
+// treat it as a *retryable* condition, not as a decision about the user. The PAM
+// module counts it against its transport-failure budget and keeps polling; a
+// client that treated it as terminal would fail a login that is merely being
+// asked to slow down.
+const ErrorCodeRateLimited = "RATE_LIMITED"
+
+// removeStaleSocket deletes a leftover socket from a previous run.
+//
+// It refuses to delete anything that is not a socket, and it is not recursive.
+// This used to be os.RemoveAll, which meant a typo in server.socket_path — say a
+// path under /etc/oauth2-pam, which the systemd unit granted write access to —
+// destroyed a directory tree as root on the next restart.
+func removeStaleSocket(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("stat socket path %s: %w", path, err)
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("refusing to replace %s: it exists and is not a socket (mode %s)", path, info.Mode())
+	}
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("remove stale socket %s: %w", path, err)
+	}
+	return nil
+}
+
 // Server handles IPC communication between the PAM module and the broker.
 type Server struct {
-	socketPath   string
-	broker       *auth.Broker
-	listener     net.Listener
-	rateLimiter  *rateLimiter
+	socketPath string
+	broker     *auth.Broker
+	listener   net.Listener
+	// rateLimiter buckets authenticate requests per calling UID; sessionLimiter
+	// buckets everything else per session ID. See callerKey and sessionKey for
+	// why the two cannot share a bucket.
+	rateLimiter    *rateLimiter
+	sessionLimiter *rateLimiter
+	// handlerSlots bounds concurrent connection handlers. See
+	// maxConcurrentHandlers.
+	handlerSlots chan struct{}
 	readTimeout  time.Duration
 	writeTimeout time.Duration
 	stopChan     chan struct{}
@@ -38,6 +76,23 @@ type Server struct {
 // defaultIOTimeout applies when server.read_timeout / server.write_timeout are
 // unset or non-positive.
 const defaultIOTimeout = 30 * time.Second
+
+// maxConcurrentHandlers bounds how many connections are being served at once.
+//
+// This replaced an accept-time rate limit, which was the wrong primitive: it
+// bounded resources by *failing* requests, and since every caller is sshd as
+// root they all shared one bucket, so a burst of logins denied each other. A
+// semaphore bounds the same resource without failing anything — excess
+// connections wait in the kernel's listen backlog and are served as slots free,
+// which for a login broker is the right trade. Each handler reads a bounded body
+// under a deadline, so a slot cannot be held longer than server.read_timeout.
+const maxConcurrentHandlers = 64
+
+// maxSessionRequestsPerMinute bounds polls against one session ID. The module
+// permits poll_interval as low as 1s, i.e. 60 requests a minute for a legitimate
+// login, so this leaves 2x headroom and only catches a client that has stopped
+// honouring the interval.
+const maxSessionRequestsPerMinute = 120
 
 // Request is a message from the PAM module.
 type Request struct {
@@ -57,15 +112,21 @@ type Request struct {
 	Provider string `json:"provider"`
 }
 
+// StatusRevoked is the status of a successful revoke_session reply. It is not a
+// session state — the session no longer exists — but every reply carries a
+// status, so a client never has to special-case a missing one.
+const StatusRevoked = "revoked"
+
 // Response is a message from the broker to the PAM module.
 //
-// Status is the authoritative field: it is one of the auth.Status* values
-// ("pending", "authorized", "denied", "expired", "error"). Success is true only
-// when Status is "authorized" — a client must not treat "pending" as an
-// authenticated user, and UserID is populated only when authorized.
+// Status is the authoritative field. For the authentication verbs it is one of
+// the auth.Status* values ("pending", "authorized", "denied", "expired",
+// "error"); revoke_session replies "revoked". The rule a client must apply is:
 //
-// The one exception is the revoke_session reply, which carries no Status; there
-// Success means "the session was revoked".
+//	access is granted only when Success is true AND Status is "authorized"
+//
+// and UserID is populated only in that case. In particular "pending" is never an
+// authenticated user, and a status the client does not recognise is not either.
 type Response struct {
 	Success          bool              `json:"success"`
 	Status           string            `json:"status"`
@@ -99,19 +160,21 @@ func NewServer(socketPath string, broker *auth.Broker, cfg *config.Config) (*Ser
 	}
 
 	return &Server{
-		socketPath:   socketPath,
-		broker:       broker,
-		rateLimiter:  rl,
-		readTimeout:  readTimeout,
-		writeTimeout: writeTimeout,
-		stopChan:     make(chan struct{}),
+		socketPath:     socketPath,
+		broker:         broker,
+		rateLimiter:    rl,
+		sessionLimiter: newRateLimiter(maxSessionRequestsPerMinute),
+		handlerSlots:   make(chan struct{}, maxConcurrentHandlers),
+		readTimeout:    readTimeout,
+		writeTimeout:   writeTimeout,
+		stopChan:       make(chan struct{}),
 	}, nil
 }
 
 // Start begins accepting connections on the Unix socket.
 func (s *Server) Start(ctx context.Context) error {
-	if err := os.RemoveAll(s.socketPath); err != nil {
-		return fmt.Errorf("remove existing socket: %w", err)
+	if err := removeStaleSocket(s.socketPath); err != nil {
+		return err
 	}
 	// Directory needs to be accessible by the PAM module process (root-owned,
 	// group oauth2-pam). The socket itself is 0660.
@@ -159,7 +222,7 @@ func (s *Server) Stop() error {
 			_ = s.listener.Close()
 		}
 		s.wg.Wait()
-		if err := os.RemoveAll(s.socketPath); err != nil {
+		if err := os.Remove(s.socketPath); err != nil && !os.IsNotExist(err) {
 			log.Warn().Err(err).Str("socket", s.socketPath).Msg("Failed to remove socket file")
 		}
 		log.Info().Msg("IPC server stopped")
@@ -199,18 +262,15 @@ func (s *Server) acceptConnections(ctx context.Context) {
 			}
 		}
 
-		// Check rate limit before spawning a goroutine. An unidentifiable peer
-		// gets the shared bucket rather than being attributed to root.
-		uid, known := peerUID(conn)
-		bucket := uid
-		if !known {
-			bucket = unknownPeerBucket
-		}
-		if !s.rateLimiter.allow(bucket) {
-			log.Warn().Uint32("uid", uid).Bool("uid_known", known).Msg("Rate limit exceeded, rejecting connection")
-			s.sendErrorOnConn(conn, "RATE_LIMITED", "Too many requests; try again later")
+		// Bound concurrent handlers rather than rate-limiting the accept path.
+		// Blocking here is intentional: the kernel's listen backlog holds the
+		// excess and every waiting login is eventually served, where a rejection
+		// would have failed it outright.
+		select {
+		case s.handlerSlots <- struct{}{}:
+		case <-s.stopChan:
 			_ = conn.Close()
-			continue
+			return
 		}
 
 		s.wg.Add(1)
@@ -220,6 +280,7 @@ func (s *Server) acceptConnections(ctx context.Context) {
 
 func (s *Server) handleConnection(conn net.Conn) {
 	defer s.wg.Done()
+	defer func() { <-s.handlerSlots }()
 	defer func() { _ = conn.Close() }()
 
 	_ = conn.SetReadDeadline(time.Now().Add(s.readTimeout))
@@ -239,6 +300,13 @@ func (s *Server) handleConnection(conn net.Conn) {
 		log.Warn().Err(err).Msg("Invalid IPC request fields")
 		_ = conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
 		s.sendError(conn, "INVALID_REQUEST", "Invalid request fields")
+		return
+	}
+
+	// Rate-limit after decoding, so the bucket can depend on what was asked for.
+	if !s.allowRequest(conn, &req) {
+		_ = conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
+		s.sendError(conn, ErrorCodeRateLimited, "Too many requests; try again shortly")
 		return
 	}
 
@@ -267,6 +335,15 @@ func validateRequest(req *Request) error {
 		return fmt.Errorf("unknown request type %q", req.Type)
 	}
 
+	// An authenticate request must name the account it is for. The broker's
+	// authoritative check is "the mapped local user equals the requested one",
+	// and an empty requested user made that comparison vacuous — the session
+	// activated as whatever the identity happened to map to. The PAM module never
+	// sends an empty username, so nothing legitimate is refused here; this is the
+	// last line of defence declining to fail open.
+	if req.Type == "authenticate" && req.UserID == "" {
+		return fmt.Errorf("authenticate requires a non-empty user_id")
+	}
 	if len(req.UserID) > 256 {
 		return fmt.Errorf("user_id too long (%d bytes)", len(req.UserID))
 	}
@@ -302,6 +379,30 @@ func validateRequest(req *Request) error {
 		}
 	}
 	return nil
+}
+
+// allowRequest applies the rate limiter appropriate to the request type.
+//
+// authenticate is the expensive verb — it starts a device flow, a polling
+// goroutine and a provider round trip — so it is charged to the calling UID.
+// Session operations are charged to the session instead: a poll's cost belongs
+// to one login, and bucketing them by caller made every login on the host share
+// a single budget.
+func (s *Server) allowRequest(conn net.Conn, req *Request) bool {
+	if req.Type == "authenticate" {
+		uid, known := peerUID(conn)
+		if !s.rateLimiter.allow(callerKey(uid, known)) {
+			log.Warn().Uint32("uid", uid).Bool("uid_known", known).
+				Msg("Rate limit exceeded for authenticate")
+			return false
+		}
+		return true
+	}
+	if !s.sessionLimiter.allow(sessionKey(req.SessionID)) {
+		log.Warn().Str("type", req.Type).Msg("Rate limit exceeded for session operation")
+		return false
+	}
+	return true
 }
 
 func (s *Server) dispatch(req *Request) *Response {
@@ -388,22 +489,20 @@ func (s *Server) handleRevokeSession(req *Request) *Response {
 	if err := s.broker.RevokeSession(req.SessionID); err != nil {
 		return &Response{
 			Success:      false,
+			Status:       auth.StatusError,
 			ErrorCode:    "SESSION_REVOCATION_FAILED",
 			ErrorMessage: "Session revocation failed",
 		}
 	}
-	return &Response{Success: true}
+	// Carries a status like every other reply. It used to be the sole exception,
+	// which meant any client applying the documented "Success iff Status is
+	// authorized" rule saw success with no status and had to special-case it.
+	return &Response{Success: true, Status: StatusRevoked}
 }
 
 func (s *Server) sendError(conn net.Conn, code, message string) {
 	resp := &Response{Success: false, Status: auth.StatusError, ErrorCode: code, ErrorMessage: message}
 	_ = json.NewEncoder(conn).Encode(resp)
-}
-
-// sendErrorOnConn is used before the deadline is set (e.g. rate-limit rejection).
-func (s *Server) sendErrorOnConn(conn net.Conn, code, message string) {
-	_ = conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
-	s.sendError(conn, code, message)
 }
 
 func authResponseToIPC(ar *auth.AuthResponse) *Response {

@@ -43,7 +43,14 @@
 #define DEFAULT_POLL_INTERVAL 5
 #define MIN_POLL_INTERVAL     1
 #define MAX_POLL_INTERVAL     60
-#define DEFAULT_AUTH_TIMEOUT  300
+// 90s, not the 300s this used to default to. sshd's LoginGraceTime is 120s by
+// default, so it disconnects the session first: a 300s default could never
+// elapse, meaning the module's own deadline was dead code and the user saw an
+// abrupt disconnect instead of the "authentication timed out" message. 90s
+// leaves headroom under the grace period for the final poll and the PAM
+// conversation. Raise both together — timeout=N above LoginGraceTime is not a
+// longer login, just an unreachable branch.
+#define DEFAULT_AUTH_TIMEOUT  90
 #define MIN_AUTH_TIMEOUT      10
 #define MAX_AUTH_TIMEOUT      900
 

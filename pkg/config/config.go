@@ -192,6 +192,16 @@ type AuthenticationConfig struct {
 	TokenLifetime         time.Duration `mapstructure:"token_lifetime"`
 	RefreshThreshold      time.Duration `mapstructure:"refresh_threshold"`
 	MaxConcurrentSessions int           `mapstructure:"max_concurrent_sessions"`
+
+	// DeviceFlowTimeout is how long the broker will keep a device flow alive
+	// waiting for the user to approve it. It must be longer than the PAM module's
+	// timeout= argument, or logins fail before the user has run out of time.
+	//
+	// It exists because the provider's own device-code lifetime is far longer than
+	// any login: github.com issues 15-minute codes, so an abandoned SSH attempt
+	// used to hold a pending slot and a polling goroutine for a quarter of an
+	// hour. 0 means "use the provider's expiry", which restores that behaviour.
+	DeviceFlowTimeout time.Duration `mapstructure:"device_flow_timeout"`
 }
 
 // SecurityConfig contains security-related configuration
@@ -279,11 +289,18 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("authentication.token_lifetime", "8h")
 	v.SetDefault("authentication.refresh_threshold", "1h")
 	v.SetDefault("authentication.max_concurrent_sessions", 10)
+	// Longer than the module's default timeout= so the user, not the broker, is
+	// the one who runs out of time; short enough that an abandoned flow releases
+	// its slot in minutes rather than at the provider's 15-minute code expiry.
+	v.SetDefault("authentication.device_flow_timeout", "3m")
 
 	v.SetDefault("security.secure_token_storage", true)
 	v.SetDefault("security.max_token_age", "24h")
-	v.SetDefault("security.rate_limiting.max_requests_per_minute", 60)
-	v.SetDefault("security.rate_limiting.max_concurrent_auths", 10)
+	// Both of these are host-wide backstops, not per-user limits: every PAM caller
+	// is sshd running as root, so there is no per-user signal to limit on. They are
+	// sized so a busy login host never reaches them and a runaway client does.
+	v.SetDefault("security.rate_limiting.max_requests_per_minute", 300)
+	v.SetDefault("security.rate_limiting.max_concurrent_auths", 50)
 
 	v.SetDefault("mapper.enrollment_file", "/etc/oauth2-pam/enrolled-users.yaml")
 	v.SetDefault("mapper.external_script_timeout", "5s")

@@ -15,7 +15,7 @@ const peerCredsSupported = true
 
 // peerUID returns the UID of the process that connected to a Unix socket, and
 // whether that UID could be determined at all. The rate limiter buckets by the
-// result; see unknownPeerBucket for what happens when ok is false.
+// result; see unknownPeerKey for what happens when ok is false.
 func peerUID(conn net.Conn) (uint32, bool) {
 	uc, ok := conn.(*net.UnixConn)
 	if !ok {

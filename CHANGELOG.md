@@ -89,6 +89,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+Four defects found by a security review that reproduced each one against a
+running broker rather than reasoning about the code. Every one now has a
+regression test in `pkg/auth/broker_limits_test.go` or
+`internal/ipc/server_test.go`.
+
+- **Polling one login could deny logins host-wide.** `check_session` polls were
+  charged to the calling UID's rate-limit bucket, and every PAM caller is sshd
+  running as root — so all logins on the host shared one window. Measured: with
+  the limit at 4/minute, the fourth poll of a *single* login came back
+  `RATE_LIMITED` and killed it; at the shipped default of 60, about five
+  concurrent logins throttled each other and roughly 60 ssh connections in a
+  minute denied interactive login for everyone. Polls are now bucketed per
+  session (120/minute, twice what the lowest permitted `poll_interval` needs) and
+  only `authenticate` is charged per caller. The accept path no longer
+  rate-limits at all: concurrency is bounded by a 64-slot semaphore, so excess
+  connections wait in the kernel's listen backlog and are served rather than
+  refused. `RATE_LIMITED` is also now documented as a *retryable* wire
+  condition — a client that treats it as terminal fails a login that is merely
+  being asked to slow down.
+
+- **`max_concurrent_auths` was unreachable from a single account.** The global cap
+  was consulted after per-user eviction, and eviction holds one username's
+  pending count at three — so the global count never climbed. Measured: a cap of
+  10 accepted 30 requests, and the broker's goroutine count went from 7 to 40.
+  The cap is now checked first.
+
+- **An expired session could come back as authorized.** The poll loop wrote a
+  whole snapshot of the session back on completion, which overwrote whatever had
+  happened in the meantime. Measured: `check_session` at t+4s returned `expired`,
+  and at t+10s the same session returned `authorized` — a live 8-hour session
+  holding a real provider token, attached to no login. Activation is now a
+  compare-and-set under one lock that refuses unless the entry is still the same
+  pending session, and a terminal status is never rewritten: the answer a client
+  has already been given is final.
+
+  Evicted, revoked, and failed flows now also cancel their polling goroutine.
+  Previously an evicted flow kept polling the provider until the device code
+  expired — up to 15 minutes of untracked traffic against the app's rate limit,
+  invisible to the pending-flow cap because the session was already gone.
+
+- **`authenticate` with an empty `user_id` authenticated somebody.** The
+  "mapped local user equals the requested one" guard was skipped when the
+  requested user was empty, so the session activated as whatever the identity
+  mapped to. Measured: `user_id: ""` returned `authorized` with
+  `user_id: "alice"`. The comparison is now unconditional in the broker, and the
+  IPC layer refuses the request outright — either alone would have been a single
+  point of failure.
+
 - **The device-flow poll loop measured its deadline with the wall clock.** An NTP
   or `hwclock` step could extend a login window past `timeout=` or abandon a user
   mid-approval — most likely on a freshly booted host, which is exactly where the
@@ -99,6 +147,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#22](https://github.com/scttfrdmn/oauth2-pam/issues/22))
 
 ### Changed
+
+- **`authentication.device_flow_timeout` (new, default `3m`)** bounds how long the
+  broker waits for a user to approve a device flow. Previously the bound was the
+  provider's own device-code lifetime — 15 minutes at github.com — so an
+  abandoned ssh attempt held one of `max_concurrent_auths` slots and a polling
+  goroutine for a quarter of an hour. Set it to `0` to restore the old behaviour.
+  It must stay *above* the module's `timeout=`, or the broker gives up while the
+  user is still being told to wait.
+
+- **The PAM module's `timeout=` default drops from 300s to 90s.** sshd's
+  `LoginGraceTime` is 120s by default and disconnects first, so a 300s deadline
+  could never elapse: the module's timeout branch was unreachable and a user who
+  ran out of time saw an abrupt disconnect rather than a message. The README now
+  documents all three deadlines and which order they have to be in.
+
+- **The rate-limiting defaults are raised: `max_requests_per_minute` 60 → 300 and
+  `max_concurrent_auths` 10 → 50.** Both are host-wide backstops against a
+  runaway client, not per-user limits — every PAM caller is sshd as root, so there
+  is no per-user signal to limit on. Sized tightly they do not slow an attacker
+  down, they deny logins. `configs/example.yaml` now says so where the settings
+  are, and points at sshd's `MaxStartups` as the control that actually bounds
+  concurrent pre-auth connections.
+
+- **`server.socket_path` is no longer removed recursively at startup.** It was
+  `os.RemoveAll`, running as root, on an operator-supplied path — with the shipped
+  unit granting `ReadWritePaths=/etc/oauth2-pam`, a typo in that setting destroyed
+  a directory tree on the next restart. Startup now refuses to replace anything
+  that is not a socket.
+
+- **`revoke_session` replies carry a `status` (`"revoked"`)** like every other
+  reply. It was the sole exception, so a client applying the documented "granted
+  only when `success` is true *and* `status` is `authorized`" rule had to
+  special-case a missing field.
 
 - **Enrollment records name the provider they were created against**, and the
   login is now spelled `login` rather than `github_login`. On a host with two

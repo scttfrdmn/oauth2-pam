@@ -183,6 +183,17 @@ authentication:
   refresh_threshold: 1h
   max_concurrent_sessions: 10
 
+  # How long the broker keeps a device flow alive waiting for approval, and how
+  # long it keeps a goroutine polling the provider for it.
+  #
+  # Set this longer than the PAM module's timeout= argument (default 90s) or
+  # logins fail before the user has run out of time. Do not set it to the
+  # provider's device-code lifetime: github.com issues 15-minute codes, so an
+  # abandoned SSH attempt would hold a pending slot — one of only
+  # max_concurrent_auths — for a quarter of an hour. Empty or 0 means "use the
+  # provider's expiry", i.e. exactly that behaviour.
+  device_flow_timeout: 3m
+
 # ---------------------------------------------------------------------------
 # Security
 # ---------------------------------------------------------------------------
@@ -205,14 +216,29 @@ security:
   max_token_age: 24h
 
   rate_limiting:
-    # Per-UID sliding window on IPC requests. The UID comes from the socket's
-    # peer credentials (SO_PEERCRED on Linux, LOCAL_PEERCRED on macOS/FreeBSD);
-    # the broker logs peer_credentials=false at startup if it cannot get them, in
-    # which case every caller shares one window.
-    max_requests_per_minute: 60
-    # Ceiling on device flows awaiting approval broker-wide. Further
-    # authenticate requests are refused until one finishes or expires.
-    max_concurrent_auths: 10
+    # Sliding window on authenticate requests, per calling UID. The UID comes from
+    # the socket's peer credentials (SO_PEERCRED on Linux, LOCAL_PEERCRED on
+    # macOS/FreeBSD); the broker logs peer_credentials=false at startup if it
+    # cannot get them, in which case every caller shares one window.
+    #
+    # Read this as a host-wide backstop, not a per-attacker limit: every PAM
+    # caller is sshd running as root, so in practice every request lands in the
+    # same bucket. Sizing it tightly does not slow an attacker down, it denies
+    # logins — at the old default of 60 a burst of ssh connections could refuse
+    # interactive login host-wide. sshd's MaxStartups is the control that bounds
+    # concurrent pre-auth connections; max_concurrent_auths below bounds the work
+    # each one can create.
+    #
+    # Polls of an in-progress login are counted per session, not here, and are
+    # capped separately at 120/minute — twice what the lowest permitted
+    # poll_interval needs.
+    max_requests_per_minute: 300
+    # Ceiling on device flows awaiting approval broker-wide; each one holds a
+    # goroutine polling the provider. Further authenticate requests are refused
+    # with RATE_LIMITED until one finishes or hits device_flow_timeout. Size it
+    # for peak concurrent logins: a refusal is a failed login, and one abandoned
+    # flow holds a slot for device_flow_timeout.
+    max_concurrent_auths: 50
 
 # ---------------------------------------------------------------------------
 # Audit logging

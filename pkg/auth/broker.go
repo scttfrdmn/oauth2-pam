@@ -74,12 +74,18 @@ type Broker struct {
 	config *config.Config
 	// providers in configuration order; providers[0] is the default for a request
 	// that does not name one. byName indexes the same values.
-	providers []provider.Provider
-	byName    map[string]provider.Provider
+	providers    []provider.Provider
+	byName       map[string]provider.Provider
 	mapper       *mapper.Chain
 	tokenManager *TokenManager
 	auditLogger  *security.AuditLogger
 	sessions     map[string]*Session
+	// pollCancel holds the cancel function for each session's polling goroutine,
+	// guarded by sessionMutex alongside sessions. Without it, a session that was
+	// evicted, revoked, or failed left its poller running until the provider's
+	// device code expired — still hitting the provider every few seconds, no
+	// longer counted by countPendingFlows, and with nowhere to deliver a result.
+	pollCancel   map[string]context.CancelFunc
 	sessionMutex sync.RWMutex
 	stopChan     chan struct{}
 	wg           sync.WaitGroup
@@ -96,15 +102,15 @@ type Session struct {
 	RequestedLocalUser string // UserID from the PAM auth request; used by Tier 0 enrollment
 	// ProviderLogin is the identity's username at the provider, whatever that
 	// provider calls it.
-	ProviderLogin string
-	Email              string
-	Groups             []string
-	Provider           string
-	CreatedAt          time.Time
-	ExpiresAt          time.Time
-	LastAccessed       time.Time
-	SourceIP           string
-	TokenFingerprint   string
+	ProviderLogin    string
+	Email            string
+	Groups           []string
+	Provider         string
+	CreatedAt        time.Time
+	ExpiresAt        time.Time
+	LastAccessed     time.Time
+	SourceIP         string
+	TokenFingerprint string
 	// Status is one of the Status* constants. IsActive is retained as the
 	// single boolean gate on access and is true only when Status is
 	// StatusAuthorized.
@@ -221,6 +227,7 @@ func NewBrokerWithProviders(cfg *config.Config, providers []provider.Provider) (
 		tokenManager: tokenManager,
 		auditLogger:  auditLogger,
 		sessions:     make(map[string]*Session),
+		pollCancel:   make(map[string]context.CancelFunc),
 		stopChan:     make(chan struct{}),
 	}, nil
 }
@@ -306,12 +313,15 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 		}
 	}
 
-	// Bound in-flight device flows for this user, evicting the oldest.
-	b.evictExcessPendingFlows(req.UserID)
-
 	// Global cap on device flows awaiting authorization. Each one holds a
 	// goroutine polling the provider, so this bounds the work a burst of login
 	// attempts can create broker-wide.
+	//
+	// Checked before eviction, not after. The other order made the cap
+	// unreachable for a single username: eviction keeps that user's pending count
+	// at maxPendingFlowsPerUser, so countPendingFlows never climbed toward the
+	// global limit however many requests arrived. Verified before the fix: a cap
+	// of 10 accepted 30 requests.
 	if max := b.config.Security.RateLimiting.MaxConcurrentAuths; max > 0 {
 		if n := b.countPendingFlows(); n >= max {
 			log.Warn().Int("pending", n).Int("max", max).
@@ -320,6 +330,9 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 				"Too many authentications in progress; try again shortly"), nil
 		}
 	}
+
+	// Bound in-flight device flows for this user, evicting the oldest.
+	b.evictExcessPendingFlows(req.UserID)
 
 	// Start device flow
 	deviceFlow, err := prov.StartDeviceFlow(b.ctx)
@@ -352,13 +365,18 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 		return nil, fmt.Errorf("generate session ID: %w", err)
 	}
 
+	// The flow lives until the user approves it, but no longer than the broker is
+	// willing to wait — see AuthenticationConfig.DeviceFlowTimeout for why the
+	// provider's own expiry is the wrong bound.
+	expiresAt := b.deviceFlowDeadline(deviceFlow)
+
 	// Create a pending session
 	session := &Session{
 		ID:                 sessionID,
 		RequestedLocalUser: req.UserID,
 		Provider:           prov.Name(),
 		CreatedAt:          time.Now(),
-		ExpiresAt:          deviceFlow.ExpiresAt,
+		ExpiresAt:          expiresAt,
 		LastAccessed:       time.Now(),
 		SourceIP:           req.SourceIP,
 		Status:             StatusPending,
@@ -368,8 +386,15 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 	b.setSession(session)
 
 	// Poll in the background; update session when the device flow completes.
+	// The poller's context is cancelled the moment the session stops being
+	// interesting, so a login nobody is waiting for stops talking to the provider.
+	pollCtx, cancel := context.WithCancel(b.baseContext())
+	b.sessionMutex.Lock()
+	b.pollCancel[sessionID] = cancel
+	b.sessionMutex.Unlock()
+
 	b.wg.Add(1)
-	go b.pollDeviceAuthorization(sessionID, prov, deviceFlow)
+	go b.pollDeviceAuthorization(pollCtx, sessionID, prov, deviceFlow, expiresAt)
 
 	// Success is false: a started device flow is not an authenticated user.
 	return &AuthResponse{
@@ -379,7 +404,7 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 		DeviceCode:     deviceFlow.UserCode,
 		DeviceURL:      deviceFlow.DeviceURL,
 		QRCode:         qrCode,
-		ExpiresAt:      deviceFlow.ExpiresAt,
+		ExpiresAt:      expiresAt,
 		RequiresDevice: true,
 		Metadata: map[string]string{
 			"provider":         prov.Name(),
@@ -529,11 +554,22 @@ func (b *Broker) RevokeSession(sessionID string) error {
 
 // --- background polling ---
 
-// pollDeviceAuthorization polls the GitHub token endpoint in the background.
+// pollDeviceAuthorization polls the provider's token endpoint in the background.
 // It takes sessionID (not a *Session pointer) to avoid data races; all
 // session reads/writes go through getSession/setSession under the mutex.
-func (b *Broker) pollDeviceAuthorization(sessionID string, prov provider.Provider, df *provider.DeviceFlow) {
+//
+// ctx is cancelled when the session is evicted, revoked, or fails, so the
+// goroutine and its provider traffic stop with it. deadline is when the broker
+// gives up waiting, which may be earlier than the provider's own code expiry.
+func (b *Broker) pollDeviceAuthorization(
+	ctx context.Context,
+	sessionID string,
+	prov provider.Provider,
+	df *provider.DeviceFlow,
+	deadline time.Time,
+) {
 	defer b.wg.Done()
+	defer b.forgetPoll(sessionID)
 
 	interval := time.Duration(df.PollingInterval) * time.Second
 	if interval <= 0 {
@@ -542,12 +578,18 @@ func (b *Broker) pollDeviceAuthorization(sessionID string, prov provider.Provide
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	timeout := time.NewTimer(time.Until(df.ExpiresAt))
+	timeout := time.NewTimer(time.Until(deadline))
 	defer timeout.Stop()
 
 	for {
 		select {
 		case <-b.stopChan:
+			return
+
+		case <-ctx.Done():
+			// The session this poll belonged to is gone. Whatever removed it has
+			// already recorded why, so there is nothing to report here.
+			log.Debug().Str("session_id", sessionID).Msg("Device flow poll cancelled")
 			return
 
 		case <-timeout.C:
@@ -558,7 +600,7 @@ func (b *Broker) pollDeviceAuthorization(sessionID string, prov provider.Provide
 			return
 
 		case <-ticker.C:
-			token, err := prov.PollDeviceAuthorization(b.ctx, df.DeviceCode)
+			token, err := prov.PollDeviceAuthorization(ctx, df.DeviceCode)
 			if err != nil {
 				// errors.Is, not equality: an implementation is entitled to wrap
 				// a sentinel with context ("poll acme-sso: %w"), and treating
@@ -595,7 +637,7 @@ func (b *Broker) pollDeviceAuthorization(sessionID string, prov provider.Provide
 			// Token obtained — fetch identity (retry up to 3x for transient errors).
 			var identity *provider.Identity
 			for attempt := 1; attempt <= 3; attempt++ {
-				identity, err = prov.GetIdentity(b.ctx, token)
+				identity, err = prov.GetIdentity(ctx, token)
 				if err == nil {
 					break
 				}
@@ -631,7 +673,7 @@ func (b *Broker) pollDeviceAuthorization(sessionID string, prov provider.Provide
 				// Map to local user; retry transient errors up to 3x.
 				var mapResult *mapper.Result
 				for attempt := 1; attempt <= 3; attempt++ {
-					mapResult, err = b.mapper.Map(b.ctx, identity, current.RequestedLocalUser)
+					mapResult, err = b.mapper.Map(ctx, identity, current.RequestedLocalUser)
 					if err == nil {
 						break
 					}
@@ -668,7 +710,15 @@ func (b *Broker) pollDeviceAuthorization(sessionID string, prov provider.Provide
 				// session whose mapped user differs from the requested one, so a
 				// stale or hostile client cannot skip it. Without this, an
 				// identity mapping to "alice" would authorize `ssh root@host`.
-				if current.RequestedLocalUser != "" && mapResult.LocalUser != current.RequestedLocalUser {
+				//
+				// Compared unconditionally. It used to be skipped when the
+				// requested user was empty, which meant a request that named no
+				// account activated as whatever the identity mapped to — the check
+				// failing open in exactly the case where there is nothing to check
+				// against. validateRequest now rejects such a request at the door
+				// as well; both belong here, since either one alone is a single
+				// point of failure for the invariant the design rests on.
+				if mapResult.LocalUser != current.RequestedLocalUser {
 					log.Warn().
 						Str("session_id", sessionID).
 						Str("requested_user", current.RequestedLocalUser).
@@ -710,30 +760,38 @@ func (b *Broker) pollDeviceAuthorization(sessionID string, prov provider.Provide
 					return
 				}
 
-				// Guard: if the session was revoked while we were fetching identity /
-				// mapping / storing the token, discard the result rather than
-				// recreating a session the admin just removed.
-				if b.getSession(sessionID) == nil {
+				// Activate the session, but only if it is still the pending one
+				// this poll started on.
+				//
+				// Everything above — the identity fetch with its retries, the
+				// mapper with its 5s script timeout, the token store — takes
+				// seconds, and the session can be revoked or expired in that
+				// window. Writing the snapshot back wholesale was a lost update:
+				// with a 3s device code and a slow mapper, check_session reported
+				// "expired" at t+4s and "authorized" at t+10s, creating a live
+				// eight-hour session holding a real access token that no login was
+				// waiting on. The compare-and-set refuses that, and subsumes the
+				// revoked-during-flow guard this replaced.
+				activated := b.activateSession(sessionID, current.CreatedAt, func(s *Session) {
+					s.LocalUser = mapResult.LocalUser
+					s.ProviderLogin = identity.Login
+					s.Email = identity.Email
+					s.Groups = mapResult.Groups
+					s.TokenFingerprint = token.Fingerprint
+					s.TokenID = tokenID
+					s.Status = StatusAuthorized
+					s.IsActive = true
+					// The session now governs a live login rather than a device
+					// code, so switch to the configured session lifetime.
+					s.ExpiresAt = time.Now().Add(tokenLifetime)
+					s.LastAccessed = time.Now()
+				})
+				if !activated {
 					b.tokenManager.RevokeToken(tokenID)
 					log.Info().Str("session_id", sessionID).
-						Msg("Session revoked during device flow; discarding authentication result")
+						Msg("Session no longer pending when the device flow completed; discarding result")
 					return
 				}
-
-				// Update the session snapshot and write it back under the mutex.
-				current.LocalUser = mapResult.LocalUser
-				current.ProviderLogin = identity.Login
-				current.Email = identity.Email
-				current.Groups = mapResult.Groups
-				current.TokenFingerprint = token.Fingerprint
-				current.TokenID = tokenID
-				current.Status = StatusAuthorized
-				current.IsActive = true
-				// The session now governs a live login rather than a device code,
-				// so switch to the configured session lifetime.
-				current.ExpiresAt = time.Now().Add(tokenLifetime)
-				current.LastAccessed = time.Now()
-				b.setSession(current)
 
 				b.auditLogger.LogAuthEvent(security.AuditEvent{
 					EventType:  "authentication_success",
@@ -810,6 +868,76 @@ func (b *Broker) getSession(sessionID string) *Session {
 	return &snapshot
 }
 
+// activateSession promotes a pending session to authorized under a single lock,
+// applying mutate to the stored entry. It returns false — changing nothing — if
+// the session is gone, is no longer pending, or is not the same one the caller
+// started with: CreatedAt distinguishes a session that was removed and had its
+// ID reused from the one still in flight.
+//
+// This is the only place a session becomes active, so it is the only place the
+// invariant "an authorized session was pending a moment ago" has to hold.
+func (b *Broker) activateSession(sessionID string, createdAt time.Time, mutate func(*Session)) bool {
+	b.sessionMutex.Lock()
+	defer b.sessionMutex.Unlock()
+
+	s, ok := b.sessions[sessionID]
+	if !ok || s.IsActive || s.Status != StatusPending || !s.CreatedAt.Equal(createdAt) {
+		return false
+	}
+	mutate(s)
+	return true
+}
+
+// baseContext is the parent for per-session polling contexts. Start records the
+// broker's context; a broker used without Start (some tests, and any future
+// caller that only wants Authenticate) still needs a usable parent.
+func (b *Broker) baseContext() context.Context {
+	if b.ctx != nil {
+		return b.ctx
+	}
+	return context.Background()
+}
+
+// deviceFlowDeadline is when the broker stops waiting for the user to approve a
+// flow: the sooner of the provider's device-code expiry and
+// authentication.device_flow_timeout.
+func (b *Broker) deviceFlowDeadline(df *provider.DeviceFlow) time.Time {
+	limit := b.config.Authentication.DeviceFlowTimeout
+	if limit <= 0 {
+		return df.ExpiresAt
+	}
+	own := time.Now().Add(limit)
+	if own.Before(df.ExpiresAt) {
+		return own
+	}
+	return df.ExpiresAt
+}
+
+// cancelPoll stops the polling goroutine for a session, if one is still running.
+// Safe to call for a session that has none.
+//
+// The cancel function is taken under the lock and invoked outside it: callers
+// include paths that already hold sessionMutex, and cancel() must never be able
+// to re-enter it.
+func (b *Broker) cancelPoll(sessionID string) {
+	b.sessionMutex.Lock()
+	cancel := b.pollCancel[sessionID]
+	delete(b.pollCancel, sessionID)
+	b.sessionMutex.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// forgetPoll drops a finished poller's cancel function without calling it, so
+// the map does not grow with one entry per completed login.
+func (b *Broker) forgetPoll(sessionID string) {
+	b.sessionMutex.Lock()
+	defer b.sessionMutex.Unlock()
+	delete(b.pollCancel, sessionID)
+}
+
 // countUserSessions returns the number of *established* sessions for userID.
 //
 // Pending device flows are excluded deliberately. Counting them meant that
@@ -857,8 +985,21 @@ func (b *Broker) countPendingFlows() int {
 func (b *Broker) failSession(sessionID, status, message string) {
 	var tokenID string
 
+	// Stop polling first: a flow that has failed has nothing left to wait for,
+	// and CheckSession reaches here too, so the poller may still be running.
+	b.cancelPoll(sessionID)
+
 	b.sessionMutex.Lock()
 	s, ok := b.sessions[sessionID]
+	if ok && s.Status != StatusPending {
+		// Terminal states are final. Cancelling the poller (above) makes the
+		// in-flight provider and mapper calls fail, and those failures arrive back
+		// here — without this guard, a session CheckSession had already reported
+		// as "expired" would be rewritten as "error" moments later, changing the
+		// answer a client had already been given.
+		b.sessionMutex.Unlock()
+		return
+	}
 	if ok {
 		tokenID = s.TokenID
 		s.Status = status
@@ -887,8 +1028,13 @@ func (b *Broker) failSession(sessionID, status, message string) {
 // start. Evicting rather than rejecting means a user with several terminals
 // open always gets a usable prompt in the newest one.
 func (b *Broker) evictExcessPendingFlows(userID string) {
+	// Cancels are collected under the lock and invoked after it, so an evicted
+	// flow's goroutine stops talking to the provider. Without this, eviction
+	// deleted the session and left the poller running to the device code's
+	// expiry — untracked traffic against the provider's per-app rate limit.
+	var cancels []context.CancelFunc
+
 	b.sessionMutex.Lock()
-	defer b.sessionMutex.Unlock()
 
 	var pending []*Session
 	for _, s := range b.sessions {
@@ -897,6 +1043,7 @@ func (b *Broker) evictExcessPendingFlows(userID string) {
 		}
 	}
 	if len(pending) < maxPendingFlowsPerUser {
+		b.sessionMutex.Unlock()
 		return
 	}
 
@@ -905,10 +1052,19 @@ func (b *Broker) evictExcessPendingFlows(userID string) {
 	})
 	for _, s := range pending[:len(pending)-(maxPendingFlowsPerUser-1)] {
 		delete(b.sessions, s.ID)
+		if cancel := b.pollCancel[s.ID]; cancel != nil {
+			cancels = append(cancels, cancel)
+			delete(b.pollCancel, s.ID)
+		}
 		log.Debug().
 			Str("session_id", s.ID).
 			Str("user_id", userID).
 			Msg("Evicted oldest pending device flow")
+	}
+	b.sessionMutex.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
 	}
 }
 
@@ -954,6 +1110,9 @@ func (b *Broker) selectProvider(name string) (provider.Provider, error) {
 }
 
 func (b *Broker) removeSession(sessionID string) {
+	// A removed session's poller has nowhere to deliver a result.
+	b.cancelPoll(sessionID)
+
 	b.sessionMutex.Lock()
 	defer b.sessionMutex.Unlock()
 	delete(b.sessions, sessionID)

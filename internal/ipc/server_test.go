@@ -17,7 +17,10 @@ func TestValidateRequest(t *testing.T) {
 		req     Request
 		wantErr string // substring; empty means the request must be accepted
 	}{
-		{"authenticate", Request{Type: "authenticate"}, ""},
+		{"authenticate", Request{Type: "authenticate", UserID: "alice"}, ""},
+		// An authenticate request with no username makes the broker's
+		// mapped-equals-requested check vacuous, so it is refused outright.
+		{"authenticate with no user", Request{Type: "authenticate"}, "non-empty user_id"},
 		{"check_session", Request{Type: "check_session"}, ""},
 		{"refresh_session", Request{Type: "refresh_session"}, ""},
 		{"revoke_session", Request{Type: "revoke_session"}, ""},
@@ -32,23 +35,23 @@ func TestValidateRequest(t *testing.T) {
 
 		{"session id at the limit", Request{Type: "check_session", SessionID: strings.Repeat("a", 128)}, ""},
 		{"session id over the limit", Request{Type: "check_session", SessionID: strings.Repeat("a", 129)}, "session_id too long"},
-		{"source ip over the limit", Request{Type: "authenticate", SourceIP: strings.Repeat("a", 46)}, "source_ip too long"},
-		{"target host over the limit", Request{Type: "authenticate", TargetHost: strings.Repeat("a", 254)}, "target_host too long"},
+		{"source ip over the limit", Request{Type: "authenticate", UserID: "alice", SourceIP: strings.Repeat("a", 46)}, "source_ip too long"},
+		{"target host over the limit", Request{Type: "authenticate", UserID: "alice", TargetHost: strings.Repeat("a", 254)}, "target_host too long"},
 
-		{"login type ssh", Request{Type: "authenticate", LoginType: "ssh"}, ""},
-		{"login type console", Request{Type: "authenticate", LoginType: "console"}, ""},
-		{"login type gui", Request{Type: "authenticate", LoginType: "gui"}, ""},
-		{"empty login type defaults", Request{Type: "authenticate", LoginType: ""}, ""},
-		{"invalid login type", Request{Type: "authenticate", LoginType: "telnet"}, "invalid login_type"},
+		{"login type ssh", Request{Type: "authenticate", UserID: "alice", LoginType: "ssh"}, ""},
+		{"login type console", Request{Type: "authenticate", UserID: "alice", LoginType: "console"}, ""},
+		{"login type gui", Request{Type: "authenticate", UserID: "alice", LoginType: "gui"}, ""},
+		{"empty login type defaults", Request{Type: "authenticate", UserID: "alice", LoginType: ""}, ""},
+		{"invalid login type", Request{Type: "authenticate", UserID: "alice", LoginType: "telnet"}, "invalid login_type"},
 
 		{
 			"metadata value with NUL",
-			Request{Type: "authenticate", Metadata: map[string]string{"k": "v\x00"}},
+			Request{Type: "authenticate", UserID: "alice", Metadata: map[string]string{"k": "v\x00"}},
 			"NUL byte",
 		},
 		{
 			"metadata key with NUL",
-			Request{Type: "authenticate", Metadata: map[string]string{"k\x00": "v"}},
+			Request{Type: "authenticate", UserID: "alice", Metadata: map[string]string{"k\x00": "v"}},
 			"NUL byte",
 		},
 	}
@@ -218,26 +221,26 @@ func TestRateLimiterAllowsUpToTheLimit(t *testing.T) {
 	rl := newRateLimiter(3)
 
 	for i := 1; i <= 3; i++ {
-		if !rl.allow(1000) {
+		if !rl.allow("uid:1000") {
 			t.Fatalf("request %d denied, want allowed", i)
 		}
 	}
-	if rl.allow(1000) {
+	if rl.allow("uid:1000") {
 		t.Error("request 4 allowed, want denied")
 	}
 }
 
-func TestRateLimiterIsPerUID(t *testing.T) {
+func TestRateLimiterIsPerKey(t *testing.T) {
 	rl := newRateLimiter(1)
 
-	if !rl.allow(1000) {
+	if !rl.allow("uid:1000") {
 		t.Fatal("uid 1000 first request denied")
 	}
-	if rl.allow(1000) {
+	if rl.allow("uid:1000") {
 		t.Error("uid 1000 second request allowed")
 	}
 	// One noisy user must not lock everyone else out.
-	if !rl.allow(1001) {
+	if !rl.allow("uid:1001") {
 		t.Error("uid 1001 was denied because uid 1000 exhausted its window")
 	}
 }
@@ -245,19 +248,19 @@ func TestRateLimiterIsPerUID(t *testing.T) {
 func TestRateLimiterWindowResets(t *testing.T) {
 	rl := newRateLimiter(1)
 
-	if !rl.allow(1000) {
+	if !rl.allow("uid:1000") {
 		t.Fatal("first request denied")
 	}
-	if rl.allow(1000) {
+	if rl.allow("uid:1000") {
 		t.Fatal("second request in the same window allowed")
 	}
 
 	// Age the window instead of sleeping a minute.
 	rl.mu.Lock()
-	rl.windows[1000].resetAt = time.Now().Add(-time.Second)
+	rl.windows["uid:1000"].resetAt = time.Now().Add(-time.Second)
 	rl.mu.Unlock()
 
-	if !rl.allow(1000) {
+	if !rl.allow("uid:1000") {
 		t.Error("request denied after the window elapsed")
 	}
 }
@@ -265,42 +268,67 @@ func TestRateLimiterWindowResets(t *testing.T) {
 func TestRateLimiterEvictsStaleWindows(t *testing.T) {
 	rl := newRateLimiter(10)
 
-	rl.allow(1000)
-	rl.allow(1001)
+	rl.allow("uid:1000")
+	rl.allow("uid:1001")
 
 	rl.mu.Lock()
-	rl.windows[1000].resetAt = time.Now().Add(-time.Second) // stale
+	rl.windows["uid:1000"].resetAt = time.Now().Add(-time.Second) // stale
 	rl.mu.Unlock()
 
 	rl.evict()
 
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-	if _, ok := rl.windows[1000]; ok {
+	if _, ok := rl.windows["uid:1000"]; ok {
 		t.Error("stale window was not evicted; the map grows without bound")
 	}
-	if _, ok := rl.windows[1001]; !ok {
+	if _, ok := rl.windows["uid:1001"]; !ok {
 		t.Error("a live window was evicted")
 	}
 }
 
-// TestUnknownPeerBucketIsNotRoot guards the reason unknownPeerBucket exists:
-// peerUID used to return 0 for every peer it could not identify, so unknown
-// callers and root shared a window and the logs called them root.
-func TestUnknownPeerBucketIsNotRoot(t *testing.T) {
-	if unknownPeerBucket == 0 {
-		t.Fatal("unknownPeerBucket is 0, which is root's real UID")
+// TestUnknownPeerKeyIsNotRoot guards the reason unknownPeerKey exists: peerUID
+// used to return 0 for every peer it could not identify, so unknown callers and
+// root shared a window and the logs called them root.
+func TestUnknownPeerKeyIsNotRoot(t *testing.T) {
+	if callerKey(0, true) == unknownPeerKey {
+		t.Fatal("the unknown-peer bucket collides with root's real UID")
 	}
 
 	rl := newRateLimiter(1)
-	if !rl.allow(unknownPeerBucket) {
+	if !rl.allow(unknownPeerKey) {
 		t.Fatal("first unidentified request denied")
 	}
-	if rl.allow(unknownPeerBucket) {
+	if rl.allow(unknownPeerKey) {
 		t.Error("second unidentified request allowed; the shared bucket is not counting")
 	}
-	if !rl.allow(0) {
+	if !rl.allow(callerKey(0, true)) {
 		t.Error("root was denied because unidentified callers exhausted its window")
+	}
+}
+
+// TestPollsAreBucketedPerSessionNotPerCaller is the regression test for a
+// verified host-wide login DoS: every PAM caller is sshd as root, so charging
+// check_session polls to the caller's UID meant a handful of concurrent logins
+// exhausted one shared window and the next poll came back RATE_LIMITED, which
+// the module treats as terminal. Two logins must not compete for one budget.
+func TestPollsAreBucketedPerSessionNotPerCaller(t *testing.T) {
+	rl := newRateLimiter(2)
+
+	for i := 0; i < 2; i++ {
+		if !rl.allow(sessionKey("session-a")) {
+			t.Fatalf("poll %d for session-a denied", i+1)
+		}
+	}
+	if rl.allow(sessionKey("session-a")) {
+		t.Error("session-a exceeded its own budget without being denied")
+	}
+	// The other login, from the same root caller, is unaffected.
+	if !rl.allow(sessionKey("session-b")) {
+		t.Error("session-b was denied because session-a exhausted its window")
+	}
+	if !rl.allow(callerKey(0, true)) {
+		t.Error("an authenticate request was denied by another session's polling")
 	}
 }
 
