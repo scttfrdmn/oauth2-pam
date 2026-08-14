@@ -97,6 +97,11 @@ Examples:
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
 			}
+			// The broker will not start on a config that fails this, so enrolling
+			// against one would write a record for a host that cannot serve it.
+			if err := cfg.Validate(); err != nil {
+				return fmt.Errorf("invalid config %s: %w", cfgPath, err)
+			}
 
 			enrollFile := cfg.Mapper.EnrollmentFile
 			if enrollFile == "" {

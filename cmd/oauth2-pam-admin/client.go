@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"time"
 
@@ -15,7 +16,18 @@ import (
 	"github.com/scttfrdmn/oauth2-pam/pkg/provider"
 )
 
+// maxResponseSize bounds the reply this client will read: client conformance item
+// 8 in docs/wire-protocol.md, "bounds the reply it will read instead of growing a
+// buffer to fit". It is MAX_RESPONSE_SIZE from cmd/pam-module/cgo_bridge.h, so
+// this tool accepts exactly what the PAM module accepts — a reply too large for
+// the module is not one an operator should see reported here as fine.
+const maxResponseSize = 16 * 1024
+
 // ipcClient is a thin client for the broker IPC socket.
+//
+// It is this repository's reference client for the protocol the repository
+// specifies, so the conformance items in docs/wire-protocol.md are cited by
+// number below rather than left to be inferred.
 type ipcClient struct {
 	socketPath string
 }
@@ -27,6 +39,12 @@ func newIPCClient(socketPath string) (*ipcClient, error) {
 func (c *ipcClient) Close() {}
 
 func (c *ipcClient) send(req *ipc.Request) (*ipc.Response, error) {
+	// Item 4: say which contract this request is written in. Omitting it worked
+	// only because the broker reads an absent version as 1, and that rule exists
+	// so a v0.2.x PAM module keeps working — not so this repository's own client
+	// can leave the field out.
+	req.ProtocolVersion = ipc.ProtocolVersion
+
 	conn, err := net.DialTimeout("unix", c.socketPath, 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("dial broker: %w", err)
@@ -38,9 +56,20 @@ func (c *ipcClient) send(req *ipc.Request) (*ipc.Response, error) {
 		return nil, fmt.Errorf("send request: %w", err)
 	}
 
+	// Item 8: read at most maxResponseSize, so a broker that answers with
+	// megabytes cannot make this tool allocate them. A reply that overruns the cap
+	// arrives here as a decode error naming the cap, which is the diagnosis.
 	var resp ipc.Response
-	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
+	if err := json.NewDecoder(io.LimitReader(conn, maxResponseSize+1)).Decode(&resp); err != nil {
+		return nil, fmt.Errorf("read response (at most %d bytes): %w", maxResponseSize, err)
+	}
+
+	// Items 4 and 5: an absent version is 1, so a broker predating the field still
+	// answers this tool; a version it does not know is refused rather than read
+	// for fields that may no longer mean what they appear to.
+	if resp.ProtocolVersion != 0 && resp.ProtocolVersion != ipc.ProtocolVersion {
+		return nil, fmt.Errorf("broker replied in protocol version %d, and this client speaks %d",
+			resp.ProtocolVersion, ipc.ProtocolVersion)
 	}
 	return &resp, nil
 }
@@ -58,6 +87,10 @@ func (c *ipcClient) TestAuth(username string) error {
 		return err
 	}
 
+	// Success is deliberately not consulted here: by the broker's first conformance
+	// item the reply to authenticate is always success=false, status=pending, and
+	// nothing has been authenticated yet. Where success matters is the authorized
+	// reply below.
 	if resp.Status != auth.StatusPending {
 		return fmt.Errorf("auth failed (%s): %s", resp.Status, resp.ErrorMessage)
 	}
@@ -85,6 +118,13 @@ func (c *ipcClient) TestAuth(username string) error {
 
 		switch check.Status {
 		case auth.StatusAuthorized:
+			// Item 1: authorized *and* success, both. Reading the status alone
+			// reports a successful test for a reply the broker did not consider a
+			// success, which is the shape of the v0.1.x bypass.
+			if !check.Success {
+				return fmt.Errorf("broker reported status %q with success=false: %s",
+					check.Status, check.ErrorMessage)
+			}
 			if check.UserID != username {
 				// Should never happen: the broker enforces this before
 				// activating the session. Refuse anyway.
@@ -133,6 +173,13 @@ func runTestMapping(cfgPath, login, org, team string) error {
 	cfg, err := config.LoadConfig(cfgPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
+	}
+	// The broker refuses to start on a config that fails this, so a dry run that
+	// reported a mapping from one would be answering a question about a
+	// configuration that cannot run — and debugging that config is exactly why an
+	// operator reaches for this command.
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("invalid config %s: %w", cfgPath, err)
 	}
 
 	orgs := []string{}

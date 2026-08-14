@@ -82,6 +82,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libpam0g-dev libjson-c-dev
 
+      # Both outputs carry the tag name, and every step below reads them through
+      # env: rather than ${{ }} inside a run: block. A ${{ }} expression is pasted
+      # into the script before the shell ever sees it, and a tag name legally
+      # contains a backtick, `$(...)`, `;` and `|` — so interpolating one would let
+      # whoever can push a tag run commands in the jobs that build and publish the
+      # release artifacts. As an environment variable it is data, never syntax.
+      # verify-version above is already written this way, with ${GITHUB_REF_NAME}.
       - name: Set build variables
         id: vars
         run: |
@@ -96,20 +103,22 @@ jobs:
       - name: Build the three binaries
         env:
           CGO_ENABLED: 0
+          LDFLAGS: ${{ steps.vars.outputs.ldflags }}
         run: |
           mkdir -p bin
           for c in broker:oauth2-pam-broker \
                    oauth2-pam-admin:oauth2-pam-admin \
                    oauth2-pam-enroll:oauth2-pam-enroll; do
-            go build -trimpath -ldflags="${{ steps.vars.outputs.ldflags }}" \
+            go build -trimpath -ldflags="$LDFLAGS" \
               -o "bin/${c#*:}" "./cmd/${c%%:*}"
           done
 
       - name: Build the PAM module
         env:
           CGO_ENABLED: 1
+          LDFLAGS: ${{ steps.vars.outputs.ldflags }}
         run: |
-          go build -buildmode=c-shared -trimpath -ldflags="${{ steps.vars.outputs.ldflags }}" \
+          go build -buildmode=c-shared -trimpath -ldflags="$LDFLAGS" \
             -o bin/oauth2_pam.so ./cmd/pam-module
           rm -f bin/oauth2_pam.h
 
@@ -117,24 +126,29 @@ jobs:
       # these symbols and nothing noticed for a month; the sister project is
       # still shipping one (oidc-pam#140). A release that publishes a module PAM
       # cannot load is worse than no release, because the artifact looks official.
+      #
+      # The loop that used to live here is now scripts/verify-pam-symbols.sh, so
+      # `make build`, this job and the installer the archive ships all ask the same
+      # question of the same artifact.
       - name: Verify the PAM entry points made it into the artifact
-        run: |
-          for sym in pam_sm_authenticate pam_sm_setcred pam_sm_acct_mgmt \
-                     pam_sm_open_session pam_sm_close_session pam_sm_chauthtok; do
-            nm -D --defined-only bin/oauth2_pam.so | grep -q " T $sym\$" \
-              || { echo "::error::MISSING ENTRY POINT: $sym"; exit 1; }
-          done
-          echo "All six pam_sm_* entry points present."
+        run: scripts/verify-pam-symbols.sh bin/oauth2_pam.so
 
       - name: Create archive
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+          ARCH: ${{ matrix.arch }}
         run: |
-          DIR="oauth2-pam-${{ steps.vars.outputs.version }}-linux-${{ matrix.arch }}"
+          DIR="oauth2-pam-$VERSION-linux-$ARCH"
           mkdir -p "$DIR"
           cp bin/oauth2-pam-broker bin/oauth2-pam-admin bin/oauth2-pam-enroll \
              bin/oauth2_pam.so "$DIR/"
           cp -r configs "$DIR/configs"
           cp README.md CHANGELOG.md SECURITY.md LICENSE "$DIR/"
           install -m 0755 scripts/install-release.sh "$DIR/install.sh"
+          # install.sh runs the same entry-point check this job just ran and asks
+          # the same script where PAM modules live, so both helpers travel with it.
+          install -m 0755 scripts/verify-pam-symbols.sh "$DIR/verify-pam-symbols.sh"
+          install -m 0755 scripts/pam-module-dir.sh "$DIR/pam-module-dir.sh"
           tar czf "$DIR.tar.gz" "$DIR"
           sha256sum "$DIR.tar.gz" > "$DIR.tar.gz.sha256"
 

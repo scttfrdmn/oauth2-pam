@@ -166,8 +166,23 @@ jobs:
           toolchain=$(curl -fsSL 'https://go.dev/dl/?mode=json' \
             | jq -er --arg prefix "go${major}." \
                 '[.[] | select(.stable) | .version | select(startswith($prefix))] | first')
+
+          # The one value here that comes off the network, and it is about to be
+          # handed to the toolchain resolver. Insist on the exact shape of a Go
+          # release version before using it, so a changed feed or a response from
+          # something that is not go.dev fails this step rather than making
+          # GOTOOLCHAIN mean something nobody intended.
+          if ! printf '%s' "$toolchain" | grep -qE '^go[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+            echo "::error::go.dev returned '$toolchain', which is not a goX.Y.Z version"
+            exit 1
+          fi
+
           echo "go.mod pins go${major}; scanning with ${toolchain}"
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          # Pinned, like gosec and golangci-lint: @latest is a moving target
+          # fetched into a job that then reports on this repository's security, and
+          # every uses: in this file is pinned to a SHA for the same reason.
+          # dependabot does not read `go install` lines, so this one moves by hand.
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
           GOTOOLCHAIN="$toolchain" govulncheck ./...
 
   dependency-review:

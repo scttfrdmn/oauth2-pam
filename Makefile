@@ -40,16 +40,10 @@ build-pam:
 	@mkdir -p $(BINARY_DIR)
 	CGO_ENABLED=1 go build -buildmode=c-shared $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(PAM_MODULE) ./cmd/pam-module
 	@echo "Verifying PAM entry points are present..."
-	@if command -v nm >/dev/null 2>&1; then \
-		count=$$(nm -D --defined-only $(BINARY_DIR)/$(PAM_MODULE) 2>/dev/null | grep -c ' pam_sm_'); \
-		if [ "$$count" -lt 6 ]; then \
-			echo "ERROR: $(PAM_MODULE) exports $$count pam_sm_* symbols, expected 6."; \
-			echo "  PAM cannot load a module without entry points. Is the C file"; \
-			echo "  still part of the cmd/pam-module package?"; \
-			exit 1; \
-		fi; \
-		echo "  $$count pam_sm_* entry points present"; \
-	fi
+	@# Per symbol, and a build host without nm fails here rather than passing
+	@# quietly. The same script runs in release.yml and in the installer, so a
+	@# module that gets past one of them gets past all three for the same reason.
+	@scripts/verify-pam-symbols.sh $(BINARY_DIR)/$(PAM_MODULE)
 
 ## Build the PAM module in a Linux container (works from macOS)
 docker-build-pam:
@@ -138,7 +132,14 @@ verify-linux:
 ## Install binaries to system locations
 install: build
 	@echo "Installing binaries..."
-	sudo cp $(BINARY_DIR)/$(PAM_MODULE) /lib/security/
+	@# The PAM module directory is asked for, not assumed. This target hardcoded
+	@# /lib/security, which is right on RHEL and wrong on Debian/Ubuntu multiarch —
+	@# and wrong quietly, since a module in the wrong directory is a module PAM
+	@# never loads. scripts/install-release.sh was already asking; it is the same
+	@# script now, so the two install routes cannot disagree.
+	PAMDIR=$$(scripts/pam-module-dir.sh) && \
+		echo "  PAM module -> $$PAMDIR/$(PAM_MODULE)" && \
+		sudo install -m 0644 -o root -g root $(BINARY_DIR)/$(PAM_MODULE) "$$PAMDIR/$(PAM_MODULE)"
 	sudo cp $(BINARY_DIR)/$(BROKER_BINARY) /usr/local/bin/
 	sudo cp $(BINARY_DIR)/$(ADMIN_BINARY) /usr/local/bin/
 	sudo cp $(BINARY_DIR)/$(ENROLL_BINARY) /usr/local/bin/
@@ -149,11 +150,15 @@ install: build
 ## Install development version
 install-dev: build
 	@echo "Installing development version..."
-	sudo cp $(BINARY_DIR)/$(PAM_MODULE) /lib/security/
+	PAMDIR=$$(scripts/pam-module-dir.sh) && \
+		echo "  PAM module -> $$PAMDIR/$(PAM_MODULE)" && \
+		sudo install -m 0644 -o root -g root $(BINARY_DIR)/$(PAM_MODULE) "$$PAMDIR/$(PAM_MODULE)"
 	sudo cp $(BINARY_DIR)/$(BROKER_BINARY) /usr/local/bin/
 	sudo cp $(BINARY_DIR)/$(ADMIN_BINARY) /usr/local/bin/
 	sudo cp $(BINARY_DIR)/$(ENROLL_BINARY) /usr/local/bin/
-	sudo mkdir -p /etc/oauth2-pam
+	@# 0750 root-owned, like the release installer: the directory holding a config
+	@# with a secret in it is not one other users should be able to list.
+	sudo install -d -m 0750 -o root -g root /etc/oauth2-pam
 	@# 0600 root-owned, because the example carries client_secret inline and the
 	@# broker refuses to read a secret out of a file other users can read. And it
 	@# is never overwritten: this target is run repeatedly during development, and
@@ -205,14 +210,22 @@ security:
 	gosec ./...
 
 ## Create release build (linux only - PAM modules are linux-specific)
+##
+## The three binaries cross-compile. The module does not: it is -buildmode=c-shared
+## against the host's libpam and libjson-c, so this target can only produce a .so
+## for the architecture it is running on. That is why release.yml builds on native
+## amd64 and arm64 runners, and why a published release comes from the workflow
+## rather than from here — this target produces one architecture's module and both
+## architectures' binaries, and used to name the module amd64 whatever it ran on.
 release: clean
 	@echo "Creating release build..."
 	@mkdir -p $(BINARY_DIR)
 	GOOS=linux GOARCH=amd64 go build $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(BROKER_BINARY)-linux-amd64 ./cmd/broker
-	@# The PAM module needs cgo against Linux-PAM, so it cannot be
-	@# cross-compiled from macOS; build it on Linux (or via docker-build-pam).
 	@if [ "$$(go env GOOS)" = "linux" ]; then \
-		GOOS=linux GOARCH=amd64 CGO_ENABLED=1 go build -buildmode=c-shared $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(PAM_MODULE)-linux-amd64 ./cmd/pam-module; \
+		arch=$$(go env GOARCH); \
+		CGO_ENABLED=1 go build -buildmode=c-shared $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(PAM_MODULE)-linux-$$arch ./cmd/pam-module; \
+		scripts/verify-pam-symbols.sh $(BINARY_DIR)/$(PAM_MODULE)-linux-$$arch; \
+		echo "release: built $(PAM_MODULE)-linux-$$arch — the other architecture needs a host of that architecture"; \
 	else \
 		echo "release: skipping $(PAM_MODULE) — requires a Linux build host (see docker-build-pam)"; \
 	fi
