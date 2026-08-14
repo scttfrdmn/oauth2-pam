@@ -624,18 +624,88 @@ func (s *Server) sendError(conn net.Conn, code, message string) {
 	})
 }
 
+// maxResponseSize is the largest reply this broker will put on the socket,
+// counting the newline the encoding adds. It is MAX_RESPONSE_SIZE from
+// cmd/pam-module/cgo_bridge.h, deliberately the same number: the client reads at
+// most that many bytes and refuses one more, so a reply above it is not a large
+// reply, it is a failed login with no diagnosis — the module gets a truncated
+// object, cannot parse it, and logs that it could not parse a response.
+//
+// It is a belt, not the fix. Nothing the broker composes on purpose comes close:
+// the biggest reply is the first one, and the bound on what a provider can put
+// into it is maxQRCodeURLBytes in pkg/auth. This is here because that bound is in
+// a different package from this socket, and every field a reply carries is
+// something somebody else chose the length of — provider_login and error_message
+// among them. The cap belongs at the one place a reply becomes bytes.
+const maxResponseSize = 16384
+
 // writeResponse is the only place a reply reaches the socket, so it is the only
 // place that has to remember to stamp the protocol version. Every reply carries
 // it, including the errors written before dispatch: a client that cannot parse a
 // reply should still be able to tell whether it was talking to a broker speaking
 // a contract it knows.
+//
+// It is also the only place that can see how big a reply turned out to be, so an
+// oversized one is replaced here with a RESPONSE_TOO_LARGE error rather than
+// written and left for the client to fail on. docs/wire-protocol.md registers
+// that code and permits sending it; substituting it is the difference between a
+// client learning "the broker had something to say and it did not fit" and a
+// client learning nothing. None of the oversized reply's own fields is copied
+// forward, because whatever made it oversized is in one of them.
 func writeResponse(conn net.Conn, resp *Response) {
 	resp.ProtocolVersion = ProtocolVersion
-	if err := json.NewEncoder(conn).Encode(resp); err != nil {
+
+	payload, err := encodeResponse(resp)
+	if err != nil {
 		log.Error().Err(err).Msg("Encode IPC response")
+		return
+	}
+
+	if len(payload) > maxResponseSize {
+		log.Error().Int("bytes", len(payload)).Int("cap", maxResponseSize).
+			Str("status", resp.Status).
+			Msg("Reply exceeds the reply cap; sending RESPONSE_TOO_LARGE instead")
+		payload, err = encodeResponse(&Response{
+			ProtocolVersion: ProtocolVersion,
+			Success:         false,
+			Status:          auth.StatusError,
+			ErrorCode:       "RESPONSE_TOO_LARGE",
+			ErrorMessage:    "Reply did not fit the reply size limit",
+		})
+		if err != nil {
+			log.Error().Err(err).Msg("Encode IPC response")
+			return
+		}
+	}
+
+	if _, err := conn.Write(payload); err != nil {
+		log.Error().Err(err).Msg("Write IPC response")
 	}
 }
 
+// encodeResponse renders a reply exactly as it goes on the wire, trailing newline
+// included, so that the size the cap is applied to is the size the client reads.
+// json.Encoder is not used directly on the connection any more for the same
+// reason: it writes as it encodes, and a reply cannot be measured after part of it
+// has already left.
+func encodeResponse(resp *Response) ([]byte, error) {
+	payload, err := json.Marshal(resp)
+	if err != nil {
+		return nil, err
+	}
+	return append(payload, '\n'), nil
+}
+
+// authResponseToIPC copies a broker answer into a reply.
+//
+// QRCode stays a field of its own even though the ASCII art is the largest thing
+// a reply carries, and it is the copy that survived the fix for #56: the art used
+// to go out here *and* inside instructions, so the reply the module has to fit in
+// 16 KiB carried it twice. docs/wire-protocol.md makes removing a reply field a
+// new protocol version, and this is a bug fix, so the copy that went is the one
+// the spec does not describe the contents of — the block inside instructions. See
+// the comment above the formatters in pkg/auth/qr_code.go. Do not "tidy" this by
+// deleting the field.
 func authResponseToIPC(ar *auth.AuthResponse) *Response {
 	return &Response{
 		Success:          ar.Success,

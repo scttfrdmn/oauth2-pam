@@ -370,11 +370,24 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 	userCode := SanitizePromptValue(deviceFlow.UserCode)
 
 	// Generated from the sanitized URL, so the QR encodes what the text says.
+	//
+	// A URL the encoder will not take is not a failed login. GenerateQRCode bounds
+	// its input — see maxQRCodeURLBytes for why the provider must not be the one
+	// choosing how many kilobytes of block characters this reply carries — and
+	// above the bound there is simply no QR code; the instructions still carry the
+	// URL and the user code as text.
+	//
+	// Sanitized here because the art now travels only in the reply's qr_code field
+	// and no longer inside instructions, so the prompt formatters are no longer
+	// where it gets filtered. Defence in depth either way: go-qrcode emits
+	// block-drawing runes and newlines and nothing else, which is exactly why the
+	// block policy leaves a real QR code untouched.
 	qrCode, err := GenerateQRCode(deviceURL)
 	if err != nil {
-		log.Warn().Err(err).Msg("Failed to generate QR code")
+		log.Warn().Err(err).Msg("Device flow will have no QR code")
 		qrCode = ""
 	}
+	qrCode = SanitizePromptBlock(qrCode)
 
 	// Generate a cryptographically random session ID server-side.
 	// The PAM client's req.SessionID is intentionally ignored to prevent

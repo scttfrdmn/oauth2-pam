@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -53,7 +54,15 @@ func TestInstructionsDoNotPromiseAutomaticCompletion(t *testing.T) {
 	}
 }
 
-func TestQRCodeIsIncludedWhenSupplied(t *testing.T) {
+// TestInstructionsDoNotEmbedTheQRCode is half of the regression test for #56,
+// and the half that pins where the single copy of the art lives.
+//
+// A reply carries the QR code in its own qr_code field. Embedding it in
+// instructions as well put every byte of the largest thing in the largest reply
+// on the wire twice — a doubling the provider chose the size of, since the art
+// is a function of its verification_uri. The formatters still take the argument
+// so the shape of the contract is unchanged; they must not write it anywhere.
+func TestInstructionsDoNotEmbedTheQRCode(t *testing.T) {
 	qr, err := GenerateQRCode(testDeviceURL)
 	if err != nil {
 		t.Fatalf("GenerateQRCode: %v", err)
@@ -65,22 +74,82 @@ func TestQRCodeIsIncludedWhenSupplied(t *testing.T) {
 	for name, format := range allFormatters() {
 		t.Run(name, func(t *testing.T) {
 			withQR := format(testDeviceURL, testUserCode, qr)
-			withoutQR := format(testDeviceURL, testUserCode, "")
+			if withQR != format(testDeviceURL, testUserCode, "") {
+				t.Error("supplying a QR code changed the instructions, so the art is serialized twice")
+			}
+			if strings.Contains(withQR, qr) {
+				t.Errorf("the QR code was embedded in the instructions:\n%s", withQR)
+			}
+			// A line of the art is enough to catch a partial copy, which the
+			// whole-string check above would miss.
+			for _, line := range strings.Split(strings.TrimRight(qr, "\n"), "\n") {
+				if len(line) > 8 && strings.Contains(withQR, line) {
+					t.Errorf("a row of the QR code appears in the instructions: %q", line)
+				}
+			}
+		})
+	}
+}
 
-			switch name {
-			case "gui":
-				// A GUI login manager renders a plain-text dialog; ASCII art
-				// would be unreadable there, so it is deliberately omitted.
-				if withQR != withoutQR {
-					t.Error("the GUI format embedded the ASCII QR code")
-				}
-			default:
-				if !strings.Contains(withQR, qr) {
-					t.Error("the QR code was not embedded")
-				}
-				if withQR == withoutQR {
-					t.Error("supplying a QR code made no difference")
-				}
+// TestQRCodeIsSkippedForAnOverlongURL is the other half of #56: the input to the
+// encoder is a provider's verification_uri, a QR symbol grows superlinearly in
+// it, and the module's reply buffer is fixed. Above the bound there must be no
+// art at all — and the caller must be told why, because "the provider sent a
+// 2 KB URL" and "the encoder is broken" are the same fallback and different
+// things for an operator to go and look at.
+func TestQRCodeIsSkippedForAnOverlongURL(t *testing.T) {
+	atTheBound := testDeviceURL + strings.Repeat("a", maxQRCodeURLBytes-len(testDeviceURL))
+	if len(atTheBound) != maxQRCodeURLBytes {
+		t.Fatalf("test URL is %d bytes, want %d", len(atTheBound), maxQRCodeURLBytes)
+	}
+
+	if qr, err := GenerateQRCode(atTheBound); err != nil || qr == "" {
+		t.Errorf("a URL of exactly %d bytes was refused: qr=%d bytes, err=%v",
+			maxQRCodeURLBytes, len(qr), err)
+	}
+
+	// One byte over, and the length the issue's dangerous band is drawn around.
+	for _, n := range []int{maxQRCodeURLBytes + 1, 300, 1029, 2029} {
+		long := testDeviceURL + strings.Repeat("a", n-len(testDeviceURL))
+		qr, err := GenerateQRCode(long)
+		if qr != "" {
+			t.Errorf("a %d-byte URL still produced %d bytes of QR code", n, len(qr))
+		}
+		if !errors.Is(err, ErrURLTooLongForQR) {
+			t.Errorf("a %d-byte URL returned err = %v, want ErrURLTooLongForQR", n, err)
+		}
+	}
+}
+
+// TestAnOverlongVerificationURICannotInflateTheInstructions walks the same path
+// the broker does — sanitize, then encode — and pins the size of what comes out.
+// The 16 KiB is the module's MAX_RESPONSE_SIZE, which is the buffer the whole
+// reply has to fit in, so instructions alone need to be well inside it.
+func TestAnOverlongVerificationURICannotInflateTheInstructions(t *testing.T) {
+	// A provider-chosen URL from the middle of the band where the QR art used to
+	// cross the buffer on its own.
+	hostile := "https://ghes.corp.example/login/device?x=" + strings.Repeat("ab", 1000)
+
+	deviceURL := SanitizePromptValue(hostile)
+	qr, err := GenerateQRCode(deviceURL)
+	if err == nil {
+		t.Fatalf("a %d-byte URL was encoded into %d bytes of QR code", len(deviceURL), len(qr))
+	}
+
+	const maxPromptSize = 16384
+	for name, format := range allFormatters() {
+		t.Run(name, func(t *testing.T) {
+			// qr is "" here, but pass what the encoder returned rather than a
+			// literal: a formatter that started embedding the argument again
+			// should fail this test as well as the one above.
+			out := format(deviceURL, testUserCode, qr)
+			if len(out) >= maxPromptSize {
+				t.Errorf("instructions are %d bytes for a %d-byte URL, which does not fit the module's %d-byte buffer",
+					len(out), len(hostile), maxPromptSize)
+			}
+			// The URL is echoed once and the login is still usable.
+			if !strings.Contains(out, testUserCode) {
+				t.Error("the user code is missing, so the user has nothing to act on")
 			}
 		})
 	}
@@ -158,29 +227,30 @@ func TestInstructionsSayWhenTheyDroppedSomething(t *testing.T) {
 	}
 }
 
-// TestFormattingLeavesARealQRCodeIntact: the ASCII QR code is block-drawing
-// runes and newlines by construction, and sanitizing it as if it were a
-// single-line value would collapse it into one unreadable line for everybody.
-func TestFormattingLeavesARealQRCodeIntact(t *testing.T) {
-	qr, err := GenerateQRCode(testDeviceURL)
+// TestTheReplyCarriesARealQRCodeIntact is where the old formatting test moved
+// to, because the property moved: the art is no longer written into instructions,
+// so the qr_code field is the one place it has to arrive undamaged. It is
+// block-drawing runes and newlines by construction, and running it through the
+// single-line value policy would collapse it into one unreadable row for
+// everybody, which is why the broker uses the block policy on it.
+func TestTheReplyCarriesARealQRCodeIntact(t *testing.T) {
+	b := startBroker(t, brokerConfig(t), newFakeProvider("acme"))
+
+	resp, err := b.Authenticate(&AuthRequest{UserID: "alice", LoginType: "ssh"})
+	if err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+
+	want, err := GenerateQRCode(resp.DeviceURL)
 	if err != nil {
 		t.Fatalf("GenerateQRCode: %v", err)
 	}
-
-	for name, format := range allFormatters() {
-		if name == "gui" {
-			continue // deliberately omits the QR code; see the test above
-		}
-		t.Run(name, func(t *testing.T) {
-			out := format(testDeviceURL, testUserCode, qr)
-			if !strings.Contains(out, qr) {
-				t.Errorf("the QR code did not survive formatting byte-for-byte.\nwanted (%d lines):\n%s\ngot:\n%s",
-					strings.Count(qr, "\n"), qr, out)
-			}
-			if strings.Contains(out, "control character") {
-				t.Errorf("a clean QR code was reported as needing sanitizing:\n%s", out)
-			}
-		})
+	if resp.QRCode != want {
+		t.Errorf("qr_code did not survive the broker byte-for-byte.\nwanted (%d lines):\n%s\ngot:\n%s",
+			strings.Count(want, "\n"), want, resp.QRCode)
+	}
+	if strings.Contains(resp.QRCode, "control character") {
+		t.Errorf("a clean QR code was reported as needing sanitizing:\n%s", resp.QRCode)
 	}
 }
 
