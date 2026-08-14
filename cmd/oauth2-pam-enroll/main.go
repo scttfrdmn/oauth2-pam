@@ -250,6 +250,16 @@ func runEnroll(localUser, providerName string, groups []string, enrollFile strin
 		return fmt.Errorf("get provider identity: %w", err)
 	}
 
+	// An identity with no login is a provider error, not something to record. The
+	// login is one half of what tier 0 matches on; writing an empty one produces a
+	// record that matches any identity that also arrives without a login, which is a
+	// wildcard for this local account. Store.Add refuses it too — this check is here
+	// so the operator is told the provider was at fault rather than the record.
+	if identity.Login == "" {
+		return fmt.Errorf("%s returned an identity with no login, so there is nothing to enroll %q against",
+			prov.Name(), localUser)
+	}
+
 	// Write enrollment record
 	store, err := enrollment.Load(enrollFile)
 	if err != nil {
