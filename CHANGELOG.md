@@ -94,8 +94,40 @@ start until it is chmodded; the error names the file and the command. A negative
 
 - **An empty GitHub `login` was a wildcard.** An enrollment lookup for `""` matched,
   which is the wrong answer to a malformed API response. Refused in `Store.Find`,
-  `Store.Add`, the mapper, and the enroll CLI.
+  `Store.Add`, the mapper, the enroll CLI, and — the place the empty value actually
+  enters the system — the GitHub adapter's `getUser`.
   ([#80](https://github.com/scttfrdmn/oauth2-pam/issues/80))
+
+- **A failed audit write on the grant path now fails the login.** There is exactly one
+  place in the broker where a session becomes usable for a login, and the
+  `authentication_success` record written there was discarding its error — so a full
+  disk produced an authenticated session with no trail of it, which is the outcome an
+  audit log exists to prevent. That site now uses `LogAuthEventErr` and, if the write
+  fails, withdraws the activation it had just made: the token is revoked, the session
+  is marked terminally errored, and the polling client is told the login failed. The
+  five sites recording a denial, a failure or an attempt deliberately still discard —
+  a lost refusal record is a gap in the trail, not an unlogged access — and each now
+  says so in a comment, because the distinction is the whole point.
+  ([#69](https://github.com/scttfrdmn/oauth2-pam/issues/69))
+
+- **`session_revoked` claimed success for a user it could not name.** Revoking a
+  *pending* session emitted `Success: true` with an empty `UserID`, which reads as
+  "someone's session was revoked successfully" with nothing to correlate it to. A
+  pending session has no authenticated user, so the record now says that: success is
+  false, the reason states no local user was ever established, the status that was
+  revoked and the account the client *asked* for are in metadata — the latter in
+  metadata rather than `UserID` precisely because the client chose it and the broker
+  never confirmed it. An authorized session still records the real user.
+  ([#69](https://github.com/scttfrdmn/oauth2-pam/issues/69))
+
+- **The two capacity refusals disagreed about what they were.** `SESSION_LIMIT_REACHED`
+  arrived as `status: "denied"` and `AUTH_LIMIT_REACHED` as `status: "error"`, and the
+  specification supported both readings. They are now both `error`. A capacity refusal
+  is a statement about the broker's load, not a judgement about the identity: the user
+  was not denied, the broker declined to try. This is not cosmetic — the C module maps
+  `denied` to `PAM_AUTH_ERR` and `error` to `PAM_AUTHINFO_UNAVAIL`, so under the old
+  behaviour a host that was merely full told PAM the credentials were bad.
+  ([#84](https://github.com/scttfrdmn/oauth2-pam/issues/84))
 
 - **The `audit.events` allowlist filtered before the critical-event check.** The
   events that exist specifically to be undroppable were dropped by any allowlist that
@@ -185,9 +217,12 @@ start until it is chmodded; the error names the file and the command. A negative
   ([#72](https://github.com/scttfrdmn/oauth2-pam/issues/72),
   [#73](https://github.com/scttfrdmn/oauth2-pam/issues/73))
 
-- **A negative `mapper.min_uid` is rejected.** It used to disable the UID floor, which
-  was documented as a feature; a config that silently turns off the check keeping
-  system accounts unmappable is not a feature worth keeping.
+- **The UID floor can no longer be switched off.** A negative `mapper.min_uid` used to
+  disable it, documented as a feature. It is now a startup error, and the floor check
+  itself is unconditional rather than guarded on the value being non-negative — the
+  guard was the actual mechanism, and rejecting the config while leaving the guard in
+  place would have fixed only the paths that load config from a file. A `Config` built
+  in code with a negative value clamps to the default, with a warning.
   ([#81](https://github.com/scttfrdmn/oauth2-pam/issues/81))
 
 - **`error_message` no longer carries provider-chosen text to the client.** Provider
