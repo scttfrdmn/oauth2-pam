@@ -199,8 +199,40 @@ share one budget. Returns the session's current status.
 
 ### `refresh_session`
 
-Extends an authorized session using the provider's refresh token. A pending
-session is not refreshable.
+Extends the lifetime of an authorized session. **No provider round trip is
+involved** — this verb does not exchange an OAuth2 refresh token, and a broker is
+not required to hold one; it moves the broker's own `expires_at` and nothing else.
+Earlier revisions of this document said otherwise, which was wrong about every
+implementation including this one.
+
+A refresh is an extension of something still live, never a second chance at an
+authorization, so four things are refused rather than extended:
+
+- A session that is not authorized — pending, denied, expired, errored — with
+  `SESSION_NOT_ACTIVE`.
+- A session that **has already expired**, with `status: "expired"` and
+  `SESSION_EXPIRED`. The session is removed, so a second attempt gets
+  `SESSION_NOT_FOUND`. This is the same answer `check_session` gives, and the two
+  verbs are required to agree: a broker that extends an expired session lets a
+  client route around its own expiry by choosing which verb to send. This broker
+  did exactly that until v0.3.0.
+- A session **past the broker's absolute age ceiling**, also with
+  `SESSION_EXPIRED`. A ceiling is measured from when the session was created and
+  no extension moves it, so however often a client refreshes, a session cannot
+  outlive it; reaching it revokes the token at the provider. Whether there is such
+  a ceiling and how long it is are the broker's policy — `security.max_token_age`
+  here — and a client must not infer one from `expires_at`.
+- A session whose **access token is no longer usable**, also with
+  `SESSION_EXPIRED`. The session is what authorizes use of a credential, so a
+  session outliving its credential is a shell and must not be reported as
+  authorized. One consequence is worth stating because it is easy to meet by
+  accident: a broker that never extends the stored token's own lifetime will
+  refuse a second refresh once that lifetime has passed, so refresh is not
+  indefinitely repeatable even below the age ceiling.
+
+A client cannot tell those last three apart, deliberately: all of them mean this
+session is over, start a new `authenticate`. `error_message` says which, for the
+log.
 
 ### `revoke_session`
 
