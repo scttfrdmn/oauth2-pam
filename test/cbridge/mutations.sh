@@ -84,8 +84,20 @@ run() {
         return
     fi
 
-    "$WORK/cbridge_test" >"$WORK/out" 2>&1
+    # Capped, because the failure mode of a timeout defect is a suite that blocks
+    # rather than one that fails: a mutation that removes a deadline can leave a
+    # test waiting on a peer that will never speak, and without this the run wedges
+    # instead of reporting. The honest suite finishes in a few seconds.
+    timeout 120 "$WORK/cbridge_test" >"$WORK/out" 2>&1
     local status=$?
+
+    if [ "$status" -eq 124 ]; then
+        # Neither caught nor missed: the suite never answered, so this case is
+        # evidence about nothing. Reported as a failure so it cannot pass as one.
+        echo "HUNG     $name — the suite did not finish within 120s"
+        failures=$((failures + 1))
+        return
+    fi
 
     case "$expect" in
     pass)
@@ -137,6 +149,19 @@ run "a full buffer means too large" fail \
 # not turn the mutation into a compile error.)
 run "no I/O timeout on the socket" fail \
     '$n = s/tv\.tv_sec  = seconds;/tv.tv_sec  = seconds * 0;/g'
+
+# The reply bounded per recv() again rather than as a whole. transfer_deadline
+# failing means no budget to enforce, which is the state the module was in: a peer
+# sending one byte just inside every SO_RCVTIMEO holds the login open per byte.
+run "no deadline on the whole reply, only on each recv()" fail \
+    '$n = s/(static int transfer_deadline\(int sock, int optname, struct timespec \*deadline\) \{\n)/$1    return -1;\n/g'
+
+# Mutating apply_remaining to hand back *more* time than is left is deliberately
+# not a case here: every version of it leaves a huge SO_RCVTIMEO on the socket, so
+# the silent-peer test blocks instead of failing and the run hangs rather than
+# reporting. The timeout wrapper in run() turns that into a HUNG failure rather
+# than a wedged CI job, but a mutation that can only hang is evidence about the
+# harness, not about the tests.
 
 # source_ip taking PAM_RHOST verbatim. Under `UseDNS yes` that is a hostname, and
 # a long FQDN overruns the 45 bytes the broker allows — which makes it reject the

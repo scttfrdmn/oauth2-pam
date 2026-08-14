@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 static int failures = 0;
 static int checks = 0;
@@ -38,16 +39,33 @@ static int checks = 0;
 
 /* ------------------------------------------------------------------ helpers */
 
-/* pair_with_timeout returns a connected socketpair whose first end has a short
-   receive timeout, standing in for the deadline connect_to_broker sets. Tests
-   read from fds[0] and play broker on fds[1]. */
-static void pair_with_timeout(int fds[2], int timeout_seconds) {
+/* pair_with_timeout_ms returns a connected socketpair whose first end carries the
+   I/O timeout connect_to_broker would have set, in milliseconds — sub-second
+   budgets keep the deadline cases quick. Both directions get it, because the
+   bridge reads the socket's own timeout back as the budget for a transfer and the
+   send path is bounded the same way as the receive path. Tests read from fds[0]
+   and play broker on fds[1]. */
+static void pair_with_timeout_ms(int fds[2], long timeout_ms) {
     struct timeval tv;
 
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
-    tv.tv_sec  = timeout_seconds;
-    tv.tv_usec = 0;
+    tv.tv_sec  = (time_t)(timeout_ms / 1000);
+    tv.tv_usec = (suseconds_t)(timeout_ms % 1000) * 1000;
     assert(setsockopt(fds[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0);
+    assert(setsockopt(fds[0], SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0);
+}
+
+static void pair_with_timeout(int fds[2], int timeout_seconds) {
+    pair_with_timeout_ms(fds, (long)timeout_seconds * 1000);
+}
+
+/* millis_now is the test's own monotonic clock. The deadline cases turn on tenths
+   of a second, which monotonic_seconds cannot see. */
+static long millis_now(void) {
+    struct timespec ts;
+
+    assert(clock_gettime(CLOCK_MONOTONIC, &ts) == 0);
+    return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000L;
 }
 
 static void write_n(int fd, char byte, size_t n) {
@@ -203,6 +221,104 @@ static void test_receive_rejects_a_full_buffer_without_eof(void) {
 
     CHECK(receive_auth_response(fds[0], buf, sizeof(buf)) != 0,
           "acted on a possibly-truncated response");
+
+    close(fds[0]);
+    close(fds[1]);
+}
+
+static void test_receive_bounds_a_drip_feeding_peer(void) {
+    printf("  receive_auth_response: peer sends one byte per timeout\n");
+
+    /* The defect a per-syscall timeout cannot catch. SO_RCVTIMEO bounds each
+       recv(), so a peer that sends a single byte just inside every timeout extends
+       the wait per byte and holds the login open for as long as it likes — a
+       16 KB buffer drip-fed at this rate is hours, with an sshd pre-auth child
+       held for all of them. "A deadline on every receive" was satisfied and the
+       thing it was for was not.
+
+       The child writes a byte every 200ms against a 500ms budget, so the reply
+       deadline must end the call after roughly one budget rather than after the
+       child stops talking. */
+    int fds[2];
+    char buf[RESPONSE_BUF_SIZE];
+    long start, elapsed;
+    pid_t child;
+
+    pair_with_timeout_ms(fds, 500);
+
+    child = fork();
+    assert(child != -1);
+    if (child == 0) {
+        int i;
+        close(fds[0]);
+        for (i = 0; i < 15; i++) {
+            if (write(fds[1], "x", 1) != 1) _exit(0);
+            usleep(200000);
+        }
+        /* Then hold the connection open without closing it, which is what makes
+           this a hang rather than a short reply. Bounded so that a module without
+           a reply deadline fails this case in a few seconds instead of running
+           until the 16 KB buffer fills, which at this rate is nearly an hour. */
+        sleep(5);
+        _exit(0);
+    }
+    close(fds[1]);
+
+    start = millis_now();
+    CHECK(receive_auth_response(fds[0], buf, sizeof(buf)) != 0,
+          "a drip-feeding peer was treated as a valid reply");
+    elapsed = millis_now() - start;
+    CHECK(elapsed < 1500, "took %ldms against a 500ms budget; the reply deadline did not apply",
+          elapsed);
+
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    close(fds[0]);
+}
+
+/* ------------------------------------------- transfer deadline helpers */
+
+static void test_transfer_deadline_bounds_a_whole_transfer(void) {
+    printf("  transfer_deadline: the budget is the socket's own timeout\n");
+
+    int fds[2];
+    struct timespec deadline;
+    struct timeval got;
+    socklen_t len = sizeof(got);
+    long left_ms;
+
+    /* A socket with no timeout has no budget to enforce. Refusing to talk would
+       be worse than leaving the caller the per-call bound it already had — and
+       connect_to_broker will not hand out such a socket in the first place. */
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    CHECK(transfer_deadline(fds[0], SO_RCVTIMEO, &deadline) == -1,
+          "invented a deadline for a socket with no timeout");
+    close(fds[0]);
+    close(fds[1]);
+
+    /* The send path, which the drip-feed case above cannot reach: making send()
+       block needs a peer that stops reading until the socket buffer fills, and the
+       module's requests are a few hundred bytes. Exercised through the helper
+       instead, on the option the send loop uses. */
+    pair_with_timeout_ms(fds, 2000);
+    CHECK(transfer_deadline(fds[0], SO_SNDTIMEO, &deadline) == 0,
+          "no deadline taken from a 2s SO_SNDTIMEO");
+
+    usleep(300000);
+    CHECK(apply_remaining(fds[0], SO_SNDTIMEO, &deadline) == 0,
+          "reported the budget spent while 1.7s of it was left");
+    assert(getsockopt(fds[0], SOL_SOCKET, SO_SNDTIMEO, &got, &len) == 0);
+    left_ms = (long)got.tv_sec * 1000 + got.tv_usec / 1000;
+    /* Shrunk, not renewed. A per-call timeout reset to the full budget on every
+       iteration is exactly the defect. */
+    CHECK(left_ms > 0 && left_ms <= 1700,
+          "per-call timeout is %ldms; the remaining budget was not applied", left_ms);
+
+    /* Once the budget is spent the answer is no, rather than one more syscall. */
+    assert(clock_gettime(CLOCK_MONOTONIC, &deadline) == 0);
+    deadline.tv_sec -= 1;
+    CHECK(apply_remaining(fds[0], SO_SNDTIMEO, &deadline) == -1,
+          "an elapsed deadline was treated as time remaining");
 
     close(fds[0]);
     close(fds[1]);
@@ -879,6 +995,8 @@ int main(void) {
     test_receive_rejects_an_empty_response();
     test_receive_times_out_on_a_silent_peer();
     test_receive_rejects_a_full_buffer_without_eof();
+    test_receive_bounds_a_drip_feeding_peer();
+    test_transfer_deadline_bounds_a_whole_transfer();
     test_connect_applies_the_io_timeout();
     test_send_json_survives_a_closed_peer();
     test_send_auth_request_fields();

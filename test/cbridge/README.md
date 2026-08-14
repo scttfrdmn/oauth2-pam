@@ -24,6 +24,7 @@ cannot make the broker misbehave in specific ways. These can, over a
 | a reply exactly `MAX_RESPONSE_SIZE` bytes long | the read loop stopped one byte early and rejected a complete response as "too large" |
 | one byte over the limit | must be refused, not truncated into JSON that might still parse |
 | a peer that accepts and then says nothing | without `SO_RCVTIMEO` the module blocks in `recv()` until sshd's `LoginGraceTime` kills the session; `timeout=` cannot help, it is only consulted between polls |
+| a peer that sends one byte per timeout | `SO_RCVTIMEO` bounds each `recv()`, not the reply, so a drip-feeding peer extended the wait per byte and held the login open for as long as it liked; the bound is now one absolute deadline for the whole transfer |
 | a peer that hangs up mid-request | without `MSG_NOSIGNAL`, `send()` raises SIGPIPE and **terminates sshd's pre-auth child** — a broker restart would drop the connection instead of failing the module |
 | the assembled `authenticate` request | the module sent `PAM_RHOST` as `target_host` and never sent `source_ip`, so every audit record named the client as the target and left the origin blank |
 | `error_code` parsing | `RATE_LIMITED` arrives as `status: "error"` and was treated as terminal, failing logins that were only being asked to slow down |
@@ -56,13 +57,16 @@ caught   a full buffer means too large (exit 1)
 ...
 ```
 
-Two ways a case can be inconclusive rather than reassuring, both reported as
+Three ways a case can be inconclusive rather than reassuring, all reported as
 failures rather than passes:
 
 - `SETUP` — the mutation's pattern matched nothing, or the mutated source did not
   compile. The source has moved and the mutation is no longer reintroducing the
   defect it names. Editing the bridge will eventually cause this; fix the pattern
   in `mutations.sh` rather than dropping the case.
+- `HUNG` — the suite did not finish within 120s. The failure mode of a deadline
+  defect is a test that blocks on a peer which will never speak, so each build is
+  run under `timeout`; a case that never answers is evidence about nothing.
 - `BROKEN` — the *unmutated* baseline failed. Usually this means the run is not
   privileged, the socket case skipped, and a skip counts as a failure. Run it
   under `sudo`, as the Makefile target and CI do; the container path is already

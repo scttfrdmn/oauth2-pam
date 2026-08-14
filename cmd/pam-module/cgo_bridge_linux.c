@@ -101,6 +101,79 @@ static int set_io_timeout(int sock, int seconds) {
     return 0;
 }
 
+/* transfer_deadline and apply_remaining bound a whole request or reply, not each
+   syscall.
+ *
+ * SO_RCVTIMEO and SO_SNDTIMEO expire per recv() and per send() call, which bounds
+ * a peer that says nothing but not a peer that says one byte just inside every
+ * timeout: that peer extends the wait per byte, without limit. "A deadline on
+ * every receive" is then satisfied per syscall while the thing it was for — a
+ * wedged or hostile broker cannot hang a login — is defeated. The module's own
+ * timeout= does not help either; it is only consulted between polls, and does not
+ * start counting until after the PAM conversation.
+ *
+ * So the deadline is taken once, before the first syscall, and the socket's
+ * timeout is shrunk to whatever is left of it before each one. The budget is the
+ * timeout connect_to_broker already put on the socket — see AUTH_IO_TIMEOUT and
+ * POLL_IO_TIMEOUT — read back rather than passed in, so that no caller can bound
+ * a transfer differently from the connection it runs on. The shrunk value is left
+ * on the socket, which is fine because broker_roundtrip closes it after one
+ * request and one reply.
+ *
+ * CLOCK_MONOTONIC for the reason monotonic_seconds gives below: a clock that can
+ * be stepped would either extend the wait or abandon a transfer in progress.
+ *
+ * transfer_deadline returns -1 when there is no budget to enforce — no timeout on
+ * the socket, or no usable clock — and the caller then keeps the per-call bound it
+ * already had rather than refusing to talk. */
+static int transfer_deadline(int sock, int optname, struct timespec *deadline) {
+    struct timeval tv;
+    socklen_t len = sizeof(tv);
+
+    if (getsockopt(sock, SOL_SOCKET, optname, &tv, &len) != 0) return -1;
+    if (tv.tv_sec <= 0 && tv.tv_usec <= 0) return -1;
+    if (clock_gettime(CLOCK_MONOTONIC, deadline) != 0) return -1;
+
+    deadline->tv_sec  += tv.tv_sec;
+    deadline->tv_nsec += (long)tv.tv_usec * 1000;
+    if (deadline->tv_nsec >= 1000000000L) {
+        deadline->tv_sec++;
+        deadline->tv_nsec -= 1000000000L;
+    }
+    return 0;
+}
+
+/* apply_remaining shrinks the socket's timeout to the time left before the
+   deadline. It returns -1 once the deadline has passed, which is the caller's
+   signal to give up rather than start another syscall. */
+static int apply_remaining(int sock, int optname, const struct timespec *deadline) {
+    struct timespec now;
+    struct timeval tv;
+    long remaining_ms;
+
+    /* A clock that has stopped working mid-transfer cannot say how much of the
+       budget is left. Proceed on the timeout already set — the per-call bound the
+       module had before this existed — rather than fail a login in progress over a
+       condition that cannot happen on Linux with a valid clock id. */
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+
+    remaining_ms = (long)(deadline->tv_sec - now.tv_sec) * 1000 +
+                   (deadline->tv_nsec - now.tv_nsec) / 1000000L;
+    if (remaining_ms <= 0) return -1;
+
+    tv.tv_sec  = (time_t)(remaining_ms / 1000);
+    tv.tv_usec = (suseconds_t)(remaining_ms % 1000) * 1000;
+    /* A zero timeval means "no timeout at all" to setsockopt, so the last
+       fraction of a millisecond must never round down into one. */
+    if (tv.tv_sec == 0 && tv.tv_usec == 0) tv.tv_usec = 1000;
+
+    if (setsockopt(sock, SOL_SOCKET, optname, &tv, sizeof(tv)) != 0) {
+        log_pam_message(LOG_ERR, "Failed to shrink socket timeout: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
 int connect_to_broker(const char *socket_path, int io_timeout) {
     int sock;
     struct sockaddr_un addr;
@@ -184,15 +257,25 @@ int get_user_info(pam_handle_t *pamh, const char **username, const char **servic
 
    The loop exists because a short send is legal on a stream socket. The old code
    treated one as a failure, which is at least fail-closed, but a partial request
-   also leaves the broker parsing a truncated JSON object. */
+   also leaves the broker parsing a truncated JSON object. A peer that accepts one
+   byte per timeout would otherwise keep the loop going indefinitely, so the whole
+   request is bounded by one deadline — see transfer_deadline. */
 static int send_json(int sock, json_object *req) {
     const char *req_str = json_object_to_json_string(req);
     size_t req_len = strlen(req_str);
     size_t total = 0;
+    struct timespec deadline;
+    int bounded = transfer_deadline(sock, SO_SNDTIMEO, &deadline) == 0;
 
     log_pam_message(LOG_DEBUG, "Sending request: %s", req_str);
 
     while (total < req_len) {
+        if (bounded && apply_remaining(sock, SO_SNDTIMEO, &deadline) != 0) {
+            log_pam_message(LOG_ERR,
+                            "Request deadline elapsed after sending %zu of %zu bytes",
+                            total, req_len);
+            return -1;
+        }
         ssize_t sent = send(sock, req_str + total, req_len - total, MSG_NOSIGNAL);
         if (sent <= 0) {
             if (sent == -1 && errno == EINTR) continue;
@@ -307,8 +390,17 @@ int send_check_session_request(int sock, const char *session_id) {
 int receive_auth_response(int sock, char *response, size_t response_size) {
     size_t total = 0;
     int filled = 0;
+    struct timespec deadline;
+    int bounded;
 
     if (response == NULL || response_size < 2) return -1;
+
+    /* One deadline for the whole reply, not one per recv(). Without it the only
+       bound is SO_RCVTIMEO, which a peer sending a byte just inside every timeout
+       extends per byte: a 16 KB reply drip-fed at that rate holds the login open
+       for hours, and holds an sshd pre-auth child with it. See
+       transfer_deadline. */
+    bounded = transfer_deadline(sock, SO_RCVTIMEO, &deadline) == 0;
 
     /* Loop until the broker closes the connection (n==0) or an error occurs.
        The broker writes one JSON object then immediately closes the connection,
@@ -316,6 +408,12 @@ int receive_auth_response(int sock, char *response, size_t response_size) {
        it arrives across multiple recv() calls (e.g. large device-flow payloads
        containing base64-encoded QR codes). */
     while (total < response_size - 1) {
+        if (bounded && apply_remaining(sock, SO_RCVTIMEO, &deadline) != 0) {
+            log_pam_message(LOG_ERR,
+                            "Broker still sending after the reply deadline; got %zu bytes, rejecting",
+                            total);
+            return -1;
+        }
         ssize_t n = recv(sock, response + total, response_size - 1 - total, 0);
         if (n < 0) {
             if (errno == EINTR) continue;
@@ -341,6 +439,11 @@ int receive_auth_response(int sock, char *response, size_t response_size) {
     filled = 1;
     for (;;) {
         char extra;
+        if (bounded && apply_remaining(sock, SO_RCVTIMEO, &deadline) != 0) {
+            log_pam_message(LOG_ERR,
+                            "Reply deadline elapsed with the buffer full; rejecting");
+            return -1;
+        }
         ssize_t n = recv(sock, &extra, 1, 0);
         if (n > 0) {
             log_pam_message(LOG_ERR,
