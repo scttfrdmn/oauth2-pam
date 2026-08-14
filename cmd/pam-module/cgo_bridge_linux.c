@@ -582,6 +582,40 @@ int prompt_user(pam_handle_t *pamh, const char *prompt, char *response,
     return retval;
 }
 
+/* copy_json_block copies a pre-rendered multi-line field, and drops it rather than
+   truncating it when it does not fit.
+ *
+ * The difference from copy_json_field matters for exactly one field, qr_code. The
+ * others are values — a status, a user id, a message — where a truncated copy is
+ * still a usable, if damaged, version of what was sent. Block art is not: half a QR
+ * symbol cannot be scanned, and it renders as a broken box that reads like a bug in
+ * the module rather than like "there is no QR code here". Since an absent qr_code is
+ * an ordinary reply the prompt already handles (the broker sends none above a
+ * 200-byte verification_uri), dropping an oversized one lands on a case that is
+ * already correct.
+ *
+ * The bound is the module's own. The broker sanitizes this field with
+ * SanitizePromptBlock before it goes on the wire, so escaping is not re-implemented
+ * here — but "someone else bounded it" is not a bound on the buffer this copies
+ * into. */
+static void copy_json_block(json_object *obj, const char *key,
+                            char *dst, size_t dst_size) {
+    json_object *field = NULL;
+    dst[0] = '\0';
+    if (!json_object_object_get_ex(obj, key, &field)) return;
+    if (field == NULL || json_object_get_type(field) != json_type_string) return;
+    const char *val = json_object_get_string(field);
+    if (val == NULL) return;
+    size_t len = strlen(val);
+    if (len >= dst_size) {
+        log_pam_message(LOG_WARNING,
+                        "Broker sent a %zu-byte %s; this module renders at most %zu, dropping it",
+                        len, key, dst_size - 1);
+        return;
+    }
+    memcpy(dst, val, len + 1);
+}
+
 /* copy_json_field copies a string field into a bounded buffer, leaving it as
    an empty string when the key is absent or not a string. */
 static void copy_json_field(json_object *obj, const char *key,
@@ -624,6 +658,7 @@ int parse_broker_response(const char *json_text, struct broker_response **out) {
     copy_json_field(root, "error_code",    r->error_code,    sizeof(r->error_code));
     copy_json_field(root, "error_message", r->error_message, sizeof(r->error_message));
     copy_json_field(root, "instructions",  r->instructions,  sizeof(r->instructions));
+    copy_json_block(root, "qr_code",       r->qr_code,       sizeof(r->qr_code));
 
     /* success is read strictly, because json_object_get_boolean *coerces*: any
        non-empty string and any non-zero number read as true, so "success":"false"
@@ -741,6 +776,52 @@ static void sleep_seconds(long seconds) {
     while (nanosleep(&remaining, &remaining) == -1 && errno == EINTR) {
         /* Interrupted by a signal; finish what is left of the interval. */
     }
+}
+
+/* The two fixed pieces of the device-flow prompt.
+ *
+ * PROMPT_TRAILER is why the instructions are shown as a prompt rather than as
+ * PAM_TEXT_INFO — see the call site. QR_PROMPT_HEADER is the line that used to sit
+ * above the art when the broker embedded it in instructions; it is here now because
+ * that is where the art is rendered from. The wording is unchanged, so the screen a
+ * user sees is the one they saw before #56.
+ */
+#define QR_PROMPT_HEADER "Scan QR code with your phone:"
+#define PROMPT_TRAILER   "Press Enter once you have approved the request: "
+
+/* build_device_prompt renders what the user sees: the broker's instructions, the
+   QR art when the reply carried any, and the trailer that says what to do next.
+ *
+ * The art is a field of its own on the wire and is not inside instructions — #56
+ * removed it from there because serializing it twice let a hostile
+ * verification_uri push the reply past the 16 KiB cap. The fix left this module
+ * rendering only instructions, which meant no QR code appeared at a login prompt at
+ * all; this is the other half of it. The art travels once and is drawn once.
+ *
+ * An absent or empty qr_code is the ordinary case rather than an error — above a
+ * 200-byte verification_uri the broker deliberately sends none — so it must render
+ * as a prompt with no QR section in it, not as a header with nothing under it. That
+ * is what the branch is for; there is nothing to fall back to and nothing to
+ * apologise for, because the URL and the user code are in the instructions and those
+ * are what the user acts on.
+ *
+ * Nothing is escaped here. The art is sanitized with SanitizePromptBlock before it
+ * goes on the wire (pkg/auth/broker.go), and a second, different filter in the
+ * consumer is how two implementations of one policy come to disagree. What this
+ * module owes is a bound on what it copies, and that is copy_json_block's job at
+ * parse time — by the time the field is read here it is already known to fit. */
+static void build_device_prompt(char *prompt, size_t prompt_size,
+                                const struct broker_response *r) {
+    const char *body = r->instructions[0] != '\0'
+        ? r->instructions
+        : "Device authorization required.";
+
+    if (r->qr_code[0] != '\0') {
+        snprintf(prompt, prompt_size, "%s\n%s\n%s\n%s",
+                 body, QR_PROMPT_HEADER, r->qr_code, PROMPT_TRAILER);
+        return;
+    }
+    snprintf(prompt, prompt_size, "%s\n\n%s", body, PROMPT_TRAILER);
 }
 
 /* protocol_version_supported reports whether a reply is written in a contract
@@ -891,6 +972,154 @@ static int terminal_status_to_pam(const struct broker_response *r, const char *u
     return PAM_AUTH_ERR;
 }
 
+/* free_session_data is the cleanup PAM runs when it destroys the handle this
+   session id was filed under. Without it the strdup below leaks once per login in
+   a long-lived sshd, and the id — which names a live session at the broker —
+   stays in freed heap for whatever allocates next to read. */
+static void free_session_data(pam_handle_t *pamh, void *data, int error_status) {
+    (void)pamh; (void)error_status;
+    if (data == NULL) return;
+    memset(data, 0, strlen((char *)data));
+    free(data);
+}
+
+/* remember_session_id files the authenticated session id with PAM so that
+   pam_sm_acct_mgmt can re-check the same session the auth stage established.
+
+   pam_set_data and not a file-static variable, which is the shortcut and is wrong
+   in two ways. The .so is loaded once into a process that handles many logins:
+   sshd forks per connection, but a multiplexing application does not have to, and a
+   static would then let one login's account stage validate against another login's
+   session — with no diagnostic, because both values are real. And the account stage
+   may run in a process that never ran the auth stage at all (su, cron, an sshd
+   built differently), where a static holds whatever the last caller left behind or
+   nothing at all. The PAM handle is the thing whose lifetime actually matches "this
+   login", which is why PAM offers this at all.
+
+   Failure to store is logged and otherwise ignored: it makes the account stage see
+   no session and answer PAM_IGNORE, which is the closed direction. */
+static void remember_session_id(pam_handle_t *pamh, const char *session_id) {
+    char *copy;
+    int rc;
+
+    if (session_id == NULL || session_id[0] == '\0') return;
+
+    copy = strdup(session_id);
+    if (copy == NULL) {
+        log_pam_message(LOG_WARNING,
+                        "Out of memory storing the session id; the account stage "
+                        "will have nothing to re-check");
+        return;
+    }
+    rc = pam_set_data(pamh, SESSION_DATA_KEY, copy, free_session_data);
+    if (rc != PAM_SUCCESS) {
+        log_pam_message(LOG_WARNING, "pam_set_data(%s) failed: %s",
+                        SESSION_DATA_KEY, pam_strerror(pamh, rc));
+        /* PAM took no ownership, so this side still owns it. */
+        free(copy);
+    }
+}
+
+/* account_status_to_pam maps a check_session reply to an account-management
+   result. It is the account stage's whole decision and is deliberately not
+   terminal_status_to_pam: the two stages answer different questions and PAM
+   distinguishes their return codes. Authentication answers "is this the user",
+   whose refusal is PAM_AUTH_ERR; account management answers "may this user log in
+   now", whose refusal is PAM_PERM_DENIED. Returning PAM_AUTH_ERR here would tell
+   sshd the password was wrong, and it would offer a retry for a session that has
+   been revoked.
+
+   Every branch that is not "authorized, for this user" denies. There is no status
+   worth treating as probably fine: this runs after authentication succeeded, so
+   the only reason to re-ask is that the answer may have changed, and an answer
+   that cannot be read is not an answer that says yes. */
+static int account_status_to_pam(const struct broker_response *r, const char *username) {
+    if (strcmp(r->status, STATUS_AUTHORIZED) == 0) {
+        /* Same check the auth stage makes, called rather than restated: a second
+           spelling of "does the returned user match" is a second thing that can be
+           weakened on its own, and this one guards the stage that runs after the
+           password prompt is over. */
+        if (authorized_for(r, username)) {
+            log_pam_message(LOG_DEBUG, "Account check passed for %s", username);
+            return PAM_SUCCESS;
+        }
+        log_pam_message(LOG_ERR,
+                        "Broker still reports an authorized session, but not for %s; "
+                        "denying the account stage", username);
+        return PAM_PERM_DENIED;
+    }
+
+    /* "error" splits, and the split is the same one the auth stage makes: some
+       error codes mean the broker declined to answer rather than answered "no".
+       RATE_LIMITED is the limiter's window, RESPONSE_TOO_LARGE is a reply that did
+       not fit the cap — in both the module has no information, so it says so and
+       lets the rest of the stack decide, instead of denying a login on the strength
+       of a message that was never about the user.
+
+       SESSION_NOT_FOUND is *not* in this class, even though it is also an "error":
+       a session the broker has forgotten, revoked or expired out of its store is
+       precisely the case issue #75 is about, and "I have no record of this" has to
+       deny. */
+    if (strcmp(r->status, STATUS_ERROR) == 0 &&
+        (is_rate_limited(r) ||
+         strcmp(r->error_code, ERROR_CODE_RESPONSE_TOO_LARGE) == 0)) {
+        log_pam_message(LOG_WARNING,
+                        "Broker could not answer the account check for %s (%s); "
+                        "reporting the session as unverifiable", username, r->error_code);
+        return PAM_AUTHINFO_UNAVAIL;
+    }
+
+    /* denied, expired, error/SESSION_NOT_FOUND, a pending session that should not
+       be pending after a successful authentication, and any status this module has
+       never heard of. */
+    log_pam_message(LOG_NOTICE,
+                    "Account check for %s refused: broker reports status=%s (%s: %s)",
+                    username, r->status, r->error_code, r->error_message);
+    return PAM_PERM_DENIED;
+}
+
+/* account_decision is pam_sm_acct_mgmt with the PAM handle taken out, so that the
+   test suite can drive every branch: pam_set_data and pam_get_data refuse to run
+   outside a service module (they check __PAM_FROM_APP), so a test cannot build a
+   handle carrying session data and ask the real entry point.
+
+   session_id NULL or empty means this module did not authenticate this login. */
+static int account_decision(const struct module_options *opts, const char *username,
+                            const char *session_id) {
+    struct broker_response *r = NULL;
+    int rc;
+
+    if (session_id == NULL || session_id[0] == '\0') {
+        /* PAM_IGNORE: "this is not my business", the one honest answer when the
+           module has no session of its own to check. Not PAM_SUCCESS — approving a
+           login this module knows nothing about is fail-open, and it would make
+           `account required oauth2_pam.so` silently approve every account on the
+           host, including logins that never went near a device flow. PAM_IGNORE is
+           also safe in a stack of one: Linux-PAM turns an all-PAM_IGNORE account
+           stack into PAM_PERM_DENIED rather than success. */
+        log_pam_message(LOG_DEBUG,
+                        "No session of this module's for %s; leaving the account "
+                        "decision to the rest of the stack", username);
+        return PAM_IGNORE;
+    }
+
+    if (broker_roundtrip(opts, POLL_IO_TIMEOUT, send_check_cb,
+                         (void *)session_id, &r) != 0) {
+        /* Unreachable broker, a connection that dies mid-reply, a reply that is
+           not JSON, a reply over the cap, a protocol version this module cannot
+           read: broker_roundtrip has already logged which. None of them is a
+           statement about the user, so none of them is a denial. */
+        log_pam_message(LOG_ERR,
+                        "Could not re-check the session for %s at the account stage",
+                        username);
+        return PAM_AUTHINFO_UNAVAIL;
+    }
+
+    rc = account_status_to_pam(r, username);
+    free(r);
+    return rc;
+}
+
 /* poll_for_authorization polls check_session until the outcome is known or the
    deadline passes. */
 static int poll_for_authorization(pam_handle_t *pamh, const struct module_options *opts,
@@ -902,8 +1131,6 @@ static int poll_for_authorization(pam_handle_t *pamh, const struct module_option
     /* Grows only while the broker is throttling us, and resets as soon as it
        answers again. */
     int backoff = poll_interval;
-
-    (void)pamh;
 
     for (;;) {
         int wait = poll_interval;
@@ -943,6 +1170,10 @@ static int poll_for_authorization(pam_handle_t *pamh, const struct module_option
                 int ok = authorized_for(r, username);
                 free(r);
                 if (!ok) return PAM_AUTH_ERR;
+                /* Only now, with the reply verified against this login's user: the
+                   account stage trusts what it finds here, so a session id stored
+                   before the check would hand it a session that failed one. */
+                remember_session_id(pamh, session_id);
                 log_pam_message(LOG_INFO, "Authentication successful for user: %s", username);
                 return PAM_SUCCESS;
             }
@@ -980,8 +1211,8 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
         return PAM_AUTHINFO_UNAVAIL;
     }
 
-    log_pam_message(LOG_INFO, "%s v%s authentication started",
-                    PAM_MODULE_NAME, PAM_MODULE_VERSION);
+    log_pam_message(LOG_INFO, "%s v%s (%s) authentication started",
+                    PAM_MODULE_NAME, PAM_MODULE_VERSION, PAM_MODULE_BUILD);
 
     retval = get_user_info(pamh, &username, &service, &rhost, &tty);
     if (retval != PAM_SUCCESS) return retval;
@@ -999,6 +1230,12 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
        cached session. */
     if (strcmp(r->status, STATUS_AUTHORIZED) == 0) {
         int ok = authorized_for(r, username);
+        /* Same rule as the polling path: store only a session that passed the
+           check, and read it out of the reply before it is freed. A cached
+           authorization with no session id in it stores nothing, and the account
+           stage then answers PAM_IGNORE — correct, since there would be no handle
+           to re-check. */
+        if (ok) remember_session_id(pamh, r->session_id);
         free(r);
         return ok ? PAM_SUCCESS : PAM_AUTH_ERR;
     }
@@ -1027,7 +1264,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
         poll_interval = r->poll_interval;
     }
 
-    /* Phase 2: show the code, then wait.
+    /* Phase 2: show the code and the QR art, then wait.
      *
      * The instructions go out as a prompt rather than PAM_TEXT_INFO because
      * OpenSSH buffers informational messages and may not flush them until
@@ -1036,11 +1273,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
      * screen and gives the user a natural way to say "I have approved".
      */
     char prompt[MAX_PROMPT_SIZE];
-    const char *body = r->instructions[0] != '\0'
-        ? r->instructions
-        : "Device authorization required.";
-    snprintf(prompt, sizeof(prompt),
-             "%s\n\nPress Enter once you have approved the request: ", body);
+    build_device_prompt(prompt, sizeof(prompt), r);
     free(r);
     r = NULL;
 
@@ -1070,14 +1303,50 @@ PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh, int flags,
     return PAM_SUCCESS;
 }
 
+/* pam_sm_acct_mgmt re-asks the broker whether the session this login
+   authenticated with is still authorized for this account (issue #75).
+ *
+ * It used to return PAM_SUCCESS with a comment saying authorization had been
+ * decided during authentication. That is true at the instant authentication
+ * finishes and stops being true immediately afterwards, which is the entire reason
+ * PAM has a separate account stage: between the two, an operator can revoke the
+ * enrollment, the provider can revoke the grant, and `oauth2-pam-admin` can delete
+ * the session. A module that answers "yes, decided earlier" cannot notice any of
+ * it, and an `account required` line naming it is then documentation rather than a
+ * control.
+ *
+ * The cost is one more round trip to a Unix socket on the same host, against a
+ * broker that answers check_session out of its own state without leaving the
+ * machine — which is why POLL_IO_TIMEOUT and not AUTH_IO_TIMEOUT.
+ */
 PAM_EXTERN int pam_sm_acct_mgmt(pam_handle_t *pamh, int flags,
                                  int argc, const char **argv) {
+    const char *username = NULL, *service = NULL, *rhost = NULL, *tty = NULL;
     struct module_options opts;
-    (void)pamh; (void)flags;
+    const void *data = NULL;
+    int retval;
+
+    (void)flags;
+
     parse_arguments(argc, argv, &opts);
-    /* Authorization was decided during authentication: the broker only issues
-       an authorized status for an identity that mapped to this account. */
-    return PAM_SUCCESS;
+
+    if (validate_socket_path(opts.socket_path) != 0) {
+        log_pam_message(LOG_ERR, "Invalid socket path: %s", opts.socket_path);
+        return PAM_AUTHINFO_UNAVAIL;
+    }
+
+    retval = get_user_info(pamh, &username, &service, &rhost, &tty);
+    if (retval != PAM_SUCCESS) return retval;
+
+    /* PAM_NO_MODULE_DATA when the auth stage never stored anything — a login that
+       authenticated by some other means, or one where this module was not in the
+       auth stack at all. Collapsed into a NULL session id so that account_decision
+       is the single place the "not my business" answer is written down. */
+    if (pam_get_data(pamh, SESSION_DATA_KEY, &data) != PAM_SUCCESS) {
+        data = NULL;
+    }
+
+    return account_decision(&opts, username, (const char *)data);
 }
 
 PAM_EXTERN int pam_sm_open_session(pam_handle_t *pamh, int flags,

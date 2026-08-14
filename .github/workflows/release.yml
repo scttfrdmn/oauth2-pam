@@ -94,12 +94,14 @@ jobs:
         run: |
           {
             echo "version=${GITHUB_REF_NAME}"
+            echo "commit=$(git rev-parse --short HEAD)"
+            echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "ldflags=-s -w -X main.version=${GITHUB_REF_NAME} -X main.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ) -X main.gitCommit=$(git rev-parse --short HEAD)"
           } >> "$GITHUB_OUTPUT"
 
-      # Native runners rather than cross-compilation: the module is
-      # -buildmode=c-shared against the host's libpam and libjson-c, so an arm64
-      # artifact has to be linked on arm64.
+      # Native runners rather than cross-compilation: the module is a shared object
+      # linked against the host's libpam and libjson-c, so an arm64 artifact has to
+      # be compiled and linked on arm64.
       - name: Build the three binaries
         env:
           CGO_ENABLED: 0
@@ -113,14 +115,23 @@ jobs:
               -o "bin/${c#*:}" "./cmd/${c%%:*}"
           done
 
+      # `make build-pam`, not a compile line written out again here. The module is
+      # plain C since issue #65 and its hardening flags — -D_FORTIFY_SOURCE=2 and
+      # not 3, no -fcf-protection, RELRO/BIND_NOW, the stack protector — live in
+      # the Makefile with the reasoning attached. A release built from a second copy
+      # of that command line is a release whose mitigations depend on the two copies
+      # staying equal.
+      #
+      # The version reaches the C as a -D macro rather than through -ldflags, which
+      # set Go symbols that no longer exist in this artifact. It is passed as make
+      # variables rather than let git describe answer, because the tag is what a
+      # release is stamped with.
       - name: Build the PAM module
         env:
-          CGO_ENABLED: 1
-          LDFLAGS: ${{ steps.vars.outputs.ldflags }}
-        run: |
-          go build -buildmode=c-shared -trimpath -ldflags="$LDFLAGS" \
-            -o bin/oauth2_pam.so ./cmd/pam-module
-          rm -f bin/oauth2_pam.h
+          VERSION: ${{ steps.vars.outputs.version }}
+          GIT_COMMIT: ${{ steps.vars.outputs.commit }}
+          BUILD_DATE: ${{ steps.vars.outputs.build_date }}
+        run: make build-pam
 
       # The release gate, not a formality. v0.1.1 published a .so with none of
       # these symbols and nothing noticed for a month; the sister project is

@@ -233,6 +233,64 @@ run "every terminal status is a successful login" fail \
 run "an unknown broker status grants the login" fail \
     '$n = s/(    log_pam_message\(LOG_ERR, "Unknown broker status .*\n.*\n)    return PAM_AUTH_ERR;/$1    return PAM_SUCCESS;/g'
 
+# The account stage (issue #75). Its whole reason to exist is that authorization can
+# be withdrawn after authentication succeeded, so every mutation below is a version
+# of the stage this module shipped before: one that answers "fine, decided earlier".
+#
+# A login this module did not authenticate answering PAM_SUCCESS instead of
+# PAM_IGNORE. This is the fail-open shape of the stage, and it is worse than it
+# looks: `account required oauth2_pam.so` in a stack would then approve every
+# account on the host, including logins that never went near a device flow.
+run "a login with no session of ours is approved" fail \
+    '$n = s/        return PAM_IGNORE;/        return PAM_SUCCESS;/g'
+
+# The mapping stops mapping: denied, expired, a revoked session and a status from
+# a contract this module does not implement all become a valid login.
+run "every account status is a valid login" fail \
+    '$n = s/(static int account_status_to_pam\(const struct broker_response \*r, const char \*username\) \{\n)/$1    return PAM_SUCCESS;\n/g'
+
+# The username verification dropped from the account path — the auth-stage bypass
+# one stage later. The broker's session is genuinely authorized; it just belongs to
+# somebody else. This is what reusing authorized_for is for, and this mutation is
+# what proves the reuse is load-bearing rather than decorative.
+run "the account stage ignores which user the session belongs to" fail \
+    '$n = s/if \(authorized_for\(r, username\)\) \{/if (1) {/g'
+
+# A refusal reported as PAM_AUTH_ERR rather than PAM_PERM_DENIED. Both are
+# failures, so a suite that only asserted "not success" would call this equivalent
+# — it is not: PAM_AUTH_ERR tells sshd the credential was wrong, and sshd's answer
+# to that is to offer the user another attempt at a session that has been revoked.
+run "the account stage reports a revoked session as a bad password" fail \
+    '$n = s/return PAM_PERM_DENIED;/return PAM_AUTH_ERR;/g'
+
+# A broker that cannot be reached at the account stage treated as a pass. Nothing
+# answered, so there is nothing to be reassured by.
+run "an unverifiable session is approved" fail \
+    '$n = s/(Could not re-check the session.*?)return PAM_AUTHINFO_UNAVAIL;/$1return PAM_SUCCESS;/s'
+
+# The QR code at the login prompt. Since the #56 fix the art travels in its own
+# wire field, and these are the two ways it stops reaching the screen.
+#
+# The field never read, which is the regression itself: the module renders
+# instructions alone and the QR code silently disappears from every login. The key
+# is renamed rather than the call deleted, because deleting it leaves
+# copy_json_block defined and uncalled, and -Werror turns that into a compile error
+# instead of a mutation.
+run "the qr_code field is never read" fail \
+    '$n = s/copy_json_block\(root, "qr_code"/copy_json_block(root, "not_a_field"/g'
+
+# The caption emitted whether or not there is art under it. A dangling "Scan QR
+# code with your phone:" above the Enter prompt is worse than saying nothing: the
+# user waits for a code that is not coming.
+run "the QR caption is printed with no art under it" fail \
+    "\$n = s/if \\(r->qr_code\\[0\\] != '\\\\0'\\) \\{/if (1) {/g"
+
+# The module's own bound on the art turned into a truncating copy. Half a QR symbol
+# is not scannable, and a partial box reads as a rendering bug rather than as "no QR
+# code here" — which is a case the prompt already handles correctly.
+run "oversized QR art is truncated rather than dropped" fail \
+    '$n = s/(if \(len >= dst_size\) \{).*?return;/$1 len = dst_size - 1; memcpy(dst, val, len); dst[len] = 0; return;/s'
+
 echo
 if [ "$failures" -ne 0 ]; then
     echo "$failures case(s) failed — a regression test is not protecting what it claims to"

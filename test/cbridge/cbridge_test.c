@@ -950,6 +950,474 @@ static void test_terminal_status_to_pam(void) {
     }
 }
 
+/* --------------------------------------------------- the account stage */
+
+static void test_account_status_to_pam(void) {
+    printf("  account_status_to_pam: a revoked session is not a login\n");
+
+    /* The account stage answers a different question from the auth stage — "may
+       this user log in now", asked after authentication already said "yes, this is
+       the user" — and PAM has different return codes for the two. Both halves are
+       asserted here: that nothing but a verified authorization returns
+       PAM_SUCCESS, and that the refusal is PAM_PERM_DENIED rather than
+       PAM_AUTH_ERR. Reporting a revoked session as PAM_AUTH_ERR tells sshd the
+       password was wrong, and sshd's answer to that is to offer another try. */
+    struct broker_response *r;
+    int rc;
+
+    r = parsed("{\"success\":true,\"status\":\"authorized\",\"user_id\":\"alice\"}");
+    CHECK(r != NULL, "a still-authorized reply did not parse");
+    if (r != NULL) {
+        rc = account_status_to_pam(r, "alice");
+        CHECK(rc == PAM_SUCCESS, "a live session for alice mapped to %d, want PAM_SUCCESS (%d)",
+              rc, PAM_SUCCESS);
+
+        /* The same bypass the auth stage guards against, one stage later: a
+           session that is genuinely authorized, for somebody else. This is why the
+           account stage reuses authorized_for instead of trusting the status
+           word. */
+        rc = account_status_to_pam(r, "bob");
+        CHECK(rc == PAM_PERM_DENIED,
+              "a session authorized for alice let bob through the account stage (%d)", rc);
+        rc = account_status_to_pam(r, "alic");
+        CHECK(rc == PAM_PERM_DENIED, "a prefix of the authorized user passed the account stage (%d)", rc);
+        free(r);
+    }
+
+    /* status and success disagreeing is not something this stage can act on
+       either — inherited from authorized_for, and asserted here so that the reuse
+       cannot be undone without a failure. */
+    r = parsed("{\"success\":false,\"status\":\"authorized\",\"user_id\":\"alice\"}");
+    CHECK(r != NULL, "an authorized/success=false reply did not parse");
+    if (r != NULL) {
+        rc = account_status_to_pam(r, "alice");
+        CHECK(rc == PAM_PERM_DENIED, "authorized with success=false passed the account stage (%d)", rc);
+        free(r);
+    }
+
+    /* The headline case of issue #75: the operator deleted the session, or the
+       provider revoked the grant, between authentication and the account stage. */
+    r = parsed("{\"status\":\"error\",\"error_code\":\"SESSION_NOT_FOUND\","
+               "\"error_message\":\"no such session\"}");
+    CHECK(r != NULL, "a session-not-found reply did not parse");
+    if (r != NULL) {
+        rc = account_status_to_pam(r, "alice");
+        CHECK(rc == PAM_PERM_DENIED,
+              "a session the broker has no record of mapped to %d, want PAM_PERM_DENIED (%d)",
+              rc, PAM_PERM_DENIED);
+        free(r);
+    }
+
+    r = parsed("{\"status\":\"denied\",\"error_message\":\"removed from the team\"}");
+    CHECK(r != NULL, "a denied reply did not parse");
+    if (r != NULL) {
+        rc = account_status_to_pam(r, "alice");
+        CHECK(rc == PAM_PERM_DENIED, "denied mapped to %d, want PAM_PERM_DENIED (%d)",
+              rc, PAM_PERM_DENIED);
+        free(r);
+    }
+
+    r = parsed("{\"status\":\"expired\"}");
+    CHECK(r != NULL, "an expired reply did not parse");
+    if (r != NULL) {
+        rc = account_status_to_pam(r, "alice");
+        CHECK(rc == PAM_PERM_DENIED, "expired mapped to %d, want PAM_PERM_DENIED (%d)",
+              rc, PAM_PERM_DENIED);
+        free(r);
+    }
+
+    /* "pending" is a perfectly ordinary status during authentication and a
+       nonsensical one afterwards: the login it belongs to was already granted. It
+       is not "probably fine, still working on it" — it denies with everything
+       else. */
+    r = parsed("{\"status\":\"pending\",\"session_id\":\"abc\"}");
+    CHECK(r != NULL, "a pending reply did not parse");
+    if (r != NULL) {
+        rc = account_status_to_pam(r, "alice");
+        CHECK(rc == PAM_PERM_DENIED,
+              "a pending session passed the account stage as %d", rc);
+        free(r);
+    }
+
+    /* A status from a contract this module does not implement. Fails closed, and
+       closed here is a denial and not "ask someone else": the broker answered. */
+    r = parsed("{\"status\":\"stillfine\",\"success\":true,\"user_id\":\"alice\"}");
+    CHECK(r != NULL, "an unknown status did not parse");
+    if (r != NULL) {
+        rc = account_status_to_pam(r, "alice");
+        CHECK(rc == PAM_PERM_DENIED, "an unknown status mapped to %d, want PAM_PERM_DENIED (%d)",
+              rc, PAM_PERM_DENIED);
+        free(r);
+    }
+
+    r = parsed("{\"success\":true,\"user_id\":\"alice\"}");
+    CHECK(r != NULL, "a reply with no status did not parse");
+    if (r != NULL) {
+        rc = account_status_to_pam(r, "alice");
+        CHECK(rc == PAM_PERM_DENIED, "a missing status mapped to %d, want PAM_PERM_DENIED (%d)",
+              rc, PAM_PERM_DENIED);
+        free(r);
+    }
+
+    /* The two codes that mean the broker declined to answer rather than answered.
+       PAM_AUTHINFO_UNAVAIL, so the rest of the stack may decide — the module has
+       no information about this user, and inventing a denial from a throttled
+       request would lock out a host whose limiter window happened to be full. */
+    r = parsed("{\"status\":\"error\",\"error_code\":\"RATE_LIMITED\"}");
+    CHECK(r != NULL, "a rate-limited reply did not parse");
+    if (r != NULL) {
+        rc = account_status_to_pam(r, "alice");
+        CHECK(rc == PAM_AUTHINFO_UNAVAIL,
+              "RATE_LIMITED mapped to %d, want PAM_AUTHINFO_UNAVAIL (%d)", rc, PAM_AUTHINFO_UNAVAIL);
+        free(r);
+    }
+
+    r = parsed("{\"status\":\"error\",\"error_code\":\"RESPONSE_TOO_LARGE\"}");
+    CHECK(r != NULL, "an over-cap reply did not parse");
+    if (r != NULL) {
+        CHECK(strcmp(r->error_code, ERROR_CODE_RESPONSE_TOO_LARGE) == 0,
+              "error_code = %s", r->error_code);
+        rc = account_status_to_pam(r, "alice");
+        CHECK(rc == PAM_AUTHINFO_UNAVAIL,
+              "RESPONSE_TOO_LARGE mapped to %d, want PAM_AUTHINFO_UNAVAIL (%d)",
+              rc, PAM_AUTHINFO_UNAVAIL);
+        free(r);
+    }
+}
+
+/* fake_broker_reply forks a one-shot broker on path: it accepts a single
+   connection, copies whatever request it receives into req_pipe, answers with
+   reply and hangs up. Returns the child pid. */
+static pid_t fake_broker_reply(int listener, const char *reply, int req_pipe) {
+    pid_t pid = fork();
+
+    assert(pid != -1);
+    if (pid != 0) return pid;
+
+    /* Child. No CHECK() in here: its counters die with it, and a FAIL printed from
+       a forked copy of the suite would be counted nowhere. It reports by what it
+       puts on the two file descriptors. */
+    char buf[4096];
+    int conn = accept(listener, NULL, NULL);
+
+    if (conn != -1) {
+        ssize_t n = recv(conn, buf, sizeof(buf) - 1, 0);
+        if (n > 0) {
+            /* Small enough to fit the pipe buffer, so this cannot deadlock with
+               the parent, which reads only after account_decision returns. */
+            if (write(req_pipe, buf, (size_t)n) < 0) { /* the parent will see none */ }
+        }
+        if (write(conn, reply, strlen(reply)) < 0) { /* likewise */ }
+        /* Hanging up is the end of the reply: the module reads until EOF. */
+        close(conn);
+    }
+    close(req_pipe);
+    close(listener);
+    _exit(0);
+}
+
+static void test_account_decision(void) {
+    printf("  account_decision: the round trip, and what happens without one\n");
+
+    struct module_options opts;
+    const char *none[] = { NULL };
+    int rc;
+
+    parse_arguments(0, none, &opts);
+
+    /* No session data means this module did not authenticate this login: some
+       other module did, or none did. PAM_IGNORE — "not my business".
+       Emphatically not PAM_SUCCESS: `account required oauth2_pam.so` would then
+       approve every account on the host, including logins that never went near a
+       device flow, which is the fail-open shape of this whole stage. PAM_IGNORE is
+       safe even as the only module in the account stack, because Linux-PAM turns an
+       all-ignored stack into PAM_PERM_DENIED. */
+    rc = account_decision(&opts, "alice", NULL);
+    CHECK(rc == PAM_IGNORE, "a login with no session of ours mapped to %d, want PAM_IGNORE (%d)",
+          rc, PAM_IGNORE);
+    CHECK(rc != PAM_SUCCESS, "a login this module knows nothing about was approved");
+
+    /* Same thing spelled with an empty string, which is what a stored-but-empty
+       session id would look like. */
+    rc = account_decision(&opts, "alice", "");
+    CHECK(rc == PAM_IGNORE, "an empty session id mapped to %d, want PAM_IGNORE (%d)", rc, PAM_IGNORE);
+
+    /* A session id we cannot check, because nothing is listening. The path is one
+       validate_socket_path accepts and deliberately does not exist, so this needs
+       no privileges: a broker that is stopped is the ordinary case here. Not a
+       denial — the module has no information — but not a success either. */
+    opts.socket_path = "/run/oauth2-pam/cbridge-nothing-here.sock";
+    rc = account_decision(&opts, "alice", "session-abc");
+    CHECK(rc == PAM_AUTHINFO_UNAVAIL,
+          "an unreachable broker mapped to %d, want PAM_AUTHINFO_UNAVAIL (%d)",
+          rc, PAM_AUTHINFO_UNAVAIL);
+
+    /* And a real round trip. Needs the one directory validate_socket_path accepts,
+       which means root; the skip is counted as a failure by default (see main). */
+    const char *dir  = "/run/oauth2-pam";
+    const char *path = "/run/oauth2-pam/cbridge-acct.sock";
+    struct sockaddr_un addr;
+    int listener;
+
+    if (mkdir(dir, 0750) != 0 && errno != EEXIST) {
+        printf("    SKIP: cannot create %s (%s); run as root to cover this\n",
+               dir, strerror(errno));
+        skipped++;
+        return;
+    }
+
+    listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    assert(listener != -1);
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+    unlink(path);
+    if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        printf("    SKIP: cannot bind %s (%s); run as root to cover this\n",
+               path, strerror(errno));
+        skipped++;
+        close(listener);
+        return;
+    }
+    assert(listen(listener, 1) == 0);
+    opts.socket_path = path;
+
+    struct {
+        const char *name;
+        const char *reply;
+        int want;
+    } cases[] = {
+        { "a live session",
+          "{\"success\":true,\"status\":\"authorized\",\"user_id\":\"alice\"}",
+          PAM_SUCCESS },
+        /* The session the operator revoked between the two stages. */
+        { "a deleted session",
+          "{\"status\":\"error\",\"error_code\":\"SESSION_NOT_FOUND\"}",
+          PAM_PERM_DENIED },
+        /* Authorized, for somebody else. */
+        { "a session belonging to another user",
+          "{\"success\":true,\"status\":\"authorized\",\"user_id\":\"bob\"}",
+          PAM_PERM_DENIED },
+        /* A reply the module cannot read at all is not an answer about the user. */
+        { "a reply that is not JSON", "this is not a reply", PAM_AUTHINFO_UNAVAIL },
+        /* A contract this module does not implement, saying the magic word. */
+        { "a future protocol version",
+          "{\"protocol_version\":2,\"success\":true,\"status\":\"authorized\","
+          "\"user_id\":\"alice\"}",
+          PAM_AUTHINFO_UNAVAIL },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        int pipefd[2];
+        char req[4096];
+        ssize_t n;
+        pid_t pid;
+
+        assert(pipe(pipefd) == 0);
+        pid = fake_broker_reply(listener, cases[i].reply, pipefd[1]);
+        close(pipefd[1]);
+
+        rc = account_decision(&opts, "alice", "session-abc");
+        CHECK(rc == cases[i].want, "%s mapped to %d, want %d", cases[i].name, rc, cases[i].want);
+
+        n = read(pipefd[0], req, sizeof(req) - 1);
+        req[n > 0 ? (size_t)n : 0] = '\0';
+        close(pipefd[0]);
+        waitpid(pid, NULL, 0);
+
+        /* The request must name the session the auth stage stored, and it must be
+           a check_session — an account stage that started a fresh device flow
+           would prompt the user again after they had already logged in. */
+        json_object *sent = json_tokener_parse(req);
+        CHECK(sent != NULL, "%s: the request was not JSON: %s", cases[i].name, req);
+        if (sent != NULL) {
+            const char *type = field(sent, "type");
+            const char *sid  = field(sent, "session_id");
+            CHECK(type != NULL && strcmp(type, "check_session") == 0,
+                  "%s: request type is %s, want check_session", cases[i].name,
+                  type == NULL ? "(absent)" : type);
+            CHECK(sid != NULL && strcmp(sid, "session-abc") == 0,
+                  "%s: request carried session_id %s, want the stored one",
+                  cases[i].name, sid == NULL ? "(absent)" : sid);
+            json_object_put(sent);
+        }
+    }
+
+    close(listener);
+    unlink(path);
+}
+
+/* -------------------------------------------------------- the QR code */
+
+static void test_parse_reads_the_qr_code(void) {
+    printf("  parse_broker_response: qr_code is its own bounded field\n");
+
+    /* Since the #56 fix the art travels in qr_code instead of being pasted into
+       instructions, and for a while nothing here read that field — so the module
+       rendered instructions alone and the QR code silently disappeared from the
+       login prompt. */
+    struct broker_response *r;
+
+    r = parsed("{\"status\":\"pending\",\"session_id\":\"abc\","
+               "\"instructions\":\"Go to https://example.test and enter ABCD-1234\","
+               "\"qr_code\":\"##  ##\\n  ##  \"}");
+    CHECK(r != NULL, "a reply with a qr_code did not parse");
+    if (r != NULL) {
+        CHECK(strcmp(r->qr_code, "##  ##\n  ##  ") == 0, "qr_code = [%s]", r->qr_code);
+        CHECK(strstr(r->instructions, "ABCD-1234") != NULL,
+              "instructions lost their content: [%s]", r->instructions);
+        free(r);
+    }
+
+    /* No art is an ordinary reply, not an error: above a 200-byte
+       verification_uri the broker deliberately sends none. */
+    r = parsed("{\"status\":\"pending\",\"session_id\":\"abc\",\"instructions\":\"Go here\"}");
+    CHECK(r != NULL, "a reply without a qr_code did not parse");
+    if (r != NULL) {
+        CHECK(r->qr_code[0] == '\0', "an absent qr_code became [%s]", r->qr_code);
+        free(r);
+    }
+
+    /* A qr_code that is not a string is not art. It must leave the field empty
+       rather than whatever json-c's coercion makes of it. */
+    r = parsed("{\"status\":\"pending\",\"session_id\":\"abc\",\"qr_code\":42}");
+    CHECK(r != NULL, "a reply with a numeric qr_code did not parse");
+    if (r != NULL) {
+        CHECK(r->qr_code[0] == '\0', "a numeric qr_code became [%s]", r->qr_code);
+        free(r);
+    }
+
+    /* Art the module will not render. The broker caps the URL it encodes, so this
+       cannot come from one honouring the contract — which is exactly why the bound
+       is enforced here and not assumed there. The rest of the reply still parses:
+       the URL and the user code are in instructions, and those are what the user
+       acts on. */
+    {
+        size_t art = MAX_QR_CODE_LEN + 64;
+        size_t cap = art + 256;
+        char *json = malloc(cap);
+        assert(json != NULL);
+        int head = snprintf(json, cap,
+                            "{\"status\":\"pending\",\"session_id\":\"abc\","
+                            "\"instructions\":\"Go to https://example.test\","
+                            "\"qr_code\":\"");
+        assert(head > 0 && (size_t)head < cap);
+        memset(json + head, '#', art);
+        assert(snprintf(json + head + art, cap - (size_t)head - art, "\"}") > 0);
+
+        r = parsed(json);
+        CHECK(r != NULL, "a reply with oversized art did not parse");
+        if (r != NULL) {
+            CHECK(r->qr_code[0] == '\0',
+                  "%zu bytes of art were copied into a %d-byte field", art, MAX_QR_CODE_LEN);
+            CHECK(strstr(r->instructions, "example.test") != NULL,
+                  "oversized art cost the user their instructions");
+            free(r);
+        }
+        free(json);
+    }
+
+    /* The largest art that does fit, to prove the bound is off-by-none: one byte
+       short of the field, plus its terminator. */
+    {
+        size_t art = MAX_QR_CODE_LEN - 1;
+        size_t cap = art + 256;
+        char *json = malloc(cap);
+        assert(json != NULL);
+        int head = snprintf(json, cap, "{\"status\":\"pending\",\"qr_code\":\"");
+        assert(head > 0);
+        memset(json + head, '#', art);
+        assert(snprintf(json + head + art, cap - (size_t)head - art, "\"}") > 0);
+
+        r = parsed(json);
+        CHECK(r != NULL, "a reply with maximal art did not parse");
+        if (r != NULL) {
+            CHECK(strlen(r->qr_code) == art, "maximal art became %zu bytes, want %zu",
+                  strlen(r->qr_code), art);
+            free(r);
+        }
+        free(json);
+    }
+}
+
+static void test_build_device_prompt(void) {
+    printf("  build_device_prompt: the art reaches the screen, or nothing does\n");
+
+    /* What the user actually sees. Before #56 the art was inside instructions and
+       this was one string; afterwards the wire carried it once, in its own field,
+       and the prompt had to put the two back together. The regression this covers
+       is a login prompt with no QR code on it. */
+    struct broker_response *r;
+    char prompt[MAX_PROMPT_SIZE];
+
+    r = parsed("{\"status\":\"pending\",\"session_id\":\"abc\","
+               "\"instructions\":\"Go to https://example.test and enter ABCD-1234\","
+               "\"qr_code\":\"##  ##\\n  ##  \"}");
+    CHECK(r != NULL, "the reply did not parse");
+    if (r != NULL) {
+        build_device_prompt(prompt, sizeof(prompt), r);
+        CHECK(strstr(prompt, "ABCD-1234") != NULL, "the user code is missing: [%s]", prompt);
+        CHECK(strstr(prompt, "##  ##\n  ##  ") != NULL, "the art is missing: [%s]", prompt);
+        CHECK(strstr(prompt, QR_PROMPT_HEADER) != NULL, "the art has no caption: [%s]", prompt);
+        CHECK(strstr(prompt, PROMPT_TRAILER) != NULL,
+              "the prompt does not say what to do next: [%s]", prompt);
+        /* Order matters on a terminal: the caption has to precede the art it
+           captions, and the "press Enter" line has to be last, where the cursor
+           sits. */
+        CHECK(strstr(prompt, QR_PROMPT_HEADER) < strstr(prompt, PROMPT_TRAILER),
+              "the trailer came before the QR header: [%s]", prompt);
+        free(r);
+    }
+
+    /* No art: the prompt must read cleanly rather than showing a caption over
+       nothing. A dangling "Scan QR code with your phone:" followed by the Enter
+       prompt is worse than saying nothing, because the user waits for a code that
+       is never coming. */
+    r = parsed("{\"status\":\"pending\",\"session_id\":\"abc\","
+               "\"instructions\":\"Go to https://example.test and enter ABCD-1234\"}");
+    CHECK(r != NULL, "the art-free reply did not parse");
+    if (r != NULL) {
+        build_device_prompt(prompt, sizeof(prompt), r);
+        CHECK(strstr(prompt, "ABCD-1234") != NULL, "the user code is missing: [%s]", prompt);
+        CHECK(strstr(prompt, QR_PROMPT_HEADER) == NULL,
+              "a QR caption with no QR code under it: [%s]", prompt);
+        CHECK(strstr(prompt, PROMPT_TRAILER) != NULL, "the prompt lost its trailer: [%s]", prompt);
+        free(r);
+    }
+
+    /* Neither instructions nor art. The broker should never send this, and the
+       user still has to be told something other than a bare colon. */
+    r = parsed("{\"status\":\"pending\",\"session_id\":\"abc\"}");
+    CHECK(r != NULL, "an empty pending reply did not parse");
+    if (r != NULL) {
+        build_device_prompt(prompt, sizeof(prompt), r);
+        CHECK(prompt[0] != '\0', "an empty reply produced an empty prompt");
+        CHECK(strstr(prompt, QR_PROMPT_HEADER) == NULL, "a QR caption with nothing at all: [%s]", prompt);
+        CHECK(strstr(prompt, PROMPT_TRAILER) != NULL, "the prompt lost its trailer: [%s]", prompt);
+        free(r);
+    }
+
+    /* The bound. Maximal instructions and maximal art together are larger than
+       any reply the cap allows, but the prompt buffer is sized from the fields
+       rather than from that arithmetic — because the arithmetic is done in another
+       process. What must survive is the trailer: a prompt truncated before it
+       leaves the user staring at a QR code with no idea that Enter is next. */
+    {
+        struct broker_response *big = calloc(1, sizeof(*big));
+        assert(big != NULL);
+        snprintf(big->status, sizeof(big->status), "%s", STATUS_PENDING);
+        memset(big->instructions, 'i', sizeof(big->instructions) - 1);
+        memset(big->qr_code, '#', sizeof(big->qr_code) - 1);
+
+        build_device_prompt(prompt, sizeof(prompt), big);
+        CHECK(strlen(prompt) < sizeof(prompt), "the prompt filled its own buffer exactly");
+        CHECK(strstr(prompt, PROMPT_TRAILER) != NULL,
+              "maximal instructions and art truncated the trailer away");
+        CHECK(strstr(prompt, QR_PROMPT_HEADER) != NULL, "maximal art lost its caption");
+        free(big);
+    }
+}
+
 /* ------------------------------------------------------ parse_arguments */
 
 static void test_parse_arguments(void) {
@@ -1058,6 +1526,10 @@ int main(void) {
     test_protocol_version();
     test_authorized_for();
     test_terminal_status_to_pam();
+    test_account_status_to_pam();
+    test_account_decision();
+    test_parse_reads_the_qr_code();
+    test_build_device_prompt();
     test_parse_arguments();
 
     printf("\n%d checks, %d failures", checks, failures);

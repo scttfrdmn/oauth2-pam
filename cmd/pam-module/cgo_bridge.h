@@ -12,9 +12,30 @@
 #include <unistd.h>
 #include <stdlib.h>
 
-// PAM module name and version
+// PAM module name and version.
+//
+// The version and the build stamp arrive as -D macros from the Makefile — see
+// PAM_VERSION_FLAGS there. They used to be Go link-time symbols set with
+// `-ldflags -X main.version=...`, which stopped meaning anything when the module
+// stopped being built by Go (issue #65): there is no main package left for the
+// linker to write into.
+//
+// Both have a fallback so that a bare `cc cgo_bridge_linux.c` with no -D still
+// compiles — test/cbridge does exactly that. The fallback says "dev" rather than a
+// version number on purpose: a literal here would be a second place a release
+// version is written down, and it would be wrong for every build that did not
+// remember to update it.
 #define PAM_MODULE_NAME    "oauth2_pam"
-#define PAM_MODULE_VERSION "0.3.0"
+
+#ifndef PAM_MODULE_VERSION
+#define PAM_MODULE_VERSION "dev"
+#endif
+
+// PAM_MODULE_BUILD is the commit and build date, logged next to the version so an
+// operator reading syslog can tell which artifact is installed.
+#ifndef PAM_MODULE_BUILD
+#define PAM_MODULE_BUILD "unstamped"
+#endif
 
 // The wire contract this module speaks, sent as protocol_version in every
 // request and checked against the broker's reply. Specified in
@@ -38,11 +59,30 @@
 // stop one byte early and reject a complete 16383-byte response as "too large".
 #define RESPONSE_BUF_SIZE  (MAX_RESPONSE_SIZE + 1)
 
-// The device-flow prompt is the broker's instructions plus a short trailer, so
-// it must be larger than the instructions themselves — otherwise a maximal
-// response would truncate away the "press Enter" line and leave the user with
-// no idea what to do.
-#define MAX_PROMPT_SIZE    (MAX_RESPONSE_SIZE + 128)
+// Cap on the QR art the module will render.
+//
+// The art arrives in its own qr_code field (see the struct below) and is drawn
+// from verification_uri, which the broker refuses to encode above 200 bytes —
+// maxQRCodeURLBytes in pkg/auth. A 200-byte URL measures 5610 bytes of block
+// characters, so 8 KiB is the ceiling with room to spare, and no reply from a
+// broker honouring that bound comes near it.
+//
+// It is a bound of the module's own rather than a restatement of the broker's: the
+// broker's bound is on the URL and this one is on the bytes about to be copied into
+// a fixed buffer here. Art that does not fit is dropped rather than truncated —
+// half a QR symbol is not scannable, and a partial box on screen reads as a
+// rendering bug rather than as "no QR code". The URL and the user code are in
+// instructions either way, and those are what the user acts on.
+#define MAX_QR_CODE_LEN    8192
+
+// The device-flow prompt is the broker's instructions plus the QR art plus a short
+// trailer, so it must be larger than the sum of the two fields — otherwise a
+// maximal response would truncate away the "press Enter" line and leave the user
+// with no idea what to do. Sized from the field caps rather than from what a reply
+// can actually hold (the whole reply is capped at MAX_RESPONSE_SIZE, so
+// instructions and qr_code together cannot really reach this), because a buffer
+// whose safety depends on arithmetic done in another process is not bounded here.
+#define MAX_PROMPT_SIZE    (MAX_RESPONSE_SIZE + MAX_QR_CODE_LEN + 128)
 
 // Field caps for a parsed broker response.
 #define MAX_STATUS_LEN      32
@@ -96,6 +136,21 @@
 // of the contract.
 #define ERROR_CODE_RATE_LIMITED "RATE_LIMITED"
 
+// RESPONSE_TOO_LARGE means the broker had an answer and it did not fit the reply
+// cap, so it sent this instead of something the module could not parse (see
+// writeResponse in internal/ipc and docs/wire-protocol.md). It says nothing about
+// the user: the module has no answer, which is not the same as a "no".
+#define ERROR_CODE_RESPONSE_TOO_LARGE "RESPONSE_TOO_LARGE"
+
+// The key the session id is filed under with pam_set_data, so that the account
+// stage can find what the auth stage authenticated.
+//
+// Namespaced with the module name because the PAM data namespace is shared by every
+// module in a stack: a bare "session_id" is a name another module could plausibly
+// choose, and then this module's account stage would re-check somebody else's
+// handle.
+#define SESSION_DATA_KEY PAM_MODULE_NAME "_session_id"
+
 // Wire status values. These mirror the auth.Status* constants in the broker.
 // "authorized" is the only value that grants access.
 #define STATUS_PENDING    "pending"
@@ -123,6 +178,11 @@ struct broker_response {
     char error_code[MAX_ERROR_CODE_LEN];
     char error_message[MAX_ERROR_MSG_LEN];
     char instructions[MAX_RESPONSE_SIZE];
+    // The ASCII QR code, which the reply carries in a field of its own and no
+    // longer inside instructions. Empty when the broker sent none — which is a
+    // perfectly ordinary pending reply, not an error: above a 200-byte
+    // verification_uri it deliberately sends no art. See MAX_QR_CODE_LEN.
+    char qr_code[MAX_QR_CODE_LEN];
     int  poll_interval;   // from metadata.polling_interval, 0 if absent
     int  success;         // the "success" boolean, for cross-checking status
     int  protocol_version; // the reply's protocol_version; 0 if absent, i.e. 1
