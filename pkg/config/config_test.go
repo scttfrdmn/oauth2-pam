@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/scttfrdmn/oauth2-pam/pkg/security/keys"
 )
 
@@ -38,7 +39,7 @@ func validConfig() *Config {
 			MaxTokenAge:        24 * time.Hour,
 			RateLimiting:       RateLimiting{MaxRequestsPerMinute: 60, MaxConcurrentAuths: 10},
 		},
-		Audit: AuditConfig{Enabled: true, Format: "json", Events: KnownAuditEvents},
+		Audit: AuditConfig{Enabled: true, Events: KnownAuditEvents},
 	}
 }
 
@@ -54,12 +55,35 @@ func TestValidate(t *testing.T) {
 		t.Fatalf("keys.Generate: %v", err)
 	}
 
+	// A mapping script the way an operator is required to install one: absolute,
+	// executable, and writable by nobody but its owner. t.TempDir is 0700 and owned
+	// by whoever runs the test, so the directory half of the check passes too.
+	scriptDir := t.TempDir()
+	goodScript := filepath.Join(scriptDir, "map-user.sh")
+	if err := os.WriteFile(goodScript, []byte("#!/bin/sh\nexit 1\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(goodScript, 0700); err != nil {
+		t.Fatal(err)
+	}
+
 	tests := []struct {
 		name    string
 		mutate  func(*Config)
 		wantErr string // substring; empty means the config must be accepted
 	}{
 		{"no socket path", func(c *Config) { c.Server.SocketPath = "" }, "socket_path"},
+		// Resolved against the broker's working directory, which under systemd is /,
+		// while the PAM module looks at its own compiled-in absolute path.
+		{"relative socket path", func(c *Config) { c.Server.SocketPath = "broker.sock" }, "absolute"},
+
+		// The level was read by nothing until v0.4.0, so nothing rejected a value
+		// either: `log_level: verbose` was accepted, ignored, and believed.
+		{"misspelled log level", func(c *Config) { c.Server.LogLevel = "verbose" }, "log_level"},
+		{"zerolog's trace level is not one of ours", func(c *Config) { c.Server.LogLevel = "trace" }, "log_level"},
+		{"unset log level is left to the flag", func(c *Config) { c.Server.LogLevel = "" }, ""},
+		{"debug log level", func(c *Config) { c.Server.LogLevel = "debug" }, ""},
+		{"error log level", func(c *Config) { c.Server.LogLevel = "error" }, ""},
 		{"no providers", func(c *Config) { c.Providers = nil }, "at least one provider"},
 		{"provider without name", func(c *Config) { c.Providers[0].Name = "" }, "name is required"},
 		{"provider without type", func(c *Config) { c.Providers[0].Type = "" }, "type is required"},
@@ -98,6 +122,14 @@ func TestValidate(t *testing.T) {
 
 		{"negative read timeout", func(c *Config) { c.Server.ReadTimeout = -time.Second }, "read_timeout"},
 		{"negative write timeout", func(c *Config) { c.Server.WriteTimeout = -time.Second }, "write_timeout"},
+		// Only negatives were rejected, so 24h validated cleanly and made a handful
+		// of idle half-written requests into a stall that outlasted the day: a
+		// connection holds one of the server's bounded handler slots for as long as
+		// its read deadline allows.
+		{"read timeout beyond the ceiling", func(c *Config) { c.Server.ReadTimeout = 24 * time.Hour }, "read_timeout"},
+		{"write timeout beyond the ceiling", func(c *Config) { c.Server.WriteTimeout = 24 * time.Hour }, "write_timeout"},
+		{"read timeout at the ceiling", func(c *Config) { c.Server.ReadTimeout = maxServerTimeout }, ""},
+		{"a raised but sane read timeout", func(c *Config) { c.Server.ReadTimeout = 2 * time.Minute }, ""},
 		{"negative concurrent auth limit", func(c *Config) { c.Security.RateLimiting.MaxConcurrentAuths = -1 }, "max_concurrent_auths"},
 
 		// A typo in the allowlist would silently discard an entire class of
@@ -152,7 +184,20 @@ func TestValidate(t *testing.T) {
 
 		{"no mapper tier", func(c *Config) { c.Mapper = MapperConfig{} }, "at least one tier"},
 		{"enrollment alone is a tier", func(c *Config) { c.Mapper = MapperConfig{EnrollmentEnabled: true} }, ""},
-		{"script alone is a tier", func(c *Config) { c.Mapper = MapperConfig{ExternalScript: "/usr/local/bin/map"} }, ""},
+		{"script alone is a tier", func(c *Config) { c.Mapper = MapperConfig{ExternalScript: goodScript} }, ""},
+
+		// The script runs as root on every tier-2 login. http_endpoint, which
+		// executes nothing, has been checked since the beginning; this one was not
+		// checked at all.
+		{"relative script is resolved through PATH", func(c *Config) { c.Mapper.ExternalScript = "map-user.sh" }, "absolute path"},
+		{"missing script", func(c *Config) { c.Mapper.ExternalScript = filepath.Join(scriptDir, "absent.sh") }, "absent.sh"},
+		{"script that is a directory", func(c *Config) { c.Mapper.ExternalScript = scriptDir }, "not a regular file"},
+
+		// A negative floor turned the UID check off for every tier, leaving only a
+		// name denylist that a broker built without cgo cannot apply on an LDAP host.
+		{"negative min uid", func(c *Config) { c.Mapper.MinUID = -1 }, "must not be negative"},
+		{"unset min uid means the default", func(c *Config) { c.Mapper.MinUID = 0 }, ""},
+		{"a lowered floor is still a floor", func(c *Config) { c.Mapper.MinUID = 500 }, ""},
 	}
 
 	for _, tc := range tests {
@@ -174,6 +219,105 @@ func TestValidate(t *testing.T) {
 				t.Errorf("Validate() = %q, want it to mention %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestMapperScriptMustNotBeReplaceable is the other half of #81: a path that
+// executes as root on every tier-2 login, with a mode and an owner that say who
+// gets to choose what it executes.
+func TestMapperScriptMustNotBeReplaceable(t *testing.T) {
+	// One directory per case, because some of these change the directory's mode.
+	newScript := func(t *testing.T, mode os.FileMode) (dir, path string) {
+		t.Helper()
+		dir = filepath.Join(t.TempDir(), "lib")
+		if err := os.Mkdir(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		path = filepath.Join(dir, "map-user.sh")
+		if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 1\n"), mode); err != nil {
+			t.Fatal(err)
+		}
+		// WriteFile applies the umask, so the mode this test is about has to be set
+		// explicitly or the group-writable cases pass for the wrong reason.
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		return dir, path
+	}
+
+	t.Run("group or other writable", func(t *testing.T) {
+		for _, mode := range []os.FileMode{0770, 0707, 0777, 0766} {
+			_, path := newScript(t, mode)
+			cfg := validConfig()
+			cfg.Mapper.ExternalScript = path
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("a %04o script was accepted", mode)
+			}
+			if !strings.Contains(err.Error(), "runs as root") {
+				t.Errorf("mode %04o: error does not say what is at stake: %v", mode, err)
+			}
+		}
+	})
+
+	t.Run("not executable", func(t *testing.T) {
+		_, path := newScript(t, 0600)
+		cfg := validConfig()
+		cfg.Mapper.ExternalScript = path
+		err := cfg.Validate()
+		// Left alone this is silent: exec fails, the mapper falls through, and tier 2
+		// is never consulted again.
+		if err == nil || !strings.Contains(err.Error(), "not executable") {
+			t.Fatalf("a non-executable script gave: %v", err)
+		}
+	})
+
+	t.Run("in a writable directory", func(t *testing.T) {
+		dir, path := newScript(t, 0755)
+		if err := os.Chmod(dir, 0777); err != nil {
+			t.Fatal(err)
+		}
+		cfg := validConfig()
+		cfg.Mapper.ExternalScript = path
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "writable by group or other") {
+			t.Fatalf("a script in a 0777 directory gave: %v", err)
+		}
+	})
+
+	t.Run("symlink", func(t *testing.T) {
+		_, path := newScript(t, 0755)
+		link := filepath.Join(filepath.Dir(path), "map.link")
+		if err := os.Symlink(path, link); err != nil {
+			t.Fatal(err)
+		}
+		cfg := validConfig()
+		cfg.Mapper.ExternalScript = link
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "is a symlink") {
+			t.Fatalf("a symlinked script gave: %v", err)
+		}
+	})
+
+	t.Run("the control", func(t *testing.T) {
+		_, path := newScript(t, 0755)
+		cfg := validConfig()
+		cfg.Mapper.ExternalScript = path
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("a 0755 script owned by this process was refused: %v", err)
+		}
+	})
+}
+
+// TestSupportedLogLevelsAreZerologLevels pins the allowlist to the parser that
+// applies it: cmd/broker hands server.log_level to zerolog.ParseLevel, so a level
+// Validate accepts and zerolog rejects would be a broker that dies immediately
+// after passing validation.
+func TestSupportedLogLevelsAreZerologLevels(t *testing.T) {
+	for _, l := range SupportedLogLevels {
+		if _, err := zerolog.ParseLevel(l); err != nil {
+			t.Errorf("SupportedLogLevels contains %q, which zerolog rejects: %v", l, err)
+		}
 	}
 }
 
@@ -244,6 +388,11 @@ func TestLoadConfig(t *testing.T) {
 
 	if cfg.Server.SocketPath != "/tmp/oauth2-pam-test.sock" {
 		t.Errorf("socket_path = %q", cfg.Server.SocketPath)
+	}
+	// The level the file asks for has to reach the caller: cmd/broker applies it,
+	// and for three releases nothing did.
+	if cfg.Server.LogLevel != "debug" {
+		t.Errorf("log_level = %q, want the configured %q", cfg.Server.LogLevel, "debug")
 	}
 	if cfg.Server.ReadTimeout != 10*time.Second {
 		t.Errorf("read_timeout = %s, want 10s", cfg.Server.ReadTimeout)
@@ -323,6 +472,9 @@ func TestLoadConfigRejectsUnknownKeys(t *testing.T) {
 			sampleYAML + "  outputs:\n    - type: file\n      path: /tmp/a.log\n      url: https://siem.example.com/ingest\n",
 			"url",
 		},
+		// audit.format went the same way: parsed, defaulted to json, and read by
+		// nothing, while every record was JSON regardless.
+		{"removed audit format field", sampleYAML + "  format: json\n", "format"},
 	}
 
 	for _, tc := range tests {
