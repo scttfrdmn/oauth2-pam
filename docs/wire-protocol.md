@@ -82,6 +82,12 @@ Every other paragraph here is in service of that sentence. In particular:
   the broker. There is no framing beyond that: the reply ends at EOF. There is no
   multiplexing, no keep-alive, and no server-initiated message.
 - **A request is at most 64 KiB.** Larger is refused before it is decoded.
+- **A reply is at most 16 KiB.** A client is entitled to refuse a larger one
+  rather than grow a buffer without bound, and this one does: `MAX_RESPONSE_SIZE`
+  in `cmd/pam-module/cgo_bridge.h` is 16384, and `strncpy` past it truncates in
+  silence, which a client cannot then parse. This broker holds itself to the same
+  number and substitutes `RESPONSE_TOO_LARGE` rather than writing an oversized
+  reply — see that code below.
 - **Both ends apply deadlines to every send and receive.** A broker that accepts
   a connection and then says nothing must not be able to hang a login: the client
   is inside `sshd`'s `LoginGraceTime` and has no other timer for a blocked
@@ -89,10 +95,40 @@ Every other paragraph here is in service of that sentence. In particular:
   client's are per phase, because starting a device flow involves a provider
   round trip and polling does not.
 
-A reply is expected to fit comfortably under 16 KiB. The largest by a wide margin
-is the first one, whose `instructions` carry a QR code drawn in multibyte block
-characters — around 2–3 KiB in practice. A client is entitled to refuse a larger
-reply rather than grow a buffer without bound, and this one does.
+The largest reply by a wide margin is the first one, and the reason is the QR
+code: ASCII art in multibyte block characters, whose size grows superlinearly in
+the length of the URL it encodes, and the URL is `verification_uri` from the
+provider. Measured against the real `github.com/skip2/go-qrcode` at Medium
+recovery, serializing the reply this broker sends (JSON plus the trailing
+newline), with a lowercase URL because that is what puts the encoder in byte mode
+and byte mode is the larger of the two encodings a real URL can take:
+
+| `verification_uri` | QR art | first reply |
+|---|---|---|
+| 31 B — what github.com actually sends | 1940 B | **2.9 KB** |
+| 51 B — a URI with the user code in it | 2304 B | 3.3 KB |
+| 200 B — the ceiling, above which no QR is drawn | 5610 B | 6.9 KB |
+| longer than 200 B | none | ~1.4 KB plus the URL, which appears twice |
+
+Earlier revisions of this document said "around 2–3 KiB in practice", which was
+wrong on the happy path in the direction that made 16 KiB look generous: that
+figure was the size of the `instructions` field, while the reply carried the same
+art a second time in `qr_code`, so the real github.com baseline was 4.9 KB before
+any hostile input — and a 300-byte `verification_uri` reached 17.6 KB, over the
+buffer, while a 2 KB one reached 88 KB
+([#56](https://github.com/scttfrdmn/oauth2-pam/issues/56)). Both halves of that
+are fixed rather than re-documented: the art is serialized once, in `qr_code`, and
+the URL it is drawn from is bounded at 200 bytes with the code skipped above that.
+The sizing rule a consumer should take from it is to measure the whole reply
+rather than one field, and to remember that the largest field in it is a function
+of a string the provider chose the length of.
+
+That is also why the QR bound is not the whole answer. The URL itself is on the
+wire twice, in `device_url` and inside `instructions`, so a provider sending a
+multi-kilobyte `verification_uri` still writes a reply that will not fit — around
+7.7 KB of URL is enough. What it gets is the reply cap: `RESPONSE_TOO_LARGE`, which
+is a terminal answer with a reason in it, rather than a truncated object the client
+cannot parse.
 
 ## Versioning
 
@@ -299,8 +335,8 @@ One JSON object.
 | `success` | bool | True only when `status` is `"authorized"` (or `"revoked"` for a revocation). Redundant with `status` on purpose: it is the field the pre-status clients read, and a client should require both to agree. |
 | `user_id` | string | The local account authorized. Populated **only** when authorized. |
 | `session_id` | string | The handle to poll. |
-| `instructions` | string | Ready-to-display text for the user, formatted for `login_type`. A client is not expected to build this from the parts. |
-| `device_code`, `device_url`, `qr_code` | string | The parts, for a client that wants to format its own prompt. |
+| `instructions` | string | Ready-to-display text for the user, formatted for `login_type`. A client is not expected to build this from the parts. It carries the URL and the user code as text and **does not embed the QR code** — see below. |
+| `device_code`, `device_url`, `qr_code` | string | The parts, for a client that wants to format its own prompt. `qr_code` is the only place the QR art travels, and it is empty when there is none. |
 | `expires_at` | RFC 3339 timestamp | When the session or the flow expires. |
 | `error_code` | string | Machine-readable. See below. |
 | `error_message` | string | For the log, not for a decision. |
@@ -308,6 +344,14 @@ One JSON object.
 | `email` | string | Optional, informational. |
 | `requires_device`, `requires_approval` | bool | Legacy hints from before `status` existed. Do not make decisions on them. |
 | `metadata` | object of string→string | `polling_interval` on a pending reply, `provider` and `provider_login` where known. |
+
+The QR code appears **once** in a reply, in `qr_code`. It used to be there and
+inside `instructions` as well, which put the largest field of the largest reply on
+the wire twice at a size the provider chose; a client that wants to draw a QR code
+renders that field. `qr_code` may also be empty on a perfectly good `pending`
+reply — a broker that will not encode an overlong `verification_uri` is expected to
+send none rather than to fail the login — so a client must treat the art as
+optional and the URL and code in `instructions` as what the user acts on.
 
 ### Status values
 
@@ -385,9 +429,12 @@ not fit" — which is the whole value of substituting it.
 
 Whether a version-1 broker is *obliged* to substitute it, rather than writing an
 oversized reply and leaving the client to refuse, is not settled here: that is a
-requirement on brokers, this one does not yet meet it, and specifying it is
+requirement on brokers, and specifying it is
 [#48](https://github.com/scttfrdmn/oauth2-pam/issues/48). Sending it is permitted
-today; relying on receiving it is not.
+today; relying on receiving it is not. This broker does substitute it, as of the
+fix for [#56](https://github.com/scttfrdmn/oauth2-pam/issues/56) — every reply is
+serialized and measured before it is written — which is a property of this
+implementation and not yet a promise of version 1.
 
 ## What this contract deliberately does not do
 
@@ -469,6 +516,11 @@ starting point — the conformance list above is what they are checking:
   fake provider, including that `authenticate` is not an authentication, that a
   mapping to a different account does not authorize the requested one, that every
   reply carries `protocol_version`, and that an unsupported version is refused.
+- `internal/ipc/reply_size_test.go` covers the sizing claims above with the real
+  QR encoder: that the art is serialized exactly once, that a `verification_uri`
+  from anywhere in the range that used to overflow the client's buffer cannot
+  inflate a reply past the cap, and that an oversized reply is replaced by
+  `RESPONSE_TOO_LARGE` rather than written.
 - `test/cbridge/cbridge_test.c` covers the client's parsing and serialization:
   which field carries what, a reply exactly the size of the buffer, a broker that
   accepts and then says nothing, and the version rules above.
