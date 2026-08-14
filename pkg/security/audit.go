@@ -298,19 +298,54 @@ func (al *AuditLogger) processEvents(ctx context.Context) {
 // byte-identical to a real grant, describing a login that was refused — and the
 // caller has to correct it.
 //
-// Two ways the second arises, neither exotic. Every sink is attempted whatever the
+// Three ways the second arises, none exotic. Every sink is attempted whatever the
 // earlier ones did (see writeEvent), so one broken output among several returns an
-// error while the healthy ones hold the record. And a write that overran its
-// deadline is still running: fileOutput.Write is a write followed by an fsync, so
-// on the degraded-disk case that motivated the deadline the bytes are in the file,
-// and visible to anything tailing it, well before the deadline fires.
+// error while the healthy ones hold the record. A write that overran its deadline
+// is still running: fileOutput.Write is a write followed by an fsync, so on the
+// degraded-disk case that motivated the deadline the bytes are in the file, and
+// visible to anything tailing it, well before the deadline fires. And a sink can
+// return an error having already taken the record — which is not an edge case but
+// the shipped file sink's ordinary behaviour on a full or failing disk, because
+// the fsync that reports ENOSPC, EIO, EDQUOT or an NFS commit failure runs after
+// the bytes are in the file (#94).
+//
+// So MayHaveLanded is "may": true unless a sink positively reports that the record
+// reached nothing. The asymmetry is deliberate. A spurious correction is one extra
+// session_revoked saying a refused login was not recorded, which is true whether or
+// not the success made it; a missing correction leaves an authentication_success
+// standing for a login that was refused, which is the harm the type exists to
+// prevent.
 type WriteError struct {
 	EventType string
-	// MayHaveLanded reports that at least one sink accepted the record, or that a
+	// MayHaveLanded reports that a sink may hold the record: one accepted it, one
+	// failed in a way that leaves the bytes where a reader could find them, or a
 	// write still in progress may yet accept it. False means the record reached
-	// nothing: every sink refused it, or none was attempted.
+	// nothing — every sink said so, or none was attempted.
 	MayHaveLanded bool
 	Err           error
+}
+
+// ErrRecordNotLanded marks an error from AuditOutput.Write as one where no part of
+// the record reached anywhere a reader could find it. A sink that knows this joins
+// it to its own error:
+//
+//	return fmt.Errorf("%w: %w", err, security.ErrRecordNotLanded)
+//
+// Without it a failed write is assumed to have kept the record, because the sinks
+// this package ships mostly do. fileOutput.Write hands the bytes to the kernel and
+// then fsyncs, and every disk failure worth a deadline — a full filesystem with
+// delayed allocation, a quota, an I/O error, an NFS server that accepted the write
+// and not the commit — is reported by the fsync, with the record already in the
+// file and already readable by anything tailing it. Reading such an error as "the
+// record does not exist" is what made the #91 correction skip the case it was
+// written for.
+var ErrRecordNotLanded = errors.New("no part of the record reached the sink")
+
+// recordReachedSink reports whether err from AuditOutput.Write leaves the record,
+// or some of it, where a reader could find it. Anything that does not say
+// otherwise is assumed to have kept it.
+func recordReachedSink(err error) bool {
+	return !errors.Is(err, ErrRecordNotLanded)
 }
 
 func (e *WriteError) Error() string {
@@ -400,16 +435,23 @@ func (al *AuditLogger) writeEvent(event AuditEvent) error {
 		}()
 
 		var firstErr error
-		accepted := 0
+		// Sinks that may hold the record, which is not the same as sinks that
+		// accepted it: a sink that errored after taking the bytes counts here, and
+		// the shipped file sink does exactly that whenever its fsync is what failed.
+		landed := 0
 		for _, out := range al.outputs {
-			if err := out.Write(data); err != nil {
-				log.Error().Err(err).Str("event_type", event.EventType).Msg("Failed to write audit event")
-				if firstErr == nil {
-					firstErr = err
-				}
+			err := out.Write(data)
+			if err == nil {
+				landed++
 				continue
 			}
-			accepted++
+			log.Error().Err(err).Str("event_type", event.EventType).Msg("Failed to write audit event")
+			if firstErr == nil {
+				firstErr = err
+			}
+			if recordReachedSink(err) {
+				landed++
+			}
 		}
 		if firstErr == nil {
 			done <- nil
@@ -417,7 +459,7 @@ func (al *AuditLogger) writeEvent(event AuditEvent) error {
 		}
 		done <- &WriteError{
 			EventType:     event.EventType,
-			MayHaveLanded: accepted > 0,
+			MayHaveLanded: landed > 0,
 			Err:           firstErr,
 		}
 	}()
@@ -496,11 +538,18 @@ type stdoutOutput struct{}
 // that can never fail made the fail-closed guarantee above vacuous on the default
 // configuration: under systemd stdout is a journal socket, and a full or
 // unreachable journal is exactly the case the guarantee is for.
+//
+// A short write says which of the two failures this is, by the same argument as
+// fileOutput.Write: whatever bytes the journal took, it took.
 func (o *stdoutOutput) Write(data []byte) error {
-	if _, err := fmt.Println(string(data)); err != nil {
-		return fmt.Errorf("write to stdout: %w", err)
+	n, err := fmt.Println(string(data))
+	if err == nil {
+		return nil
 	}
-	return nil
+	if n == 0 {
+		return fmt.Errorf("write to stdout: %w: %w", err, ErrRecordNotLanded)
+	}
+	return fmt.Errorf("write to stdout: %w", err)
 }
 
 func (o *stdoutOutput) Close() error { return nil }
@@ -517,12 +566,33 @@ func newFileOutput(cfg config.AuditOutput) (*fileOutput, error) {
 	return &fileOutput{file: f}, nil
 }
 
+// Write appends one record and fsyncs it, and says which of the two failed.
+//
+// The distinction is what the caller acts on (#94). Only the write failing with
+// nothing written means the record does not exist. If the write took any bytes the
+// record, or the start of it, is in the file and readable by anything tailing it —
+// and if the write succeeded and the *fsync* failed, the whole record is there. The
+// fsync is the likelier of the two to fail on the cases this sink is hardened for:
+// ext4 with delayed allocation reports a full filesystem there rather than at the
+// write, as do quotas, I/O errors on a degraded device, and an NFS server that
+// accepted the write and not the commit.
+//
+// The record being unsynced does not make it unreadable. It is in the page cache,
+// every reader on the host sees it, and it survives everything short of the machine
+// losing power. So an unsynced record is a record, and the caller has to be told it
+// is there.
 func (o *fileOutput) Write(data []byte) error {
-	_, err := o.file.Write(append(data, '\n'))
+	n, err := o.file.Write(append(data, '\n'))
 	if err != nil {
-		return err
+		if n == 0 {
+			return fmt.Errorf("write audit file: %w: %w", err, ErrRecordNotLanded)
+		}
+		return fmt.Errorf("write audit file (%d bytes of the record were written): %w", n, err)
 	}
-	return o.file.Sync()
+	if err := o.file.Sync(); err != nil {
+		return fmt.Errorf("sync audit file (the record is written but unsynced): %w", err)
+	}
+	return nil
 }
 
 func (o *fileOutput) Close() error { return o.file.Close() }

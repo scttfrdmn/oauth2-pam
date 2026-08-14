@@ -59,3 +59,30 @@ if [ "$missing" -ne 0 ]; then
 fi
 
 echo "All six pam_sm_* entry points present in $SO."
+
+# And nothing else — #97.
+#
+# The six are the module's whole interface. Anything else exported is a function
+# with internal call sites resolving through the PLT against the global scope, which
+# is what -Bsymbolic used to prevent and what the Makefile's note on dropping that
+# flag asserts is impossible. It was not: eleven functions were declared in
+# cgo_bridge.h and so exported, parse_broker_response and validate_socket_path among
+# them, either of which interposed is a complete authentication bypass.
+#
+# Not currently reachable through PAM, which dlopens modules without RTLD_GLOBAL —
+# the vector is LD_PRELOAD or a hostile DT_NEEDED in sshd's own link map, and both
+# already own the process. This is here because the mitigation was dropped on a
+# premise about the source, and a premise about the source is worth a check.
+extra=$(nm -D --defined-only "$SO" 2>/dev/null \
+    | awk '$2 == "T" || $2 == "W" { print $3 }' \
+    | grep -v '^pam_sm_' \
+    | grep -v '^_' \
+    | sort -u)
+
+if [ -n "$extra" ]; then
+    fail "$SO exports symbols that are not entry points, so they can be interposed:"
+    echo "$extra" >&2
+    exit 1
+fi
+
+echo "No symbols beyond the entry points are exported."

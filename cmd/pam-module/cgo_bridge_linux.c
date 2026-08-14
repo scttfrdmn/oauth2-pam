@@ -29,7 +29,7 @@
 
 static int debug_enabled = 0;
 
-void log_pam_message(int priority, const char *format, ...) {
+static void log_pam_message(int priority, const char *format, ...) {
     if (!debug_enabled && priority == LOG_DEBUG) return;
     va_list args;
     va_start(args, format);
@@ -37,13 +37,6 @@ void log_pam_message(int priority, const char *format, ...) {
     vsyslog(priority, format, args);
     closelog();
     va_end(args);
-}
-
-void log_pam_message_string(int priority, const char *message) {
-    if (!debug_enabled && priority == LOG_DEBUG) return;
-    openlog(PAM_MODULE_NAME, LOG_PID, LOG_AUTHPRIV);
-    syslog(priority, "%s", message);
-    closelog();
 }
 
 /* validate_socket_path returns 0 if path is safe, -1 otherwise.
@@ -60,7 +53,7 @@ void log_pam_message_string(int priority, const char *message) {
  * The trailing slash in each prefix is load-bearing: without it, a path under an
  * attacker-created /run/oauth2-pam-evil/ would match.
  */
-int validate_socket_path(const char *path) {
+static int validate_socket_path(const char *path) {
     static const char *const allowed_prefixes[] = {
         "/run/oauth2-pam/",
         "/var/run/oauth2-pam/",
@@ -175,7 +168,7 @@ static int apply_remaining(int sock, int optname, const struct timespec *deadlin
     return 0;
 }
 
-int connect_to_broker(const char *socket_path, int io_timeout) {
+static int connect_to_broker(const char *socket_path, int io_timeout) {
     int sock;
     struct sockaddr_un addr;
 
@@ -213,7 +206,7 @@ int connect_to_broker(const char *socket_path, int io_timeout) {
     return sock;
 }
 
-int get_user_info(pam_handle_t *pamh, const char **username, const char **service,
+static int get_user_info(pam_handle_t *pamh, const char **username, const char **service,
                   const char **rhost, const char **tty) {
     int retval;
 
@@ -381,7 +374,7 @@ static void copy_target_host(char *dst, size_t dst_size) {
     dst[dst_size - 1] = '\0';
 }
 
-int send_auth_request(int sock, const char *username, const char *service,
+static int send_auth_request(int sock, const char *username, const char *service,
                       const char *rhost, const char *tty, const char *provider) {
     json_object *req      = json_object_new_object();
     json_object *metadata = json_object_new_object();
@@ -429,7 +422,7 @@ int send_auth_request(int sock, const char *username, const char *service,
     return rc;
 }
 
-int send_check_session_request(int sock, const char *session_id) {
+static int send_check_session_request(int sock, const char *session_id) {
     json_object *req = json_object_new_object();
     json_object_object_add(req, "protocol_version", json_object_new_int(PROTOCOL_VERSION));
     json_object_object_add(req, "type",       json_object_new_string("check_session"));
@@ -440,7 +433,7 @@ int send_check_session_request(int sock, const char *session_id) {
     return rc;
 }
 
-int receive_auth_response(int sock, char *response, size_t response_size) {
+static int receive_auth_response(int sock, char *response, size_t response_size) {
     size_t total = 0;
     int filled = 0;
     struct timespec deadline;
@@ -525,29 +518,7 @@ done:
     return 0;
 }
 
-int display_message(pam_handle_t *pamh, const char *message) {
-    struct pam_message msg;
-    const struct pam_message *msgp = &msg;
-    struct pam_response *resp = NULL;
-    struct pam_conv *conv;
-    int retval;
-
-    retval = pam_get_item(pamh, PAM_CONV, (const void**)&conv);
-    if (retval != PAM_SUCCESS) return retval;
-    if (conv == NULL || conv->conv == NULL) return PAM_CONV_ERR;
-
-    msg.msg_style = PAM_TEXT_INFO;
-    msg.msg = message;
-
-    retval = conv->conv(1, &msgp, &resp, conv->appdata_ptr);
-    if (resp) {
-        if (resp->resp) free(resp->resp);
-        free(resp);
-    }
-    return retval;
-}
-
-int prompt_user(pam_handle_t *pamh, const char *prompt, char *response,
+static int prompt_user(pam_handle_t *pamh, const char *prompt, char *response,
                 size_t response_size, int echo) {
     struct pam_message msg;
     const struct pam_message *msgp = &msg;
@@ -630,7 +601,7 @@ static void copy_json_field(json_object *obj, const char *key,
     dst[dst_size - 1] = '\0';
 }
 
-int parse_broker_response(const char *json_text, struct broker_response **out) {
+static int parse_broker_response(const char *json_text, struct broker_response **out) {
     if (json_text == NULL || out == NULL) return -1;
     *out = NULL;
 

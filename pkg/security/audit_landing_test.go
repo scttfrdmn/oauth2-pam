@@ -2,6 +2,9 @@ package security
 
 import (
 	"errors"
+	"fmt"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -73,18 +76,23 @@ func TestAPartiallyWrittenRecordSaysSoToTheCaller(t *testing.T) {
 // answer were "may have landed" whatever happened, the caller would write a
 // correction for a record that does not exist — a session_revoked describing the
 // withdrawal of a login the trail never claimed, which is its own false record.
+//
+// What makes a sink's refusal believed is the sink saying so. #94: this test used to
+// use failingOutput, a sink that returns an error and retains nothing, and asserted
+// the answer for every sink that returns an error — including the shipped file sink,
+// which retains the record whenever its fsync is what failed.
 func TestARecordNoSinkAcceptedIsNotReportedAsPossiblyLanded(t *testing.T) {
-	t.Run("every sink refused it", func(t *testing.T) {
+	t.Run("every sink says it took nothing", func(t *testing.T) {
 		al := loggerWithSinks(t,
-			&failingOutput{err: errors.New("no space left on device")},
-			&failingOutput{err: errors.New("connection refused")})
+			&refusingOutput{err: errors.New("no space left on device")},
+			&refusingOutput{err: errors.New("connection refused")})
 
 		err := al.LogAuthEventErr(criticalEvent())
 		if err == nil {
 			t.Fatal("LogAuthEventErr reported success for a record no sink accepted")
 		}
 		if RecordMayHaveLanded(err) {
-			t.Errorf("err = %v claims the record may be readable; no sink accepted it", err)
+			t.Errorf("err = %v claims the record may be readable; every sink reported taking none of it", err)
 		}
 	})
 
@@ -123,6 +131,86 @@ func TestARecordNoSinkAcceptedIsNotReportedAsPossiblyLanded(t *testing.T) {
 			t.Errorf("err = %v claims the record may be readable; it was refused before any sink saw it", err)
 		}
 	})
+}
+
+// refusingOutput is a sink that takes none of the record and reports that, the way a
+// sink whose very first write syscall failed can.
+type refusingOutput struct {
+	err    error
+	writes int
+}
+
+func (o *refusingOutput) Write([]byte) error {
+	o.writes++
+	return fmt.Errorf("%w: %w", o.err, ErrRecordNotLanded)
+}
+
+func (o *refusingOutput) Close() error { return nil }
+
+// TestTheShippedFileSinkSaysSoWhenOnlyItsFsyncFailed is the case #94 was filed for,
+// measured on the real sink rather than on a fixture.
+//
+// fileOutput.Write is a write followed by an fsync, and the failures this sink is
+// hardened against — a full filesystem with delayed allocation, a quota, an I/O
+// error on a degraded device, an NFS server that took the write and not the commit —
+// are reported by the fsync, with the whole record already in the file. Read as "no
+// sink has this record" that leaves the broker's authentication_success standing for
+// a login it refused, which is #91 unfixed on the configuration example.yaml ships.
+//
+// The pipe is the fixture: a descriptor whose Write succeeds and whose Sync fails,
+// which is the production ordering, with a reader on the other end to prove the
+// record went somewhere a reader can see it.
+func TestTheShippedFileSinkSaysSoWhenOnlyItsFsyncFailed(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Close(); _ = w.Close() })
+
+	al := loggerWithSinks(t, &fileOutput{file: w})
+	writeErr := al.LogAuthEventErr(criticalEvent())
+	if writeErr == nil {
+		t.Fatal("LogAuthEventErr reported success for a sink whose fsync failed")
+	}
+
+	// The premise: the record is readable. Without this the test would pass for a
+	// sink that had written nothing and errored for some other reason.
+	buf := make([]byte, 4096)
+	n, rerr := r.Read(buf)
+	if rerr != nil {
+		t.Fatalf("read the audit record back: %v", rerr)
+	}
+	if !strings.Contains(string(buf[:n]), `"user_id":"alice"`) {
+		t.Fatalf("the %d bytes at the other end of the sink are not the record: %q", n, buf[:n])
+	}
+
+	if !RecordMayHaveLanded(writeErr) {
+		t.Errorf("err = %v reports the record as unwritten, and %d bytes of it including user_id "+
+			"are readable at the sink; the caller will leave an authentication_success standing "+
+			"for a login it refused", writeErr, n)
+	}
+}
+
+// TestASinkFailureThatSaysNothingIsTreatedAsPossiblyLanded pins the default, which is
+// the half of #94 that no fixture can prove for every sink: a third-party
+// AuditOutput, or a shipped one on a failure mode nobody enumerated, returns a bare
+// error and the record's fate is genuinely unknown.
+//
+// It is treated as landed, because the two mistakes are not the same size. Correcting
+// a record that does not exist adds a session_revoked saying a refused login could
+// not be recorded, which is true either way. Not correcting one that does exist
+// leaves a success for a login that was refused.
+func TestASinkFailureThatSaysNothingIsTreatedAsPossiblyLanded(t *testing.T) {
+	al := loggerWithSinks(t, &failingOutput{err: errors.New("the sink broke, no further detail")})
+
+	err := al.LogAuthEventErr(criticalEvent())
+	if err == nil {
+		t.Fatal("LogAuthEventErr reported success for a sink that failed")
+	}
+	if !RecordMayHaveLanded(err) {
+		t.Errorf("err = %v is read as proof the record reached nothing; the sink did not say that, "+
+			"and assuming it is how the #91 correction came to skip the case it was written for", err)
+	}
 }
 
 // TestAStalledWriteSaysTheRecordMayHaveLanded is the case #87 was filed for, and the

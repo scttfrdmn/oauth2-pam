@@ -120,9 +120,18 @@ func newSyslogOutput(cfg config.AuditOutput) (*syslogOutput, error) {
 // the RFC 3164 minimum is 480. An audit record with a long error message can
 // reach that, so treat the file sink as the authoritative one where records must
 // be complete.
+// A write that took no bytes says so, so that the caller is not told to correct a
+// record that never left this process (#94). A short write does not: the daemon has
+// part of the record, and the caller has to assume a reader can see it.
 func (o *syslogOutput) Write(data []byte) error {
-	_, err := o.w.Write(data)
-	return err
+	n, err := o.w.Write(data)
+	if err == nil {
+		return nil
+	}
+	if n == 0 {
+		return fmt.Errorf("write to syslog: %w: %w", err, ErrRecordNotLanded)
+	}
+	return fmt.Errorf("write to syslog (%d bytes of the record were written): %w", n, err)
 }
 
 func (o *syslogOutput) Close() error { return o.w.Close() }

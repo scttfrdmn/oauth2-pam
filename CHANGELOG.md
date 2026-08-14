@@ -26,6 +26,18 @@ measure rather than the units it is enforced in. "The record was not written" wa
 read as "no sink has the record", and a byte budget was counted before the escaping
 that decides what the bytes are.
 
+A sixth round found five, and the most consequential was again in the round before
+it. Round five taught this tree that "the write returned an error" does not mean "no
+sink holds the record" — and then shipped a file sink that reported a failed `fsync`,
+which is the exact failure the guarantee was built for, indistinguishably from having
+written nothing at all. The other four are one kind of defect wearing four hats: a
+claim about the tree that was true when it was written and had quietly stopped being
+true. The Makefile said every function but the entry points was `static`; the protocol
+spec said reaching the token age ceiling revokes at the provider; the README's
+recommended stack omitted the `account` line that a whole round's work depends on.
+Three of the five were found by reading a comment against the code it describes, which
+is now a habit worth keeping and, where possible, a check.
+
 **Upgrade notes.** `broker.yaml` must be mode 0600 regardless of where the client
 secret lives — the check used to apply only when the secret was inline, which left
 the file holding the token-encryption key unchecked in every deployment that did the
@@ -33,7 +45,105 @@ right thing with its secret. A deployment relying on the old behaviour will refu
 start until it is chmodded; the error names the file and the command. A negative
 `mapper.min_uid` is also now rejected rather than silently disabling the UID floor.
 
+Two more from the sixth round. The **directory holding `enrollments.json`** must not be
+writable by anyone but its owner unless it is sticky; `/etc/oauth2-pam` at 0750 root
+already satisfies this, but a deployment that put the file somewhere group-writable
+will now fail both `Load` and `Save` with an error naming the directory and
+`chmod 750`. And the **recommended PAM stack has gained an `account` line** — without
+it the `pam_sm_acct_mgmt` re-check added in this release never runs, so a revoked
+session or a deleted enrollment is not caught at login. Add it before relying on
+revocation; read the warning next to it first, because `account required
+oauth2_pam.so` on its own denies the publickey break-glass path.
+
 ### Fixed
+
+- **The sink that reports a failed `fsync` was read as having written nothing, which
+  is the one case the correction above exists for.** #91 computes "may the record have
+  landed" by counting sinks whose `Write` returned nil. `fileOutput.Write` is a
+  `file.Write` followed by a `file.Sync`, and every failure this guarantee was built
+  for — `ENOSPC` under ext4 delayed allocation, `EDQUOT`, `EIO` on a degraded device,
+  an NFS server that accepts the write and refuses the commit — is reported by the
+  *fsync*, with the whole record already in the page cache and readable by anything
+  tailing the file. So on the configuration most deployments actually run, a single
+  file sink, the compensating `session_revoked` was suppressed during precisely the
+  disk-full incident #91 was written for, and an `authentication_success` stood as the
+  trail's last word on a login that had been refused. `MayHaveLanded` now means *may*:
+  true unless a sink positively says otherwise, via a new exported
+  `security.ErrRecordNotLanded` that each shipped sink joins to its error only when it
+  wrote zero bytes. The asymmetry is deliberate and argued at the marker — a spurious
+  correction says a refused login could not be recorded, which is true either way,
+  while a missing one leaves a success record for a login that did not happen. Both
+  the file and stdout sinks now also report a partial write as a partial write, naming
+  the byte count, rather than collapsing it into either extreme.
+  ([#94](https://github.com/scttfrdmn/oauth2-pam/issues/94))
+
+- **The enrollment file's permission check could be rolled back by anyone who could
+  write its directory.** `checkPerms` asserts mode 0600 and root ownership on
+  `enrollments.json`, neither of which can be forged — but the *name* can be reused.
+  Given write access to the parent directory, an attacker renames the current file
+  away and puts back an earlier root-owned 0600 copy, restoring a deleted enrollment
+  or a superseded GitHub-login-to-local-user binding, and every check passes because
+  every check is about the inode it was handed. Nothing followed a symlink either,
+  but only because nothing had tried: `Load` used `os.ReadFile`, so a symlink planted
+  at the path was read through, mode and owner taken from the target. `Load` now opens
+  with `O_NOFOLLOW` and refuses an `fs.ModeSymlink` with an error that says which it
+  was, and both `Load` and `Save` require the parent directory to be unwritable by
+  group and other unless it is sticky — the same rule `pkg/config/secrets.go` already
+  applied to the file holding the client secret. `Save` checks before it writes
+  anything, so a refused directory is left without a partial file in it, and its
+  lock descriptor — an `O_WRONLY` open of a path something else may have just
+  created — carries `O_NOFOLLOW` too, so the two halves cannot disagree about what
+  this path is allowed to be.
+  ([#96](https://github.com/scttfrdmn/oauth2-pam/issues/96))
+
+- **Eleven of the module's internal C functions were exported from the shared
+  object.** The Makefile's note on dropping `-Bsymbolic` argues the flag has nothing
+  left to do because every function in `cgo_bridge_linux.c` but the six `pam_sm_*`
+  entry points is `static`. That was false when it was written: eleven were declared
+  in `cgo_bridge.h` without `static`, so under `-fPIC` they were emitted
+  `STB_GLOBAL`/`STV_DEFAULT` and their internal call sites resolved through the PLT
+  against the global scope — which is exactly the interposition SYMBOLIC prevents.
+  `parse_broker_response` and `validate_socket_path` are two of the eleven, and either
+  one interposed is a complete authentication bypass. Not reachable through PAM, which
+  `dlopen`s modules without `RTLD_GLOBAL`; the vector is `LD_PRELOAD` or a hostile
+  `DT_NEEDED` in sshd's own link map, and both already own the process. Fixed anyway,
+  because a mitigation was dropped on a premise about the source and a premise about
+  the source is worth a check: `verify-pam-symbols.sh` now asserts what is *not*
+  exported as well as what is, and it runs in `make build-pam`, in the release
+  workflow and in the installer. Two of the eleven turned out to have no caller
+  anywhere in the tree, which only `static` could reveal —
+  `-Werror=unused-function` is silent about a non-static definition, since any other
+  object might call it. `log_pam_message_string` and `display_message` are deleted;
+  the second drew a `PAM_TEXT_INFO`, which this module deliberately does not do.
+  ([#97](https://github.com/scttfrdmn/oauth2-pam/issues/97))
+
+- **The README's recommended PAM stack had no `account` line, so the account check
+  this release added never ran on the documented deployment.** `pam_sm_acct_mgmt` was
+  given real behaviour above — it re-asks the broker whether the session is still
+  authorized, which is what catches a revoked session, a deleted enrollment or a lost
+  org membership at the next login — and nothing in the documented configuration
+  called it. Both distribution examples now carry `account required oauth2_pam.so`,
+  with the reason it is not optional, and with the caveat that matters: the module
+  answers `PAM_IGNORE` for a login it did not authenticate, and Linux-PAM turns an
+  account stack that is entirely `PAM_IGNORE` into `PAM_PERM_DENIED` — so that line
+  *alone*, with no `@include common-account` or `pam_unix.so` beside it, denies the
+  publickey break-glass login the rest of the README tells operators to keep.
+  ([#98](https://github.com/scttfrdmn/oauth2-pam/issues/98))
+
+- **Two statements in the wire protocol specification were false, and are corrected
+  rather than implemented.** Reaching the `max_token_age` ceiling does not revoke the
+  token at the provider, and no automatic path in this broker does: the token record
+  is stored with the same lifetime as the session and always expires strictly before
+  it, `RevokeSession` has to decrypt that record before it can call GitHub, so by the
+  time any sweep runs there is nothing left to decrypt. `revoke_session` reaches the
+  provider only while the session is still inside its `token_lifetime`; past that it
+  ends the local session and leaves the token live until GitHub's own expiry. The
+  specification now says both of those things where it used to say the opposite, and
+  #95 tracks the code fix — the mechanical half is a revocation grace period on the
+  token record, and the half that needs a decision is whether logout and shutdown
+  should revoke at all. Relatedly, #75's closing comment claimed `pam_sm_close_session`
+  revokes the session; it does not, and the comment is corrected in place.
+  ([#95](https://github.com/scttfrdmn/oauth2-pam/issues/95))
 
 - **A refused login could leave an uncorrected `authentication_success` in the
   trail.** #87 made a failed audit write refuse the login, and read that failure as

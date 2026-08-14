@@ -371,9 +371,16 @@ authorization, so four things are refused rather than extended:
 - A session **past the broker's absolute age ceiling**, also with
   `SESSION_EXPIRED`. A ceiling is measured from when the session was created and
   no extension moves it, so however often a client refreshes, a session cannot
-  outlive it; reaching it revokes the token at the provider. Whether there is such
-  a ceiling and how long it is are the broker's policy — `security.max_token_age`
-  here — and a client must not infer one from `expires_at`.
+  outlive it. Whether there is such a ceiling and how long it is are the broker's
+  policy — `security.max_token_age` here — and a client must not infer one from
+  `expires_at`.
+
+  This used to say that reaching the ceiling revokes the token at the provider. It
+  does not, and no automatic path in this broker does: the stored token record
+  expires just before the session it belongs to, and revocation needs to decrypt
+  that record first ([#95](https://github.com/scttfrdmn/oauth2-pam/issues/95)). A
+  client must assume a credential outlives the session that authorized it until
+  that is fixed.
 - A session whose **access token is no longer usable**, also with
   `SESSION_EXPIRED`. The session is what authorizes use of a credential, so a
   session outliving its credential is a shell and must not be reported as
@@ -388,9 +395,18 @@ log.
 
 ### `revoke_session`
 
-Ends a session and revokes the token at the provider. The reply's `status` is
-`"revoked"`, which is not a session state — the session no longer exists — but
-every reply carries a status so a client never has to special-case a missing one.
+Ends a session, and revokes the token at the provider if the session is still
+inside its `token_lifetime`. The reply's `status` is `"revoked"`, which is not a
+session state — the session no longer exists — but every reply carries a status so
+a client never has to special-case a missing one.
+
+The qualifier is not a detail. Past that lifetime the local token record has expired
+and cannot be decrypted, so the provider is never called and the reply says
+`revoked` about the local session only
+([#95](https://github.com/scttfrdmn/oauth2-pam/issues/95)). Past the session's own
+expiry there is nothing to address the verb to at all and the answer is
+`SESSION_NOT_FOUND`. An operator revoking a leaked credential after the fact needs
+the provider's own token settings, not this verb.
 
 ## Replies
 

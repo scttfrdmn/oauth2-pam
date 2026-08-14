@@ -57,7 +57,12 @@ GO_TEST_FLAGS := -race -coverprofile=coverage.out
 # mitigation. `go build -buildmode=c-shared` also passed -Bsymbolic and marked the
 # object NODELETE. SYMBOLIC has nothing left to do here: every function in
 # cgo_bridge_linux.c except the six pam_sm_* entry points is static, so there are no
-# internal references for the dynamic linker to resolve elsewhere. NODELETE existed
+# internal references for the dynamic linker to resolve elsewhere. That claim was
+# false when it was written and is now true — eleven functions were declared in
+# cgo_bridge.h and so exported, with internal call sites resolving through the PLT
+# against the global scope, which is exactly what SYMBOLIC prevents (#97). They are
+# static, and verify-pam-symbols.sh now asserts what is *not* exported as well as
+# what is, so the claim cannot quietly stop being true again. NODELETE existed
 # because the Go runtime cannot survive being unloaded — it pinned the module, and
 # 1.2 MB of scheduler with it, in sshd for the life of the process. A plain C module
 # has no such problem, so letting PAM dlclose it again is the correct behaviour.
