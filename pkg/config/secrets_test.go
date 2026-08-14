@@ -79,6 +79,72 @@ func TestSecretFileMustNotBeReadableByOthers(t *testing.T) {
 	}
 }
 
+// A symlink is refused rather than followed. os.Stat then os.ReadFile resolved
+// the name twice, so in a directory another user can write, the link could point
+// at a 0600 root-owned file for the check and at their own file for the read; the
+// open is O_NOFOLLOW now, and this is the case where saying so is more use than
+// ELOOP's "too many levels of symbolic links".
+func TestSecretFileMustNotBeASymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := writeSecret(t, dir, "secret", "s3cret", 0600)
+	link := filepath.Join(dir, "secret.link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	err := providerWith("", link).ResolveSecrets("")
+	if err == nil {
+		t.Fatal("a symlinked secret file was accepted")
+	}
+	if !strings.Contains(err.Error(), "is a symlink") {
+		t.Errorf("error does not say the path is a symlink: %v", err)
+	}
+}
+
+// The directory is half of the file's protection: a 0600 root-owned secret in a
+// directory another user can write cannot be modified, but it can be renamed away
+// and replaced with a file that has the same mode, the same owner, and a secret
+// the attacker chose.
+func TestSecretFileInAWritableDirectoryIsRefused(t *testing.T) {
+	for _, mode := range []os.FileMode{0770, 0707, 0777} {
+		dir := filepath.Join(t.TempDir(), "etc")
+		if err := os.Mkdir(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		path := writeSecret(t, dir, "secret", "s3cret", 0600)
+		// After writing the file, so the umask cannot have narrowed the directory
+		// back down again.
+		if err := os.Chmod(dir, mode); err != nil {
+			t.Fatal(err)
+		}
+
+		err := providerWith("", path).ResolveSecrets("")
+		if err == nil {
+			t.Fatalf("a 0600 secret in a %04o directory was accepted", mode)
+		}
+		if !strings.Contains(err.Error(), "writable by group or other") {
+			t.Errorf("directory mode %04o: error does not name the directory's mode: %v", mode, err)
+		}
+	}
+}
+
+// The sticky bit is why /tmp is shareable: it restricts rename and unlink to the
+// file's owner, which is the attack the directory mode is checked for.
+func TestStickyDirectoryIsAcceptedForASecretFile(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "tmp")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := writeSecret(t, dir, "secret", "s3cret", 0600)
+	if err := os.Chmod(dir, os.ModeSticky|0777); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := providerWith("", path).ResolveSecrets(""); err != nil {
+		t.Errorf("a secret in a sticky world-writable directory was refused: %v", err)
+	}
+}
+
 func TestSecretFileRejectsUnusableContents(t *testing.T) {
 	dir := t.TempDir()
 	tests := []struct {
@@ -229,6 +295,97 @@ func TestInlineSecretRequiresAProtectedConfigFile(t *testing.T) {
 	}
 	if got := cfg.Providers[0].SecretSource(); got != SecretSourceInline {
 		t.Errorf("source = %q, want %q", got, SecretSourceInline)
+	}
+}
+
+// This is the defect, not a variation on the one above: the config file's own
+// mode and owner used to be checked only in the inline-secret branch, so every
+// source the documentation calls better — a file, a systemd credential, the
+// environment — silently gave the check up. broker.yaml still holds the token
+// encryption key, the org and team allowlists, and the mapper rules that decide
+// which provider login becomes which Unix user.
+func TestConfigFilePermissionsAreCheckedWhateverTheSecretSource(t *testing.T) {
+	dir := t.TempDir()
+	secretPath := writeSecret(t, dir, "secret", "s3cret", 0600)
+	cfgPath := writeSecret(t, dir, "broker.yaml", "irrelevant contents", 0644)
+
+	sources := []struct {
+		name string
+		cfg  func(t *testing.T) *Config
+	}{
+		{"secret from a file", func(*testing.T) *Config {
+			return providerWith("", secretPath)
+		}},
+		{"secret from the environment", func(t *testing.T) *Config {
+			t.Setenv("OAUTH2_PAM_CLIENT_SECRET_GITHUB", "from-env")
+			return providerWith("", "")
+		}},
+		{"no secret configured at all", func(*testing.T) *Config {
+			return providerWith("", "")
+		}},
+	}
+	for _, tc := range sources {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.cfg(t).ResolveSecrets(cfgPath)
+			if err == nil {
+				t.Fatal("a world-readable config file was accepted")
+			}
+			if !strings.Contains(err.Error(), "broker.yaml") || !strings.Contains(err.Error(), "chmod 600") {
+				t.Errorf("error does not name the config file and how to fix it: %v", err)
+			}
+		})
+	}
+
+	// The control: the same sources are accepted once the file is protected, so the
+	// test above is failing on the mode and not on something else.
+	if err := os.Chmod(cfgPath, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := providerWith("", secretPath).ResolveSecrets(cfgPath); err != nil {
+		t.Errorf("a 0600 config with the secret in a file was refused: %v", err)
+	}
+}
+
+func TestConfigFileMustNotBeASymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := writeSecret(t, dir, "broker.yaml", "irrelevant contents", 0600)
+	link := filepath.Join(dir, "config.link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	err := providerWith("inline", "").ResolveSecrets(link)
+	if err == nil || !strings.Contains(err.Error(), "is a symlink") {
+		t.Fatalf("a symlinked config file gave: %v", err)
+	}
+}
+
+// LoadConfig is what the broker calls, and it must refuse the same thing:
+// nothing else ever looks at broker.yaml's permissions.
+func TestLoadConfigRefusesAWorldReadableConfigWithTheSecretInAFile(t *testing.T) {
+	dir := t.TempDir()
+	secretPath := writeSecret(t, dir, "client-secret", "loaded-from-file\n", 0600)
+	cfgPath := writeSecret(t, dir, "broker.yaml", `
+server:
+  socket_path: /tmp/test.sock
+providers:
+  - name: github
+    type: github
+    client_id: id
+    client_secret_file: `+secretPath+`
+mapper:
+  rules:
+    - match:
+        github_login: alice
+      local_user: alice
+`, 0644)
+
+	_, err := LoadConfig(cfgPath)
+	if err == nil {
+		t.Fatal("LoadConfig accepted a 0644 config file")
+	}
+	if !strings.Contains(err.Error(), "chmod 600") {
+		t.Errorf("error does not say how to fix it: %v", err)
 	}
 }
 
