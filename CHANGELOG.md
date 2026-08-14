@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The wire contract is written down and versioned.**
+  [`docs/wire-protocol.md`](docs/wire-protocol.md) specifies the broker↔module
+  protocol as a contract rather than as a description of one implementation, and
+  every request and reply now carries `protocol_version`. Version 1 is what
+  v0.2.0 shipped — the status state machine, access only on `success && status ==
+  "authorized"` — so the field is additive and **optional in a request**: absent
+  or `0` means 1, and a v0.2.x module keeps working against a v0.3.0 broker. A
+  broker refuses a version it does not implement with the new
+  `UNSUPPORTED_PROTOCOL` code and does no work; a module refuses a *reply* whose
+  version it does not know rather than reading `"authorized"` under a contract it
+  does not implement. Every reply carries the version, including the errors
+  written before the request is dispatched, so a client that cannot parse a reply
+  can still tell what it was talking to.
+
+  The spec covers what the version number is *for*: which changes are additive
+  (a new field, a new error code) and which need a new version (a new `status`, a
+  changed meaning, a removed field). It also states the two things a client must
+  get right and neither field name reveals — that `RATE_LIMITED` means "slow
+  down" and what to do about it differs between the poll phase and the
+  authenticate phase, and that an unrecognised `status` must fail closed — plus
+  the deliberate non-features (no channel binding, no broker authentication, no
+  session reuse) with the issues tracking them.
+
+  This exists because this project and its sister
+  [oidc-pam](https://github.com/scttfrdmn/oidc-pam) independently shipped the
+  same authentication bypass — a `pending` device flow reported as a success —
+  and the shared root cause was that neither had written down what `success`
+  meant. The C bridge's `PROTOCOL_VERSION`, `internal/ipc.ProtocolVersion`, and
+  the spec cross-reference each other, and the version rules are covered from
+  both ends: `TestProtocolVersionIsOnEveryReply` and
+  `TestUnsupportedProtocolVersionIsRefused` in Go, `test_protocol_version()` in
+  the C suite, and two new mutations in `test/cbridge/mutations.sh` — including a
+  version check that accepts everything, which is the failure mode that would
+  look like nothing was wrong.
+  ([#17](https://github.com/scttfrdmn/oauth2-pam/issues/17))
+
 - **The client secret can be kept out of the config file.** Each provider's
   secret now comes from one of three sources, highest precedence first:
   `$OAUTH2_PAM_CLIENT_SECRET_<PROVIDER>`, the new `client_secret_file` (an

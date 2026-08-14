@@ -38,6 +38,10 @@ host   └───────────────────────�
 
 The comparison is unconditional: an `authenticate` request that names no account at all is refused rather than activated as whatever the identity maps to.
 
+**This project owns the broker↔module protocol**, specified in **[docs/wire-protocol.md](docs/wire-protocol.md)**. Other projects in the family — its sister [oidc-pam](https://github.com/scttfrdmn/oidc-pam) — consume that spec rather than maintaining a parallel copy of it: version numbers are allocated here, the reference implementation lives in the same repository as the document, and a protocol change starts as an issue here. The spec exists because both projects independently shipped the same authentication bypass by never writing down what `success` meant, and two peers with two copies of the contract would only have slowed down the next one.
+
+Every request and reply carries a `protocol_version`, so the next change has somewhere to declare itself. Version 1 is the behaviour v0.2.0 shipped; the field naming it is new in v0.3.0 and is optional in a request, so a v0.2.x module keeps working against a v0.3.0 broker. If you are writing another client or another broker, the spec's **Conformance** section is the checklist.
+
 ## Requirements
 
 - Go 1.25+ (1.24 is end-of-life and no longer receives security backports)
@@ -414,6 +418,8 @@ oauth2-pam/
 │   └── oauth2-pam-enroll/   # Self-enrollment CLI
 ├── internal/
 │   └── ipc/                 # Unix socket IPC server
+├── docs/
+│   └── wire-protocol.md     # The broker↔module contract, version 1
 ├── test/
 │   ├── cbridge/             # C unit tests for the PAM module bridge
 │   └── integration/         # Container harness (sshd + PAM vs broker)

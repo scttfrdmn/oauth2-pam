@@ -103,6 +103,30 @@ If you rewrite one of those tests, run `make test-cbridge-mutations` — it puts
 of the six original defects back and fails if the suite still passes. A test that
 cannot fail is worse than no test, because it reads as protection.
 
+## Changing the wire protocol
+
+**This project owns the broker↔module protocol.** It is specified in
+[docs/wire-protocol.md](docs/wire-protocol.md), that document is normative, and
+other projects in the family ([oidc-pam](https://github.com/scttfrdmn/oidc-pam))
+consume it. Two consequences for you: an undocumented change here is a silent
+change to somebody else's project, and a version number is not yours to invent
+locally.
+
+If you touch the shape of a request or a reply:
+
+1. **Decide whether it is additive.** A new optional field or a new error code is
+   additive. A new `status` value, a changed meaning, a field going from optional
+   to required, or a removed field is **not** — that needs `ProtocolVersion`
+   bumped in `internal/ipc/server.go` *and* `PROTOCOL_VERSION` in
+   `cmd/pam-module/cgo_bridge.h`, which are asserted to agree. The compatibility
+   table in the spec is the reference.
+2. **Update the spec in the same commit.** Where the spec and the code disagree,
+   the code is what runs and the spec is the bug — so do not let them disagree.
+3. **Cover it from both ends.** Go side in `internal/ipc/e2e_test.go`, C side in
+   `test/cbridge/cbridge_test.c`, and add a mutation to
+   `test/cbridge/mutations.sh` if the new behaviour is a *refusal* — a check that
+   cannot fail is worse than no check, because it reads as protection.
+
 ## Two things that are easy to break
 
 **A started device flow is not an authentication.** `Success == true` iff

@@ -94,8 +94,31 @@ const maxConcurrentHandlers = 64
 // honouring the interval.
 const maxSessionRequestsPerMinute = 120
 
+// ProtocolVersion is the wire contract this broker speaks. It is documented in
+// docs/wire-protocol.md, which is the specification both this project and its
+// sister oidc-pam are meant to implement.
+//
+// Version 1 is what shipped from v0.2.0 onward: the status state machine, with
+// access granted only on success && status == "authorized". The field itself is
+// new in v0.3.0 and optional in a request, because a v0.2.x module does not send
+// it and must keep working — absent means 1. It exists so that the *next* change
+// to the contract has somewhere to declare itself, rather than being inferred
+// from which fields happen to be present.
+const ProtocolVersion = 1
+
+// ErrorCodeUnsupportedProtocol is returned when a request declares a
+// protocol_version this broker does not implement. Part of the wire contract: a
+// client must treat it as terminal, not retryable — retrying the same version
+// gets the same answer. Refusing is deliberate. A client asking for semantics
+// this broker does not have, served under semantics it did not ask for, is how a
+// field quietly changes meaning between two implementations.
+const ErrorCodeUnsupportedProtocol = "UNSUPPORTED_PROTOCOL"
+
 // Request is a message from the PAM module.
 type Request struct {
+	// ProtocolVersion is the contract the client speaks. Omitted or 0 means 1.
+	ProtocolVersion int `json:"protocol_version,omitempty"`
+
 	Type       string            `json:"type"` // authenticate, check_session, refresh_session, revoke_session
 	UserID     string            `json:"user_id"`
 	SourceIP   string            `json:"source_ip"`
@@ -128,6 +151,11 @@ const StatusRevoked = "revoked"
 // and UserID is populated only in that case. In particular "pending" is never an
 // authenticated user, and a status the client does not recognise is not either.
 type Response struct {
+	// ProtocolVersion is the contract this reply is written in. Always set, so a
+	// client never has to infer it; a client reading a version it does not know
+	// must not grant access on the strength of fields it may be misreading.
+	ProtocolVersion int `json:"protocol_version"`
+
 	Success          bool              `json:"success"`
 	Status           string            `json:"status"`
 	UserID           string            `json:"user_id"`
@@ -296,6 +324,18 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
+	// The version check comes first and answers with its own code: "your contract
+	// is not one I implement" is a different thing from "your fields are wrong",
+	// and a client that cannot tell them apart cannot report anything useful.
+	if req.ProtocolVersion != 0 && req.ProtocolVersion != ProtocolVersion {
+		log.Warn().Int("requested", req.ProtocolVersion).Int("supported", ProtocolVersion).
+			Msg("Refusing an IPC request in an unsupported protocol version")
+		_ = conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
+		s.sendError(conn, ErrorCodeUnsupportedProtocol,
+			fmt.Sprintf("this broker speaks protocol version %d", ProtocolVersion))
+		return
+	}
+
 	if err := validateRequest(&req); err != nil {
 		log.Warn().Err(err).Msg("Invalid IPC request fields")
 		_ = conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
@@ -313,9 +353,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	resp := s.dispatch(&req)
 
 	_ = conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
-	if err := json.NewEncoder(conn).Encode(resp); err != nil {
-		log.Error().Err(err).Msg("Encode IPC response")
-	}
+	writeResponse(conn, resp)
 
 	log.Debug().
 		Str("type", req.Type).
@@ -501,8 +539,24 @@ func (s *Server) handleRevokeSession(req *Request) *Response {
 }
 
 func (s *Server) sendError(conn net.Conn, code, message string) {
-	resp := &Response{Success: false, Status: auth.StatusError, ErrorCode: code, ErrorMessage: message}
-	_ = json.NewEncoder(conn).Encode(resp)
+	writeResponse(conn, &Response{
+		Success:      false,
+		Status:       auth.StatusError,
+		ErrorCode:    code,
+		ErrorMessage: message,
+	})
+}
+
+// writeResponse is the only place a reply reaches the socket, so it is the only
+// place that has to remember to stamp the protocol version. Every reply carries
+// it, including the errors written before dispatch: a client that cannot parse a
+// reply should still be able to tell whether it was talking to a broker speaking
+// a contract it knows.
+func writeResponse(conn net.Conn, resp *Response) {
+	resp.ProtocolVersion = ProtocolVersion
+	if err := json.NewEncoder(conn).Encode(resp); err != nil {
+		log.Error().Err(err).Msg("Encode IPC response")
+	}
 }
 
 func authResponseToIPC(ar *auth.AuthResponse) *Response {

@@ -540,3 +540,72 @@ func TestPerUserPendingFlowsAreBounded(t *testing.T) {
 		t.Error("no pending flows were evicted; per-user pending state is unbounded")
 	}
 }
+
+// TestProtocolVersionIsOnEveryReply checks the half of the wire contract a client
+// needs in order to know what it is talking to. Every reply carries the version
+// it was written in — including the ones written before dispatch, which is where
+// the field is easiest to forget.
+func TestProtocolVersionIsOnEveryReply(t *testing.T) {
+	h := newHarness(t)
+
+	start := h.authenticate("alice")
+	if start.ProtocolVersion != ProtocolVersion {
+		t.Errorf("authenticate reply protocol_version = %d, want %d",
+			start.ProtocolVersion, ProtocolVersion)
+	}
+	if got := h.check(start.SessionID); got.ProtocolVersion != ProtocolVersion {
+		t.Errorf("check_session reply protocol_version = %d, want %d",
+			got.ProtocolVersion, ProtocolVersion)
+	}
+
+	// An error written by validateRequest, before any handler runs.
+	bad := h.roundtrip(Request{Type: "authenticate", UserID: ""})
+	if bad.ErrorCode != "INVALID_REQUEST" {
+		t.Fatalf("error_code = %q, want INVALID_REQUEST", bad.ErrorCode)
+	}
+	if bad.ProtocolVersion != ProtocolVersion {
+		t.Errorf("rejected-request reply protocol_version = %d, want %d",
+			bad.ProtocolVersion, ProtocolVersion)
+	}
+}
+
+// TestUnsupportedProtocolVersionIsRefused covers the other half: a client asking
+// for a contract this broker does not implement is refused rather than served
+// under the contract it did happen to implement. Answering anyway is how a field
+// silently changes meaning between two implementations of the same protocol.
+func TestUnsupportedProtocolVersionIsRefused(t *testing.T) {
+	h := newHarness(t)
+
+	resp := h.roundtrip(Request{
+		ProtocolVersion: ProtocolVersion + 1,
+		Type:            "authenticate",
+		UserID:          "alice",
+		LoginType:       "ssh",
+	})
+	if resp.Success {
+		t.Fatal("a request in an unsupported protocol version was served")
+	}
+	if resp.ErrorCode != ErrorCodeUnsupportedProtocol {
+		t.Errorf("error_code = %q, want %q", resp.ErrorCode, ErrorCodeUnsupportedProtocol)
+	}
+	if resp.SessionID != "" {
+		t.Error("a refused request still started a session")
+	}
+	if n := h.fake.polls(); n != 0 {
+		t.Errorf("the provider saw %d polls; no device flow should have started", n)
+	}
+
+	// Explicitly naming the supported version works, and so does omitting it —
+	// the second is what a v0.2.x module does, and it has to keep working.
+	if got := h.roundtrip(Request{
+		ProtocolVersion: ProtocolVersion,
+		Type:            "authenticate",
+		UserID:          "alice",
+		LoginType:       "ssh",
+	}); got.Status != auth.StatusPending {
+		t.Errorf("status = %q with an explicit protocol_version, want pending", got.Status)
+	}
+	if got := h.authenticate("alice"); got.Status != auth.StatusPending {
+		t.Errorf("status = %q with protocol_version omitted, want pending", got.Status)
+	}
+}

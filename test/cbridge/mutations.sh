@@ -154,6 +154,17 @@ run "target_host takes rhost" fail \
 run "source_ip omitted from the request" fail \
     '$n = s/^.*json_object_object_add\(req, "source_ip".*\n//mg'
 
+# A version check that accepts everything. This is the mutation that matters most
+# for the wire contract: the reply still parses, so nothing looks wrong — the
+# module simply reads "authorized" under a contract it does not implement.
+run "any protocol version is acceptable" fail \
+    '$n = s/return r->protocol_version == 0 \|\| r->protocol_version == PROTOCOL_VERSION;/return 1;/g'
+
+# The request stops declaring its version, which is how the module would become
+# invisible to a broker that starts enforcing one.
+run "protocol_version omitted from requests" fail \
+    '$n = s/^.*json_object_object_add\(req, "protocol_version".*\n//mg'
+
 echo
 if [ "$failures" -ne 0 ]; then
     echo "$failures case(s) failed — a regression test is not protecting what it claims to"

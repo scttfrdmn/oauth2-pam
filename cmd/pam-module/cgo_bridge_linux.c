@@ -274,6 +274,7 @@ int send_auth_request(int sock, const char *username, const char *service,
     copy_source_ip(rhost, source_ip, sizeof(source_ip));
     copy_target_host(target_host, sizeof(target_host));
 
+    json_object_object_add(req, "protocol_version", json_object_new_int(PROTOCOL_VERSION));
     json_object_object_add(req, "type",        json_object_new_string("authenticate"));
     json_object_object_add(req, "user_id",     json_object_new_string(username));
     json_object_object_add(req, "login_type",  json_object_new_string(login_type));
@@ -294,6 +295,7 @@ int send_auth_request(int sock, const char *username, const char *service,
 
 int send_check_session_request(int sock, const char *session_id) {
     json_object *req = json_object_new_object();
+    json_object_object_add(req, "protocol_version", json_object_new_int(PROTOCOL_VERSION));
     json_object_object_add(req, "type",       json_object_new_string("check_session"));
     json_object_object_add(req, "session_id", json_object_new_string(session_id));
 
@@ -472,6 +474,15 @@ int parse_broker_response(const char *json_text, struct broker_response **out) {
         r->success = json_object_get_boolean(success_obj) ? 1 : 0;
     }
 
+    /* Absent means 1: a v0.2.x broker predates the field. Recorded rather than
+       acted on here, so the one place that decides what to do with it is the
+       caller — see check_protocol_version. */
+    json_object *pv_obj = NULL;
+    if (json_object_object_get_ex(root, "protocol_version", &pv_obj) &&
+        pv_obj != NULL && json_object_get_type(pv_obj) == json_type_int) {
+        r->protocol_version = json_object_get_int(pv_obj);
+    }
+
     /* metadata.polling_interval is a string (the IPC metadata map is
        map[string]string), so parse it rather than reading an int. */
     json_object *meta = NULL;
@@ -557,6 +568,23 @@ static void sleep_seconds(long seconds) {
     }
 }
 
+/* protocol_version_supported reports whether a reply is written in a contract
+   this module implements. Absent (0) means version 1: a v0.2.x broker predates
+   the field, and refusing it would break an upgrade in the direction nobody
+   upgrades — the broker and the module are installed from the same archive, but
+   an administrator may well restart one before the other.
+
+   A version this module does not know is a transport failure rather than a
+   decision about the user. The danger is not that the reply fails to parse; it is
+   that it parses fine and "authorized" means something new. Reading it under the
+   wrong contract is the one outcome worth ruling out.
+
+   See docs/wire-protocol.md. */
+static int protocol_version_supported(const struct broker_response *r) {
+    if (r == NULL) return 0;
+    return r->protocol_version == 0 || r->protocol_version == PROTOCOL_VERSION;
+}
+
 /* broker_roundtrip opens a connection, sends one request and reads the reply.
    send_fn does the request-specific serialization. io_timeout bounds every
    operation on the socket; see AUTH_IO_TIMEOUT and POLL_IO_TIMEOUT for why the
@@ -579,7 +607,19 @@ static int broker_roundtrip(const struct module_options *opts, int io_timeout,
     }
     close(sock);
 
-    return parse_broker_response(buf, out);
+    if (parse_broker_response(buf, out) != 0) return -1;
+
+    /* Checked here so every reply goes through it — no path reads a response
+       without coming through this function. */
+    if (!protocol_version_supported(*out)) {
+        log_pam_message(LOG_ERR,
+                        "Broker speaks protocol version %d, this module speaks %d; refusing",
+                        (*out)->protocol_version, PROTOCOL_VERSION);
+        free(*out);
+        *out = NULL;
+        return -1;
+    }
+    return 0;
 }
 
 struct auth_ctx {

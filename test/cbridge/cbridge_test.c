@@ -480,6 +480,91 @@ static void test_parse_reads_the_error_code(void) {
     CHECK(parse_broker_response("[1,2,3]", &r) != 0, "accepted a JSON array");
 }
 
+/* --------------------------------------------------- protocol versioning */
+
+static void test_protocol_version(void) {
+    printf("  protocol_version: read, and refused when unknown\n");
+
+    struct broker_response *r = NULL;
+
+    /* The version this module speaks. Accepted, obviously — but assert it, so
+       that bumping PROTOCOL_VERSION without teaching the module the new contract
+       fails here rather than in production. */
+    char reply[128];
+    snprintf(reply, sizeof(reply),
+             "{\"protocol_version\":%d,\"status\":\"pending\",\"session_id\":\"abc\"}",
+             PROTOCOL_VERSION);
+    CHECK(parse_broker_response(reply, &r) == 0, "failed to parse a same-version reply");
+    if (r != NULL) {
+        CHECK(r->protocol_version == PROTOCOL_VERSION,
+              "protocol_version = %d, want %d", r->protocol_version, PROTOCOL_VERSION);
+        CHECK(protocol_version_supported(r) == 1, "own version refused");
+        free(r);
+        r = NULL;
+    }
+
+    /* A v0.2.x broker sends no protocol_version. It must still be accepted:
+       version 1 is what it speaks, and refusing it would break a host where the
+       broker has not been restarted yet. */
+    CHECK(parse_broker_response("{\"status\":\"authorized\",\"user_id\":\"alice\"}", &r) == 0,
+          "failed to parse a reply without protocol_version");
+    if (r != NULL) {
+        CHECK(r->protocol_version == 0, "absent protocol_version became %d", r->protocol_version);
+        CHECK(protocol_version_supported(r) == 1,
+              "a broker predating the field was refused; that breaks an in-place upgrade");
+        free(r);
+        r = NULL;
+    }
+
+    /* A future contract. The reply parses and says "authorized" for a real user,
+       which is exactly why it has to be refused: this module cannot know what
+       that word means in a contract it does not implement. */
+    CHECK(parse_broker_response(
+              "{\"protocol_version\":2,\"success\":true,\"status\":\"authorized\","
+              "\"user_id\":\"alice\"}", &r) == 0,
+          "failed to parse a version-2 reply");
+    if (r != NULL) {
+        CHECK(r->protocol_version == 2, "protocol_version = %d, want 2", r->protocol_version);
+        CHECK(protocol_version_supported(r) == 0,
+              "a version-2 reply was accepted; \"authorized\" was read under the wrong contract");
+        free(r);
+        r = NULL;
+    }
+
+    /* Junk in the field is not version 1 by default. A string, a float or a
+       negative number all leave it at 0, which reads as "the field is absent" —
+       that is the deliberate choice, because the alternative is inventing a
+       version number for a broker that sent nonsense. What must not happen is a
+       nonsense value being treated as a *known* version other than 1. */
+    CHECK(parse_broker_response(
+              "{\"protocol_version\":\"two\",\"status\":\"pending\"}", &r) == 0,
+          "failed to parse a reply with a non-integer protocol_version");
+    if (r != NULL) {
+        CHECK(r->protocol_version == 0, "a string protocol_version became %d", r->protocol_version);
+        free(r);
+        r = NULL;
+    }
+
+    CHECK(parse_broker_response("{\"protocol_version\":-1,\"status\":\"pending\"}", &r) == 0,
+          "failed to parse a reply with a negative protocol_version");
+    if (r != NULL) {
+        CHECK(protocol_version_supported(r) == 0, "a negative protocol_version was accepted");
+        free(r);
+        r = NULL;
+    }
+
+    CHECK(protocol_version_supported(NULL) == 0, "a NULL response was called supported");
+
+    /* Both request types must declare the version, or a broker that starts
+       enforcing it refuses every login this module attempts. */
+    json_object *req = read_sent_request("alice", "sshd", "192.0.2.10", "ssh", NULL);
+    json_object *pv = NULL;
+    CHECK(json_object_object_get_ex(req, "protocol_version", &pv) &&
+              json_object_get_int(pv) == PROTOCOL_VERSION,
+          "authenticate did not declare protocol_version %d", PROTOCOL_VERSION);
+    json_object_put(req);
+}
+
 /* ------------------------------------------------------ parse_arguments */
 
 static void test_parse_arguments(void) {
@@ -552,6 +637,7 @@ int main(void) {
     test_source_ip_takes_only_addresses();
     test_target_host_is_this_host();
     test_parse_reads_the_error_code();
+    test_protocol_version();
     test_parse_arguments();
 
     printf("\n%d checks, %d failures", checks, failures);

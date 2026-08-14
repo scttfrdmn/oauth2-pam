@@ -14,7 +14,16 @@
 
 // PAM module name and version
 #define PAM_MODULE_NAME    "oauth2_pam"
-#define PAM_MODULE_VERSION "0.2.0"
+#define PAM_MODULE_VERSION "0.3.0"
+
+// The wire contract this module speaks, sent as protocol_version in every
+// request and checked against the broker's reply. Specified in
+// docs/wire-protocol.md; must agree with internal/ipc.ProtocolVersion.
+//
+// A broker replying with a version above this one is refused rather than
+// interpreted: the fields would still parse, and that is exactly the danger —
+// "status" meaning something new is not detectable by reading it.
+#define PROTOCOL_VERSION 1
 
 // Buffer sizes. A device-flow response carries the verification URL, the user
 // code and a QR code drawn with multibyte block characters, which puts it in
@@ -116,6 +125,7 @@ struct broker_response {
     char instructions[MAX_RESPONSE_SIZE];
     int  poll_interval;   // from metadata.polling_interval, 0 if absent
     int  success;         // the "success" boolean, for cross-checking status
+    int  protocol_version; // the reply's protocol_version; 0 if absent, i.e. 1
 };
 
 // Prototypes implemented in cgo_bridge_linux.c (compiled into the .so)

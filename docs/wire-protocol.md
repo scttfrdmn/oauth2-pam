@@ -1,0 +1,374 @@
+# The oauth2-pam broker IPC contract, version 1
+
+This is the protocol spoken between a PAM module and an authentication broker
+over a Unix domain socket.
+
+## Ownership
+
+**`oauth2-pam` owns this protocol. Other projects consume it.**
+
+That sentence is the point of this section, and it is a deliberate change from how
+the two projects were related before. `oauth2-pam` and its sister
+[`oidc-pam`](https://github.com/scttfrdmn/oidc-pam) are the same program with
+different identity providers, and both independently shipped the same
+authentication bypass — a `pending` device flow reported as a success — because
+neither had written down what `success` meant
+([oauth2-pam#5](https://github.com/scttfrdmn/oauth2-pam/issues/5),
+[oidc-pam#146](https://github.com/scttfrdmn/oidc-pam/issues/146)). Two peers
+maintaining parallel copies of an unwritten contract is what produced that, and
+two peers maintaining parallel copies of a *written* one would only slow down the
+next occurrence. So there is one owner and one normative document.
+
+Concretely:
+
+- **This document is normative.** A consumer that disagrees with it is wrong,
+  even where its own code is self-consistent.
+- **Version numbers are allocated here.** No consumer invents a version. There is
+  exactly one meaning of "version 1", and it is the one below.
+- **The reference implementation is here**, in the same repository as the spec, so
+  the two are changed in one commit and drift is a reviewable diff:
+  `internal/ipc/server.go` (broker), `cmd/pam-module/cgo_bridge_linux.c`
+  (client), with the constants `internal/ipc.ProtocolVersion` and
+  `PROTOCOL_VERSION` in `cmd/pam-module/cgo_bridge.h`. A test asserts those two
+  agree, and that this document names the current version.
+- **A change starts as an issue here**, lands here with tests on both ends, and
+  is then a thing consumers implement — not the other way round. Consumers are
+  welcome to propose changes; they are the same issues, filed on this repo.
+- **Within this repository, spec and code are expected to agree, and neither one
+  automatically wins.** If they disagree that is a bug in one of them and worth an
+  issue either way: the spec is what other people build against, and the code is
+  what is actually running on somebody's SSH port. Do not silently "fix" the
+  document to match a behaviour change.
+
+Nothing here makes this project's *identity* handling normative for anyone.
+`oidc-pam` is not expected to authenticate the way `oauth2-pam` does; it is
+expected to speak the same socket. See
+[oauth2-pam#17](https://github.com/scttfrdmn/oauth2-pam/issues/17) and
+[oidc-pam#149](https://github.com/scttfrdmn/oidc-pam/issues/149).
+
+## The rule everything else serves
+
+> Access is granted only when `success` is `true` **and** `status` is
+> `"authorized"`, and only for the account named in `user_id`.
+
+Every other paragraph here is in service of that sentence. In particular:
+
+- A started device flow is **not** an authentication. `status` is `"pending"`,
+  `success` is `false`, and `user_id` is empty. Both projects got this wrong.
+- A `status` a client does not recognise is **not** an authorization. Unknown
+  means no.
+- `user_id` must equal the account the login is for. The broker checks this
+  before it activates a session; a client checks it again on the value it is
+  about to act on. Two independent checks, because one of them is in a different
+  process and might be an older version of itself.
+
+## Transport
+
+- **A Unix domain socket.** No TCP, ever: the peer's identity is the point of the
+  transport, and `SO_PEERCRED` is what makes per-caller rate limiting possible.
+- **Socket mode `0660`, in a directory mode `0750`.** Anything that can reach the
+  socket can start device flows. That is a bounded, audited capability, not
+  nothing.
+- **One request, one reply, one connection.** The client connects, writes exactly
+  one JSON object, reads exactly one JSON object, and the connection is closed by
+  the broker. There is no framing beyond that: the reply ends at EOF. There is no
+  multiplexing, no keep-alive, and no server-initiated message.
+- **A request is at most 64 KiB.** Larger is refused before it is decoded.
+- **Both ends apply deadlines to every send and receive.** A broker that accepts
+  a connection and then says nothing must not be able to hang a login: the client
+  is inside `sshd`'s `LoginGraceTime` and has no other timer for a blocked
+  `recv()`. The broker's are `server.read_timeout` / `server.write_timeout`; the
+  client's are per phase, because starting a device flow involves a provider
+  round trip and polling does not.
+
+A reply is expected to fit comfortably under 16 KiB. The largest by a wide margin
+is the first one, whose `instructions` carry a QR code drawn in multibyte block
+characters — around 2–3 KiB in practice. A client is entitled to refuse a larger
+reply rather than grow a buffer without bound, and this one does.
+
+## Versioning
+
+The version of this contract is an integer. Version 1 is what is described here.
+It is what `oauth2-pam` has spoken since v0.2.0, retroactively named: the
+`protocol_version` field itself is new in v0.3.0, and the behaviour it names is
+older than the field.
+
+Whether any other implementation currently conforms to version 1 is a question
+about that implementation, and this document does not answer it. Do not read
+"version 1" as a claim that every project in the family already speaks it.
+
+- A request **may** carry `protocol_version`. Absent, or `0`, means 1 — a client
+  predating the field speaks version 1 by definition, and must keep working.
+- A reply **must** carry `protocol_version`, including replies that are errors
+  produced before the request was dispatched.
+- A broker receiving a version it does not implement refuses the request with
+  `error_code: "UNSUPPORTED_PROTOCOL"` and does no work. This is terminal, not
+  retryable.
+- A client receiving a version it does not implement **must not grant access.**
+  It is a transport failure, not a decision about the user. The reason to refuse
+  is not that the reply fails to parse — it is that it parses fine and
+  `"authorized"` may mean something new.
+A malformed `protocol_version` is where the two ends of this implementation
+legitimately differ, and the difference is worth stating rather than papering
+over. Both fail closed; they close in different directions because they are
+protecting different things.
+
+| Value | Broker reading a request | Client reading a reply |
+|---|---|---|
+| absent, or `null` | version 1 | version 1 |
+| `0` | version 1 | version 1 |
+| a negative integer | `UNSUPPORTED_PROTOCOL` | refused |
+| a string, or a non-integral number | `INVALID_REQUEST` — the whole request fails to decode | read as absent, so version 1 |
+
+The broker refuses the request outright because a client that cannot serialize an
+integer has told it nothing trustworthy about anything else in the object. The
+client is more forgiving in that one spot on purpose: a v0.2.x broker sends no
+`protocol_version` at all, and an in-place upgrade of the module must not break
+against one. What must never happen at either end is nonsense being treated as a
+*known* version other than 1.
+
+Compatibility within a version is **additive only**:
+
+| Change | Needs a new version? |
+|---|---|
+| A new optional field | No. Receivers ignore fields they do not know. |
+| A new `status` value | **Yes.** A client that does not know it will refuse the login, which is safe but is a behaviour change. |
+| A new `error_code` | No, provided its retryability is discoverable — see below. |
+| A new request `type` | No. An unknown type is refused. |
+| Changing what an existing field means | **Yes.** This is the change the version number exists for. |
+| Making an optional field required | **Yes.** |
+| Removing a field | **Yes.** |
+
+### Extension fields
+
+A consumer will have fields this spec does not define — `oidc-pam` carries
+`ssh_public_key` and `risk_score`, neither of which means anything here. That is
+allowed, and needs no version bump, under three rules:
+
+1. **A receiver ignores fields it does not know.** This is what makes the whole
+   additive-compatibility story work, so it is not optional.
+2. **An extension field must never be load-bearing for the authorization
+   decision.** If a field can turn a non-grant into a grant, it is part of the
+   contract and belongs in this document, at a new version. An implementation
+   whose access decision depends on a field a conformant peer would discard is not
+   speaking version 1, whatever it puts in `protocol_version`.
+3. **Register it here once it is shared.** The moment a second implementation
+   reads a field, it stops being an extension and becomes contract. File an issue
+   on this repo and it gets a row in the tables below.
+
+Rule 2 is the one with teeth, and it is not hypothetical: `requires_device` was
+exactly such a field. Making the grant depend on it is what version 1 replaced
+with `status`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `protocol_version` | int | Optional. Absent means 1. |
+| `type` | string | `authenticate`, `check_session`, `refresh_session`, `revoke_session`. Anything else is refused. |
+| `user_id` | string | The **local account being logged into** — the PAM username, not the provider's. Required and non-empty for `authenticate`. Max 256 bytes, no NUL. |
+| `session_id` | string | Required for the session verbs. Max 128 bytes. |
+| `provider` | string | Optional. Names a configured provider; absent means the broker's default. A name that is not configured is refused rather than replaced by the default. Max 256 bytes, no NUL. |
+| `source_ip` | string | The client address, if the login has one and it really is an address. Max 45 bytes (an IPv6 literal with a scope). A resolved hostname does not belong here. |
+| `target_host` | string | The host being logged **into** — this host. Max 253 bytes. |
+| `login_type` | string | `ssh`, `console`, or `gui`. Optional; empty is treated as `ssh`. Any other value is refused. It selects how instructions are formatted, nothing more. |
+| `user_agent`, `device_id` | string | Optional, carried into the audit trail. |
+| `metadata` | object of string→string | Optional. Free-form context for the audit trail: this client sends `service`, `tty`, `pid`, and the unabridged `rhost`. No NUL in keys or values. |
+
+Note the two easily-confused fields. `user_id` in a *request* is the local account
+being asked for; `user_id` in a *reply* is the local account the broker
+authorized. The whole authorization decision is that those two agree, so a client
+that conflates them has no check left. `source_ip` is where the login came from
+and `target_host` is where it is going; this project shipped them backwards once,
+which made every audit record name the client as the host being logged into.
+
+### `authenticate`
+
+Starts a device flow. This is the expensive verb — a provider round trip, a
+polling goroutine, and state that outlives the connection — so it is rate limited
+per calling UID.
+
+The reply is `status: "pending"` with a `session_id` to poll, the user-facing
+`instructions`, and `metadata.polling_interval` (seconds, **as a string**, because
+`metadata` is a string map). A client should honour that interval; it is the
+provider's, not an invention of the broker's.
+
+### `check_session`
+
+Polls one session. Rate limited per session rather than per caller: a poll's cost
+belongs to one login, and charging it to the caller made every login on the host
+share one budget. Returns the session's current status.
+
+### `refresh_session`
+
+Extends an authorized session using the provider's refresh token. A pending
+session is not refreshable.
+
+### `revoke_session`
+
+Ends a session and revokes the token at the provider. The reply's `status` is
+`"revoked"`, which is not a session state — the session no longer exists — but
+every reply carries a status so a client never has to special-case a missing one.
+
+## Replies
+
+One JSON object.
+
+| Field | Type | Notes |
+|---|---|---|
+| `protocol_version` | int | Always present. |
+| `status` | string | **Authoritative.** See below. |
+| `success` | bool | True only when `status` is `"authorized"` (or `"revoked"` for a revocation). Redundant with `status` on purpose: it is the field the pre-status clients read, and a client should require both to agree. |
+| `user_id` | string | The local account authorized. Populated **only** when authorized. |
+| `session_id` | string | The handle to poll. |
+| `instructions` | string | Ready-to-display text for the user, formatted for `login_type`. A client is not expected to build this from the parts. |
+| `device_code`, `device_url`, `qr_code` | string | The parts, for a client that wants to format its own prompt. |
+| `expires_at` | RFC 3339 timestamp | When the session or the flow expires. |
+| `error_code` | string | Machine-readable. See below. |
+| `error_message` | string | For the log, not for a decision. |
+| `groups` | array of string | **Advisory.** The mapper's supplementary groups. This client discards them and nothing calls `setgroups(2)`. See [#39](https://github.com/scttfrdmn/oauth2-pam/issues/39). |
+| `email` | string | Optional, informational. |
+| `requires_device`, `requires_approval` | bool | Legacy hints from before `status` existed. Do not make decisions on them. |
+| `metadata` | object of string→string | `polling_interval` on a pending reply, `provider` and `provider_login` where known. |
+
+### Status values
+
+| `status` | Meaning | Terminal? | Grants access? |
+|---|---|---|---|
+| `pending` | A device flow is started and nobody has approved it yet | no | **no** |
+| `authorized` | Approved, identity mapped, and the mapping matches the requested account | yes | **yes**, with `success: true` |
+| `denied` | Refused: the user denied it at the provider, the identity mapped to a different account, the mapping was refused, or a limit was hit | yes | no |
+| `expired` | The flow or the session ran out of time | yes | no |
+| `error` | Something failed. Read `error_code` | yes, unless the code says otherwise | no |
+| `revoked` | Reply to `revoke_session` only | yes | n/a |
+
+A terminal session remains queryable for a grace period after it ends — two
+minutes in this broker — so a client that is still polling learns the real outcome
+instead of `SESSION_NOT_FOUND`. Deleting the session immediately turned every
+denial into "not found", which is indistinguishable from a broker restart. Do not
+rely on the specific length; do rely on one poll after a terminal outcome getting
+the outcome.
+
+An unrecognised `status` must fail closed. This client logs it and returns
+`PAM_AUTH_ERR`.
+
+### Error codes and retryability
+
+`error_code` exists because `status: "error"` alone cannot be acted on. Every
+error arrives as `status: "error"`, so without reading the code a client cannot
+tell "slow down" from "no".
+
+The one code whose retryability is part of the contract:
+
+- **`RATE_LIMITED` means "slow down", not "no".** Treating it as terminal fails
+  logins that were only being throttled. **Which phase it arrives in decides what
+  to do**, and the two answers are different:
+  - On a **`check_session`** poll it is neither a failure nor an answer. Back off
+    (this client doubles, capped at `MAX_POLL_INTERVAL`) and keep polling. It must
+    *not* be charged to the transport-failure budget: three tries at the normal
+    interval are over in fifteen seconds, well inside the limiter's one-minute
+    window, so a login would die for a condition that clears on its own. The
+    overall deadline is what bounds the wait.
+  - On **`authenticate`** it is effectively terminal for this login. The window is
+    a fixed minute and the login does not have a minute to spend, so this client
+    reports it and stops rather than retrying.
+- **`UNSUPPORTED_PROTOCOL` is terminal.** Retrying the same version gets the same
+  answer.
+
+**Capacity conditions — `AUTH_LIMIT_REACHED` (the host's concurrent device flows)
+and `SESSION_LIMIT_REACHED` (this user's active sessions) — are not retried
+either**, but they deserve to be distinguishable in a log, because they say
+something about the host rather than about the user. `AUTH_LIMIT_REACHED` in
+particular is held by *other* logins for as long as their device flows live, so
+retrying inside this login only spends the user's remaining time to fail again.
+
+The remaining codes are diagnostic. A client that does not recognise a code must
+treat the reply as a failure, which for all of these is the right answer:
+
+| Code | Sent by | Means |
+|---|---|---|
+| `INVALID_REQUEST` | broker, pre-dispatch | the request did not decode, or a field was out of bounds |
+| `INVALID_REQUEST_TYPE` | broker | unknown `type` |
+| `NO_PROVIDER` | broker | `provider` names something not configured |
+| `DEVICE_FLOW_FAILED` | broker | the provider refused to start a device flow |
+| `SESSION_NOT_FOUND` | broker | no such `session_id`, or it aged out past the grace period |
+| `SESSION_EXPIRED` | broker | the session or device code ran out of time |
+| `SESSION_NOT_ACTIVE` | broker | a session verb was used on a session that is not authorized |
+| `AUTHENTICATION_FAILED`, `SESSION_CHECK_FAILED`, `SESSION_REFRESH_FAILED`, `SESSION_REVOCATION_FAILED` | broker | the verb's handler returned an internal error; details are in the broker's log, deliberately not on the wire |
+
+## What this contract deliberately does not do
+
+Stated because their absence is a design decision, not an oversight:
+
+- **No cryptographic binding between the approval and the connection.** Nothing
+  in a reply proves the person who approved at the provider is the person on the
+  other end of the SSH connection. The device authorization grant has no field to
+  put a connection fingerprint into. See
+  [#33](https://github.com/scttfrdmn/oauth2-pam/issues/33).
+- **No authentication of the broker to the client.** The socket's path and mode
+  are the trust anchor; a client that can be pointed at a different socket by an
+  unprivileged user has already lost, which is why the client here refuses a
+  socket path outside the expected directory.
+- **No session reuse.** Every `authenticate` starts a new flow. The contract
+  allows a broker to answer `authorized` immediately — this client handles that
+  reply — but no broker does. See
+  [#34](https://github.com/scttfrdmn/oauth2-pam/issues/34).
+- **No batch or streaming operations.** One request, one reply.
+
+## Conformance
+
+A consumer claiming to speak version 1 must satisfy all of the following. They are
+written as things to *test*, not things to intend, because every item here is
+something at least one implementation in this family has got wrong.
+
+A **client** (PAM module):
+
+1. Grants access only on `success == true` **and** `status == "authorized"`.
+2. Refuses a `status` it does not recognise, and refuses `pending` — including
+   the first reply to `authenticate`, which is always `pending`.
+3. Compares the reply's `user_id` against the account being logged into, and
+   refuses a mismatch. Yes, the broker checks this too. That is the point.
+4. Sends `protocol_version`, and refuses a reply whose version it does not know
+   rather than interpreting its fields.
+5. Treats an absent reply `protocol_version` as 1, so it works against a broker
+   predating the field.
+6. Distinguishes `RATE_LIMITED` from a denial, and backs off on a poll rather than
+   failing the login.
+7. Applies a deadline to every send and receive, so a broker that accepts a
+   connection and then goes silent cannot hang the login.
+8. Bounds the reply it will read instead of growing a buffer to fit.
+
+A **broker**:
+
+1. Answers `authenticate` with `success == false`, `status == "pending"`, and an
+   empty `user_id`. Never anything else, however fast the provider is.
+2. Enforces the mapped-account-equals-requested-account rule itself, and refuses
+   an `authenticate` with an empty `user_id` rather than activating as whatever
+   the identity maps to.
+3. Stamps `protocol_version` on **every** reply, including errors emitted before
+   the request is dispatched.
+4. Refuses an unknown request `protocol_version` with `UNSUPPORTED_PROTOCOL`, and
+   does no work for it.
+5. Keeps a terminal session queryable long enough for one more poll to see the
+   outcome.
+6. Bounds every request field, and rejects an oversized request before decoding
+   it.
+7. Never puts internal error detail on the wire. `error_code` is a category;
+   the detail belongs in the broker's log.
+
+## Testing this contract
+
+Both halves are exercised in this repository, and the claim is meant to be
+checkable rather than taken on trust. A consumer is welcome to lift these as a
+starting point — the conformance list above is what they are checking:
+
+- `internal/ipc/e2e_test.go` drives a real broker over a real socket against a
+  fake provider, including that `authenticate` is not an authentication, that a
+  mapping to a different account does not authorize the requested one, that every
+  reply carries `protocol_version`, and that an unsupported version is refused.
+- `test/cbridge/cbridge_test.c` covers the client's parsing and serialization:
+  which field carries what, a reply exactly the size of the buffer, a broker that
+  accepts and then says nothing, and the version rules above.
+- `test/cbridge/mutations.sh` reintroduces each defect this contract's wording
+  exists to prevent and requires the tests to fail — including a version check
+  that accepts everything.
+- `test/integration/` drives real `ssh` logins through a real PAM stack against a
+  real broker.
