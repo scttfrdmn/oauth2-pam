@@ -23,7 +23,7 @@ const (
 func tokenManagerConfig(key string) *config.Config {
 	return &config.Config{
 		Security: config.SecurityConfig{
-			SecureTokenStorage: key != "",
+			SecureTokenStorage: true,
 			TokenEncryptionKey: key,
 		},
 	}
@@ -93,9 +93,10 @@ func TestStoredTokenIsNotPlaintext(t *testing.T) {
 	}
 }
 
-// TestStorageWithoutEncryptionKey documents the fallback: with no key the token
-// is held in the clear, and the record says so rather than claiming otherwise.
-func TestStorageWithoutEncryptionKey(t *testing.T) {
+// TestStorageWithoutAKeyStillEncrypts covers the shipped default: nothing in
+// configs/example.yaml sets a token_encryption_key, so this is what an
+// administrator who follows it gets. It used to be plaintext in the heap.
+func TestStorageWithoutAKeyStillEncrypts(t *testing.T) {
 	tm, err := NewTokenManager(tokenManagerConfig(""))
 	if err != nil {
 		t.Fatalf("NewTokenManager: %v", err)
@@ -110,8 +111,46 @@ func TestStorageWithoutEncryptionKey(t *testing.T) {
 	stored := tm.tokenStore.tokens[id]
 	tm.tokenStore.mutex.RUnlock()
 
+	if !stored.Encrypted {
+		t.Error("Encrypted = false with no key configured; tokens are plaintext by default again")
+	}
+	if strings.Contains(stored.AccessToken, plaintextToken) {
+		t.Error("the stored blob contains the plaintext token")
+	}
+
+	// The per-process key is unrecoverable but not unusable: this process can
+	// still read back what it wrote, which is all a token in memory needs.
+	got, err := tm.GetDecryptedAccessToken(id)
+	if err != nil {
+		t.Fatalf("GetDecryptedAccessToken: %v", err)
+	}
+	if got != plaintextToken {
+		t.Errorf("token = %q, want %q", got, plaintextToken)
+	}
+}
+
+// TestSecureStorageOffIsPlaintext documents the explicit opt-out. It is the only
+// way to get plaintext now, and it takes writing secure_token_storage: false.
+func TestSecureStorageOffIsPlaintext(t *testing.T) {
+	cfg := tokenManagerConfig("")
+	cfg.Security.SecureTokenStorage = false
+
+	tm, err := NewTokenManager(cfg)
+	if err != nil {
+		t.Fatalf("NewTokenManager: %v", err)
+	}
+
+	id, err := tm.StoreToken("sess-1", "alice", plaintextToken, "", time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("StoreToken: %v", err)
+	}
+
+	tm.tokenStore.mutex.RLock()
+	stored := tm.tokenStore.tokens[id]
+	tm.tokenStore.mutex.RUnlock()
+
 	if stored.Encrypted {
-		t.Error("Encrypted = true with no key configured")
+		t.Error("Encrypted = true with secure_token_storage off")
 	}
 
 	got, err := tm.GetDecryptedAccessToken(id)
@@ -120,6 +159,37 @@ func TestStorageWithoutEncryptionKey(t *testing.T) {
 	}
 	if got != plaintextToken {
 		t.Errorf("token = %q, want %q", got, plaintextToken)
+	}
+}
+
+// Two managers must not share a key. Each generates its own, so a blob from one
+// is unreadable by the other — which is the same property that makes the key
+// worthless to an attacker who only has the ciphertext.
+func TestEphemeralKeysAreNotShared(t *testing.T) {
+	first, err := NewTokenManager(tokenManagerConfig(""))
+	if err != nil {
+		t.Fatalf("NewTokenManager: %v", err)
+	}
+	second, err := NewTokenManager(tokenManagerConfig(""))
+	if err != nil {
+		t.Fatalf("NewTokenManager: %v", err)
+	}
+
+	id, err := first.StoreToken("sess-1", "alice", plaintextToken, "", time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("StoreToken: %v", err)
+	}
+
+	first.tokenStore.mutex.RLock()
+	blob := first.tokenStore.tokens[id]
+	first.tokenStore.mutex.RUnlock()
+
+	second.tokenStore.mutex.Lock()
+	second.tokenStore.tokens[id] = blob
+	second.tokenStore.mutex.Unlock()
+
+	if _, err := second.GetDecryptedAccessToken(id); err == nil {
+		t.Error("a second manager decrypted the first's token; the per-process key is not per-process")
 	}
 }
 

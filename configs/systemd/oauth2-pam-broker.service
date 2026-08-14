@@ -41,7 +41,14 @@ LogsDirectoryMode=0750
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/var/run/oauth2-pam /var/log/oauth2-pam /etc/oauth2-pam
+
+# /etc/oauth2-pam is deliberately absent: the broker only reads from it. It used
+# to be listed, which gave a root process that parses network-sourced identity
+# data write access to its own config and to the enrollment file that decides
+# which provider login becomes which Unix user. ProtectSystem=strict leaves /etc
+# read-only, so oauth2-pam-enroll — a separate CLI, run by an administrator, not
+# under this unit — is the only thing that can change either.
+ReadWritePaths=/var/run/oauth2-pam /var/log/oauth2-pam
 PrivateTmp=true
 
 [Install]

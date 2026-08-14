@@ -443,8 +443,8 @@ func (p *Provider) getUser(ctx context.Context, accessToken string) (*gitHubUser
 }
 
 func (p *Provider) getUserOrgs(ctx context.Context, accessToken string) ([]string, error) {
-	var orgs []gitHubOrg
-	if err := p.apiGet(ctx, accessToken, "/user/orgs", &orgs); err != nil {
+	orgs, err := apiGetAll[gitHubOrg](ctx, p, accessToken, "/user/orgs")
+	if err != nil {
 		return nil, err
 	}
 	result := make([]string, 0, len(orgs))
@@ -455,8 +455,8 @@ func (p *Provider) getUserOrgs(ctx context.Context, accessToken string) ([]strin
 }
 
 func (p *Provider) getUserTeams(ctx context.Context, accessToken string) ([]string, error) {
-	var teams []gitHubTeam
-	if err := p.apiGet(ctx, accessToken, "/user/teams", &teams); err != nil {
+	teams, err := apiGetAll[gitHubTeam](ctx, p, accessToken, "/user/teams")
+	if err != nil {
 		return nil, err
 	}
 	result := make([]string, 0, len(teams))
@@ -466,10 +466,127 @@ func (p *Provider) getUserTeams(ctx context.Context, accessToken string) ([]stri
 	return result, nil
 }
 
-func (p *Provider) apiGet(ctx context.Context, accessToken, path string, dest interface{}) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.endpoints.APIBase+path, nil)
+const (
+	// apiPageSize is GitHub's maximum per_page. The default is 30, and both
+	// /user/orgs and /user/teams are lists a real user overruns — anyone in a
+	// large organisation is on more than 30 teams. A truncated list is not a
+	// cosmetic loss: required_orgs and required_teams are checked against it, so
+	// a member whose org fell off page one was denied the login.
+	apiPageSize = 100
+
+	// maxAPIPages bounds the walk at 2,000 entries. The cursor comes from the
+	// server, so a loop that only stops when it says to is a loop a broken or
+	// hostile API can hold a login open in.
+	maxAPIPages = 20
+)
+
+// apiGetAll fetches every page of a paginated GitHub list endpoint, following the
+// Link header's rel="next" cursor.
+//
+// It is a function rather than a method because Go does not allow type parameters
+// on methods.
+func apiGetAll[T any](ctx context.Context, p *Provider, accessToken, path string) ([]T, error) {
+	next := fmt.Sprintf("%s%s?per_page=%d", p.endpoints.APIBase, path, apiPageSize)
+
+	var all []T
+	for page := 1; next != ""; page++ {
+		if page > maxAPIPages {
+			return nil, fmt.Errorf("GET %s: more than %d pages", path, maxAPIPages)
+		}
+
+		var batch []T
+		link, err := p.apiGetURL(ctx, accessToken, next, &batch)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, batch...)
+
+		// An empty page with a next cursor is how a server could keep this loop
+		// going for free; maxAPIPages is the real bound, but stopping here means
+		// the common case of a server that always emits a cursor costs one extra
+		// request rather than twenty.
+		if len(batch) == 0 {
+			break
+		}
+
+		next, err = p.nextPageURL(link)
+		if err != nil {
+			return nil, fmt.Errorf("GET %s: %w", path, err)
+		}
+	}
+
+	return all, nil
+}
+
+// nextPageURL extracts the rel="next" URL from a Link header, or "" when there is
+// no next page.
+//
+// The URL is checked against the configured API base first. It arrives in a
+// server-controlled header and the next request carries the user's access token,
+// so an unchecked cursor is a way to have this process hand that token to another
+// host. httpClient.CheckRedirect pins hostnames for redirects; a Link header is
+// not a redirect and does not go through it.
+func (p *Provider) nextPageURL(link string) (string, error) {
+	raw := parseNextLink(link)
+	if raw == "" {
+		return "", nil
+	}
+
+	u, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("build request %s: %w", path, err)
+		return "", fmt.Errorf("pagination cursor is not a valid URL: %w", err)
+	}
+	base, err := url.Parse(p.endpoints.APIBase)
+	if err != nil {
+		return "", fmt.Errorf("api_base is not a valid URL: %w", err)
+	}
+	if u.Scheme != base.Scheme || u.Host != base.Host {
+		return "", fmt.Errorf("pagination cursor points at %q, not the configured API at %q",
+			u.Scheme+"://"+u.Host, base.Scheme+"://"+base.Host)
+	}
+
+	return u.String(), nil
+}
+
+// parseNextLink returns the URL of the rel="next" entry in an RFC 8288 Link
+// header value, or "" if there is none.
+func parseNextLink(header string) string {
+	for _, entry := range strings.Split(header, ",") {
+		parts := strings.Split(entry, ";")
+		if len(parts) < 2 {
+			continue
+		}
+
+		target := strings.TrimSpace(parts[0])
+		if !strings.HasPrefix(target, "<") || !strings.HasSuffix(target, ">") {
+			continue
+		}
+
+		for _, param := range parts[1:] {
+			// rel=next and rel="next" are both legal.
+			v := strings.TrimSpace(param)
+			if !strings.HasPrefix(v, "rel=") {
+				continue
+			}
+			if strings.Trim(strings.TrimPrefix(v, "rel="), `"'`) == "next" {
+				return target[1 : len(target)-1]
+			}
+		}
+	}
+	return ""
+}
+
+func (p *Provider) apiGet(ctx context.Context, accessToken, path string, dest interface{}) error {
+	_, err := p.apiGetURL(ctx, accessToken, p.endpoints.APIBase+path, dest)
+	return err
+}
+
+// apiGetURL performs one authenticated GET against an absolute URL and returns
+// the response's Link header.
+func (p *Provider) apiGetURL(ctx context.Context, accessToken, rawURL string, dest interface{}) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("build request %s: %w", rawURL, err)
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/vnd.github+json")
@@ -477,19 +594,19 @@ func (p *Provider) apiGet(ctx context.Context, accessToken, path string, dest in
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("GET %s: %w", path, err)
+		return "", fmt.Errorf("GET %s: %w", rawURL, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("GET %s: unexpected status %d", path, resp.StatusCode)
+		return "", fmt.Errorf("GET %s: unexpected status %d", rawURL, resp.StatusCode)
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(dest); err != nil {
-		return fmt.Errorf("decode %s: %w", path, err)
+		return "", fmt.Errorf("decode %s: %w", rawURL, err)
 	}
 
-	return nil
+	return resp.Header.Get("Link"), nil
 }
 
 // tokenDisplayLabel returns a human-readable prefix…suffix label for audit logs.

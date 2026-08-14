@@ -47,14 +47,32 @@ type StoredToken struct {
 }
 
 // NewTokenManager creates a new TokenManager.
+//
+// Encryption is on unless security.secure_token_storage is explicitly false. A
+// configured token_encryption_key is used if present; otherwise the manager
+// generates a per-process key, because the alternative — the previous behaviour —
+// was to hold access tokens as plaintext in the heap for anyone who omitted a
+// key, which is every administrator who took the shipped default. Tokens are
+// never written anywhere, so a key that dies with the process costs nothing.
+// See security.NewEphemeralEncryption for what that does and does not buy.
 func NewTokenManager(cfg *config.Config) (*TokenManager, error) {
 	var enc *security.Encryption
-	if cfg.Security.SecureTokenStorage && cfg.Security.TokenEncryptionKey != "" {
+	switch {
+	case !cfg.Security.SecureTokenStorage:
+		log.Warn().Msg("security.secure_token_storage is false; access tokens will be held as plaintext in memory")
+	case cfg.Security.TokenEncryptionKey != "":
 		e, err := security.NewEncryption(cfg.Security.TokenEncryptionKey)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize token encryption: %w", err)
 		}
 		enc = e
+	default:
+		e, err := security.NewEphemeralEncryption()
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize token encryption: %w", err)
+		}
+		enc = e
+		log.Info().Msg("No security.token_encryption_key set; encrypting tokens under a per-process key")
 	}
 
 	return &TokenManager{

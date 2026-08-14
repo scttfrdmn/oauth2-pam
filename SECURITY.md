@@ -68,10 +68,14 @@ This is pre-1.0 software with no third-party audit. Concretely, as of v0.2.0:
   bypass in the C makes it fail.
 - **A login against real github.com has never been verified by the test suite.**
   Everything above fakes the provider.
-- Tokens are held encrypted in memory (AES-256-GCM) and never written to disk,
-  when `secure_token_storage` is on and a key is set. They remain in process
-  memory in plaintext form transiently, and are not protected against an
-  attacker who can read the broker's memory or its core dumps.
+- Tokens are held encrypted in memory (AES-256-GCM) and never written to disk.
+  With no `token_encryption_key` configured the broker generates one for the
+  process, so the shipped default is encryption rather than plaintext; that key
+  lives in the same heap as the ciphertext, so it defends against a core dump or
+  a page that reached swap, not against an attacker who can read the broker's
+  live memory. `secure_token_storage: false` is the only way to get plaintext.
+  Tokens are in plaintext transiently in either case, and the provider and
+  `net/http` have already made copies that nothing here can reach.
 
 ## Security scanning
 

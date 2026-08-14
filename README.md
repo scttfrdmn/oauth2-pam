@@ -106,6 +106,10 @@ mapper:
       groups: [users]
 ```
 
+A key the broker does not recognise is a startup error naming that key, so a typo
+fails loudly instead of leaving the default in place. If a config from an earlier
+version stops loading, the setting it names was being ignored already.
+
 #### Where the client secret comes from
 
 Three sources, highest precedence first:
@@ -382,7 +386,8 @@ oauth2-pam/
 
 ## Security notes
 
-- Tokens are held encrypted in memory (AES-256-GCM) when `secure_token_storage: true` and a `token_encryption_key` is set. They are never written to disk. Generate the key with `oauth2-pam-admin gen-key` rather than typing one: 32 typeable characters cannot carry 256 bits.
+- Tokens are held encrypted in memory (AES-256-GCM) and never written to disk. Set `token_encryption_key` with `oauth2-pam-admin gen-key` rather than typing one: 32 typeable characters cannot carry 256 bits. With no key configured the broker generates one for the process instead of storing tokens in the clear — an unrecoverable key is no loss for data that never outlives the process, and it means the default is not plaintext. `secure_token_storage: false` opts out.
+- Audit records go to `file`, `stdout`, or `syslog`; anything else is a startup error. An unrecognised type used to become `stdout`, so a typo moved the whole trail somewhere nobody was watching.
 - The broker socket is `0660` in a `0750` directory. The PAM module runs as root and so can reach it; other local users cannot, which matters because anything that can talk to the socket can start device flows.
 - The broker rate-limits per calling UID and caps request bodies at 64 KB. The UID comes from the socket's peer credentials (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED` on macOS/FreeBSD); if a platform cannot supply them the broker logs `peer_credentials=false` at startup and every caller shares one window, rather than all being recorded as root.
 - The client secret can be kept out of the config entirely — a systemd credential, a file, or an environment variable ([above](#where-the-client-secret-comes-from)). Whichever file holds it must be 0600 and owned by root or the broker's uid, including `broker.yaml` itself when the secret is inline; the broker refuses to start rather than treat a world-readable secret as confidential.

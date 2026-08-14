@@ -26,12 +26,27 @@ const Size = 32
 // 256-bit slot. The base64 form is 44 characters, so a full-entropy key is
 // expressible in a YAML file.
 func Generate() (string, error) {
-	b := make([]byte, Size)
-	if _, err := rand.Read(b); err != nil {
-		return "", fmt.Errorf("read random bytes: %w", err)
+	b, err := GenerateBytes()
+	if err != nil {
+		return "", err
 	}
 	defer Zero(b)
 	return base64.StdEncoding.EncodeToString(b), nil
+}
+
+// GenerateBytes returns Size random bytes from crypto/rand: a key in the form
+// aes.NewCipher wants, with no string ever made of it.
+//
+// Generate's base64 output is for a human to paste into a config file, and a Go
+// string cannot be zeroized. Callers that only need a key for this process —
+// see security.NewEphemeralEncryption — should take the bytes and skip the
+// round trip through a form built for typing.
+func GenerateBytes() ([]byte, error) {
+	b := make([]byte, Size)
+	if _, err := rand.Read(b); err != nil {
+		return nil, fmt.Errorf("read random bytes: %w", err)
+	}
+	return b, nil
 }
 
 // Validate reports whether key is usable as an AES key, in the same terms Decode

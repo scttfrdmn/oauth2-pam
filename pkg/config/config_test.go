@@ -105,6 +105,31 @@ func TestValidate(t *testing.T) {
 		{"unknown audit event", func(c *Config) { c.Audit.Events = []string{"authentication_sucess"} }, "unknown event type"},
 		{"empty audit events is allowed", func(c *Config) { c.Audit.Events = nil }, ""},
 
+		// An unrecognised sink type used to fall back to stdout, so a typo moved
+		// the whole audit trail without saying anything.
+		{"unknown audit output type", func(c *Config) {
+			c.Audit.Outputs = []AuditOutput{{Type: "webhook", Path: ""}}
+		}, "not supported"},
+		{"audit output without a type", func(c *Config) {
+			c.Audit.Outputs = []AuditOutput{{Path: "/var/log/oauth2-pam/audit.log"}}
+		}, "type is required"},
+		{"file output without a path", func(c *Config) {
+			c.Audit.Outputs = []AuditOutput{{Type: "file"}}
+		}, "path is required"},
+		{"path on a stdout output", func(c *Config) {
+			c.Audit.Outputs = []AuditOutput{{Type: "stdout", Path: "/var/log/oauth2-pam/audit.log"}}
+		}, "applies only to type"},
+		{"facility on a file output", func(c *Config) {
+			c.Audit.Outputs = []AuditOutput{{Type: "file", Path: "/tmp/a.log", Facility: "auth"}}
+		}, "apply only to type"},
+		{"file output with a path", func(c *Config) {
+			c.Audit.Outputs = []AuditOutput{{Type: "file", Path: "/var/log/oauth2-pam/audit.log"}}
+		}, ""},
+		{"syslog output with facility and severity", func(c *Config) {
+			c.Audit.Outputs = []AuditOutput{{Type: "syslog", Facility: "authpriv", Severity: "notice"}}
+		}, ""},
+		{"no outputs is allowed", func(c *Config) { c.Audit.Outputs = nil }, ""},
+
 		{"16-byte key", func(c *Config) { c.Security.TokenEncryptionKey = strings.Repeat("a", 16) }, ""},
 		{"24-byte key", func(c *Config) { c.Security.TokenEncryptionKey = strings.Repeat("a", 24) }, ""},
 		{"32-byte key", func(c *Config) { c.Security.TokenEncryptionKey = strings.Repeat("a", 32) }, ""},
@@ -265,6 +290,58 @@ func TestLoadConfig(t *testing.T) {
 	// An explicit list replaces the defaults rather than merging with them.
 	if len(cfg.Audit.Events) != 2 {
 		t.Errorf("audit.events = %v, want exactly the two configured events", cfg.Audit.Events)
+	}
+}
+
+// TestLoadConfigRejectsUnknownKeys is the general fix for this project's
+// recurring bug: the setting that is read, ignored, and believed. A lenient
+// decoder makes a removed field and a typo look identical to a correct config,
+// which is how `server.audit_log` and `audit.outputs[].url` survived, and how a
+// misspelled `secure_token_storage` would leave tokens in plaintext silently.
+func TestLoadConfigRejectsUnknownKeys(t *testing.T) {
+	// sampleYAML's audit block is last, so an extra key under audit can be
+	// appended; anything else has to go inside a section that already exists,
+	// because a repeated top-level key is a YAML error rather than a decode one.
+	tests := []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{"typo at the top level", sampleYAML + "securty:\n  max_token_age: 2h\n", "securty"},
+		{
+			"typo in a nested key",
+			strings.Replace(sampleYAML, "  log_level: debug", "  log_level: debug\n  read_timout: 10s", 1),
+			"read_timout",
+		},
+		{
+			"removed field",
+			strings.Replace(sampleYAML, "  log_level: debug", "  log_level: debug\n  audit_log: /var/log/oauth2-pam/audit.log", 1),
+			"audit_log",
+		},
+		{
+			"removed audit output field",
+			sampleYAML + "  outputs:\n    - type: file\n      path: /tmp/a.log\n      url: https://siem.example.com/ingest\n",
+			"url",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(tc.yaml), 0600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+
+			_, err := LoadConfig(path)
+			if err == nil {
+				t.Fatalf("LoadConfig accepted a config containing %q", tc.want)
+			}
+			// The message has to name the offending key, or an operator cannot act
+			// on it.
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %v, want it to name %q", err, tc.want)
+			}
+		})
 	}
 }
 

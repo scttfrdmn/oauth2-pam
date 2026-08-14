@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -76,18 +77,22 @@ func NewAuditLogger(cfg config.AuditConfig) (*AuditLogger, error) {
 	}
 
 	var outputs []AuditOutput
-	for _, oc := range cfg.Outputs {
+	for i, oc := range cfg.Outputs {
 		out, err := newAuditOutput(oc)
 		if err != nil {
-			return nil, fmt.Errorf("create audit output: %w", err)
+			// Close what is already open: this error fails broker startup, and
+			// nothing else holds a reference to these sinks.
+			for _, o := range outputs {
+				_ = o.Close()
+			}
+			return nil, fmt.Errorf("audit.outputs[%d]: %w", i, err)
 		}
 		outputs = append(outputs, out)
 	}
 
 	// Default to stdout if no outputs configured
 	if len(outputs) == 0 {
-		out, _ := newAuditOutput(config.AuditOutput{Type: "stdout"})
-		outputs = append(outputs, out)
+		outputs = append(outputs, &stdoutOutput{})
 	}
 
 	return &AuditLogger{
@@ -229,14 +234,23 @@ func (al *AuditLogger) writeEvent(event AuditEvent) {
 
 // --- output implementations ---
 
+// newAuditOutput builds the sink cfg describes.
+//
+// An unrecognised type is an error. It used to fall through to stdout, so a
+// misspelled type produced a broker that started cleanly and wrote its audit
+// trail somewhere nobody was looking. config.Validate rejects unknown types
+// before this is reached; this is the backstop for a Config built in code.
 func newAuditOutput(cfg config.AuditOutput) (AuditOutput, error) {
 	switch cfg.Type {
 	case "file":
 		return newFileOutput(cfg)
 	case "syslog":
-		return &syslogOutput{cfg: cfg}, nil
-	default: // "stdout" or unrecognized
+		return newSyslogOutput(cfg)
+	case "stdout":
 		return &stdoutOutput{}, nil
+	default:
+		return nil, fmt.Errorf("unsupported type %q (supported: %s)",
+			cfg.Type, strings.Join(config.SupportedAuditOutputTypes, ", "))
 	}
 }
 
@@ -270,17 +284,3 @@ func (o *fileOutput) Write(data []byte) error {
 }
 
 func (o *fileOutput) Close() error { return o.file.Close() }
-
-type syslogOutput struct {
-	cfg config.AuditOutput
-}
-
-func (o *syslogOutput) Write(data []byte) error {
-	log.Info().
-		Str("facility", o.cfg.Facility).
-		RawJSON("event", data).
-		Msg("audit")
-	return nil
-}
-
-func (o *syslogOutput) Close() error { return nil }

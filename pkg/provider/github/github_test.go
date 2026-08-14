@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -477,6 +478,193 @@ func TestGetIdentityToleratesOrgAndTeamFailures(t *testing.T) {
 		t.Errorf("org = %v, team = %v, want both empty",
 			id.Claim(provider.ClaimOrg), id.Claim(provider.ClaimTeam))
 	}
+}
+
+// TestOrgAndTeamListsArePaginated: GitHub's default page size is 30, and a member
+// of a large organisation is on more than 30 teams. required_teams is checked
+// against this list, so a truncated page one denied logins that should have
+// succeeded.
+func TestOrgAndTeamListsArePaginated(t *testing.T) {
+	var base string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/user", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"login":"alice"}`))
+	})
+
+	var orgPages, teamPages atomic.Int32
+	mux.HandleFunc("/user/orgs", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("per_page"); got != "100" {
+			t.Errorf("per_page = %q, want 100", got)
+		}
+		if r.URL.Query().Get("page") == "" {
+			// First page: 100 entries and a cursor, exactly as GitHub replies.
+			orgPages.Add(1)
+			w.Header().Set("Link", `<`+base+`/user/orgs?per_page=100&page=2>; rel="next", <`+base+`/user/orgs?per_page=100&page=2>; rel="last"`)
+			_, _ = w.Write([]byte(jsonList("org-%d", 100, `{"login":"%s"}`)))
+			return
+		}
+		orgPages.Add(1)
+		_, _ = w.Write([]byte(jsonList("late-org-%d", 5, `{"login":"%s"}`)))
+	})
+	mux.HandleFunc("/user/teams", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("page") == "" {
+			teamPages.Add(1)
+			// rel=next without quotes is equally legal.
+			w.Header().Set("Link", `<`+base+`/user/teams?per_page=100&page=2>; rel=next`)
+			_, _ = w.Write([]byte(jsonList("team-%d", 100, `{"slug":"%s","organization":{"login":"acme"}}`)))
+			return
+		}
+		teamPages.Add(1)
+		_, _ = w.Write([]byte(jsonList("late-team-%d", 2, `{"slug":"%s","organization":{"login":"acme"}}`)))
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	base = srv.URL
+
+	id, err := providerFor(t, srv.URL).GetIdentity(context.Background(), &provider.Token{AccessToken: "gho_abc"})
+	if err != nil {
+		t.Fatalf("GetIdentity: %v", err)
+	}
+
+	if got := len(id.Claim(provider.ClaimOrg)); got != 105 {
+		t.Errorf("orgs = %d, want 105; the second page was dropped", got)
+	}
+	if got := len(id.Claim(provider.ClaimTeam)); got != 102 {
+		t.Errorf("teams = %d, want 102; the second page was dropped", got)
+	}
+	if got := orgPages.Load(); got != 2 {
+		t.Errorf("fetched %d org pages, want 2", got)
+	}
+	if got := teamPages.Load(); got != 2 {
+		t.Errorf("fetched %d team pages, want 2", got)
+	}
+
+	// The last page has no cursor, so the walk must stop rather than keep asking.
+	if teams := id.Claim(provider.ClaimTeam); teams[101] != "acme/late-team-1" {
+		t.Errorf("last team = %q, want acme/late-team-1", teams[101])
+	}
+}
+
+// A cursor is a server-controlled URL and the next request carries the user's
+// access token, so one pointing elsewhere must not be followed. CheckRedirect
+// does not cover this: a Link header is not a redirect.
+func TestPaginationCursorToAnotherHostIsRefused(t *testing.T) {
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("the access token was sent to another host: %s %s", r.Method, r.URL.Path)
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer elsewhere.Close()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/user", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"login":"alice"}`))
+	})
+	mux.HandleFunc("/user/orgs", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Link", `<`+elsewhere.URL+`/user/orgs?page=2>; rel="next"`)
+		_, _ = w.Write([]byte(`[{"login":"acme"}]`))
+	})
+	mux.HandleFunc("/user/teams", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`[]`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// GetIdentity degrades org failures to an empty list rather than failing the
+	// login, so the assertion that matters is the one inside the other server's
+	// handler; this checks the refusal reached that path.
+	id, err := providerFor(t, srv.URL).GetIdentity(context.Background(), &provider.Token{AccessToken: "gho_abc"})
+	if err != nil {
+		t.Fatalf("GetIdentity: %v", err)
+	}
+	if got := id.Claim(provider.ClaimOrg); len(got) != 0 {
+		t.Errorf("orgs = %v, want empty: a rejected cursor must not leave a partial list that an org requirement is then checked against", got)
+	}
+}
+
+// The cursor comes from the server, so the walk cannot rely on it ever saying
+// "done" — a login must not be held open by a list that never ends.
+func TestPaginationStopsAtThePageLimit(t *testing.T) {
+	var requests atomic.Int32
+	var base string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Link", `<`+base+`/user/orgs?per_page=100&page=99>; rel="next"`)
+		_, _ = w.Write([]byte(`[{"login":"acme"}]`))
+	}))
+	defer srv.Close()
+	base = srv.URL
+
+	_, err := providerFor(t, srv.URL).getUserOrgs(context.Background(), "gho_abc")
+	if err == nil {
+		t.Fatal("getUserOrgs followed an endless cursor to completion")
+	}
+	if got := requests.Load(); got != maxAPIPages {
+		t.Errorf("made %d requests, want %d", got, maxAPIPages)
+	}
+}
+
+// An empty page with a cursor is the cheapest way to spin the loop, so it ends
+// the walk rather than costing the full page budget.
+func TestPaginationStopsOnAnEmptyPage(t *testing.T) {
+	var requests atomic.Int32
+	var base string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Link", `<`+base+`/user/orgs?per_page=100&page=2>; rel="next"`)
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+	base = srv.URL
+
+	orgs, err := providerFor(t, srv.URL).getUserOrgs(context.Background(), "gho_abc")
+	if err != nil {
+		t.Fatalf("getUserOrgs: %v", err)
+	}
+	if len(orgs) != 0 {
+		t.Errorf("orgs = %v, want empty", orgs)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Errorf("made %d requests, want 1", got)
+	}
+}
+
+func TestParseNextLink(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string
+		want   string
+	}{
+		{"empty", "", ""},
+		{"quoted rel", `<https://api.github.com/user/orgs?page=2>; rel="next"`, "https://api.github.com/user/orgs?page=2"},
+		{"bare rel", `<https://api.github.com/user/orgs?page=2>; rel=next`, "https://api.github.com/user/orgs?page=2"},
+		{
+			"next among several",
+			`<https://api.github.com/u?page=1>; rel="prev", <https://api.github.com/u?page=3>; rel="next", <https://api.github.com/u?page=9>; rel="last"`,
+			"https://api.github.com/u?page=3",
+		},
+		{"last page has no next", `<https://api.github.com/u?page=1>; rel="first", <https://api.github.com/u?page=1>; rel="prev"`, ""},
+		{"malformed target", `https://api.github.com/u?page=2; rel="next"`, ""},
+		{"no params", `<https://api.github.com/u?page=2>`, ""},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseNextLink(tc.header); got != tc.want {
+				t.Errorf("parseNextLink(%q) = %q, want %q", tc.header, got, tc.want)
+			}
+		})
+	}
+}
+
+// jsonList builds a JSON array of n objects, each entryFmt with a name from
+// nameFmt.
+func jsonList(nameFmt string, n int, entryFmt string) string {
+	entries := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		entries = append(entries, fmt.Sprintf(entryFmt, fmt.Sprintf(nameFmt, i)))
+	}
+	return "[" + strings.Join(entries, ",") + "]"
 }
 
 func TestCheckAccess(t *testing.T) {

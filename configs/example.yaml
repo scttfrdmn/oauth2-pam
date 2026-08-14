@@ -290,6 +290,11 @@ audit:
   enabled: true
   format: json
 
+  # type is one of file, stdout or syslog. An unrecognised one is a startup
+  # error: it used to fall back to stdout, so `type: fille` gave a broker that
+  # started cleanly and wrote its audit trail somewhere nobody was watching.
+  # There is no webhook sink — url and headers were parsed and ignored, and are
+  # now rejected.
   outputs:
     - type: file
       path: /var/log/oauth2-pam/audit.log
@@ -297,7 +302,14 @@ audit:
     # Uncomment to also log to stdout (useful for journald / Docker)
     # - type: stdout
 
-    # Uncomment to log to syslog
+    # Uncomment to log to the local syslog daemon. facility is one of auth,
+    # authpriv, daemon, user or local0-local7; severity is one of emerg, alert,
+    # crit, err, warning, notice, info or debug. Both are optional and default
+    # to auth.info, which is where sshd's own accept and reject lines go — the
+    # audit trail can then be read against them in one pass.
+    #
+    # A syslog daemon may truncate a long line (1024 bytes is common), so keep
+    # the file sink as well where records must be complete.
     # - type: syslog
     #   facility: auth
     #   severity: info

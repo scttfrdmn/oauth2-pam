@@ -259,7 +259,77 @@ Six more in the C bridge, each with a regression test in `test/cbridge`:
   retry would just spend the user's remaining time to fail again — but both are now
   logged as the capacity conditions they are rather than as a broker error.
 
+And four more in the broker's own defaults:
+
+- **Access tokens were held in plaintext under the shipped configuration.**
+  `secure_token_storage` defaults to true, but encryption was skipped unless a
+  `token_encryption_key` was also set — and nothing shipped one, including
+  `configs/example.yaml`. So an administrator who followed the example got exactly
+  what the setting promised to prevent: live GitHub credentials in a root process's
+  heap, readable from a core dump or a swapped page. With no key configured the
+  broker now generates one from `crypto/rand` for the life of the process. A key
+  that dies with the process costs nothing here, because tokens never outlive it
+  either — there is no ciphertext left to decrypt. It is not as good as a
+  configured key (the key sits in the same heap as the ciphertext), and it is
+  vastly better than plaintext. `secure_token_storage: false` is now the only way
+  to get plaintext, and it logs a warning.
+
+- **A misspelled audit output type silently redirected the audit trail.**
+  `newAuditOutput` fell through to stdout for anything it did not recognise, so
+  `type: fille` produced a broker that started cleanly and wrote its records to
+  the journal instead of the file that was configured — discovered, at the
+  earliest, during an incident. `audit.outputs[].type` is now validated against
+  `stdout`, `file`, and `syslog`, `path` is required for `file` and rejected on the
+  others, and `facility`/`severity` are rejected on anything but `syslog`. A field
+  set on the wrong sink is an error rather than something ignored.
+
+- **Org and team membership was truncated at 30 entries.** `/user/orgs` and
+  `/user/teams` were fetched without `per_page` and without following the `Link`
+  cursor, so only GitHub's first default-sized page arrived. `require_org` and
+  `require_team` are checked against that list, so a member of a large
+  organisation — anyone on more than 30 teams — could be denied a login they were
+  entitled to. Both endpoints now request 100 per page and follow `rel="next"` to
+  the end, bounded at 20 pages. A cursor pointing at a different host is refused:
+  it arrives in a server-controlled header, the next request carries the user's
+  access token, and `CheckRedirect` does not see it because a `Link` header is not
+  a redirect.
+
+- **The broker unit had write access to its own configuration.**
+  `ReadWritePaths=/etc/oauth2-pam` let a root process that parses
+  network-sourced identity data rewrite `broker.yaml` and the enrollment file that
+  decides which provider login becomes which Unix user. The broker only reads
+  both; `oauth2-pam-enroll` is what writes the enrollment file, and it is run by
+  an administrator, not by this unit. Removed, leaving `ProtectSystem=strict` to
+  keep `/etc` read-only.
+
 ### Changed
+
+- **`audit.outputs[].type: syslog` now writes to syslog.** It used to hand the
+  record to the broker's own logger with the configured facility attached as a
+  JSON field, which under systemd meant the journal and elsewhere meant wherever
+  stderr pointed — not what `type: syslog` with `facility: auth` says, and not
+  routed by facility at all. It now opens the local syslog socket at startup, so a
+  host with no syslog daemon fails to start rather than quietly logging elsewhere.
+  `facility` accepts `auth`, `authpriv`, `daemon`, `user`, and `local0`–`local7`;
+  `severity` accepts the eight RFC 5424 names; the default is `auth.info`, beside
+  sshd's own records. Note that a syslog daemon may truncate a long line, so keep
+  the `file` sink where records must be complete.
+
+- **An unknown key in `broker.yaml` is now a startup error.** The config was
+  decoded leniently, so a key with no matching field was discarded in silence —
+  which is how `server.audit_log` and `audit.outputs[].url` came to look like
+  working settings, and how a misspelled `secure_token_storge: false` would leave
+  tokens in plaintext without a word. The error names the offending key. Anything
+  removed in 0.2.0 or 0.3.0 and still present in a config file now has to come
+  out, which is the point: those keys have not done anything for a release
+  already.
+
+- **`audit.outputs[].url` and `.headers` are gone.** Both were parsed and never
+  read — there has never been a webhook sink — so a config that appeared to post
+  audit records to a SIEM was accepted and wrote to stdout instead. With strict
+  decoding above, they are now refused by name rather than ignored, which is the
+  only version of this that tells an operator the truth. Anything relying on them
+  was already not working.
 
 - **`authentication.device_flow_timeout` (new, default `3m`)** bounds how long the
   broker waits for a user to approve a device flow. Previously the bound was the

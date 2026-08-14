@@ -28,6 +28,34 @@ func NewEncryption(key string) (*Encryption, error) {
 	if err != nil {
 		return nil, fmt.Errorf("encryption key %w", err)
 	}
+	return newEncryption(k)
+}
+
+// NewEphemeralEncryption creates an Encryption instance under a fresh key from
+// crypto/rand that exists only for the life of this process.
+//
+// This is for data that is never persisted, where the point of encryption is to
+// keep plaintext out of the process image rather than to be able to read
+// something back later. Tokens are exactly that: they live in a map in memory
+// and are gone at shutdown, so nothing is lost by the key being unrecoverable —
+// there will never be a ciphertext left to decrypt.
+//
+// It means an administrator who sets no token_encryption_key gets AES-256-GCM
+// instead of plaintext. That is a real improvement over nothing, and it is not
+// as good as a configured key: the key bytes sit in this process's heap, so an
+// attacker who can read that memory has both halves. What it defends against is
+// the narrower and more common case — a core dump, a heap-inspecting bug, a page
+// that reached swap — where the ciphertext travels and the round keys do not.
+func NewEphemeralEncryption() (*Encryption, error) {
+	k, err := keys.GenerateBytes()
+	if err != nil {
+		return nil, fmt.Errorf("generate ephemeral encryption key: %w", err)
+	}
+	return newEncryption(k)
+}
+
+// newEncryption builds the AEAD from raw key bytes and zeroizes them.
+func newEncryption(k []byte) (*Encryption, error) {
 	// aes.NewCipher copies the key into its expanded round keys, so this copy is
 	// dead weight the moment the cipher exists. See keys.Zero for what that is
 	// worth.

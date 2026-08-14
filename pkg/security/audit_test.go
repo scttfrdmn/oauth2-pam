@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"log/syslog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -315,16 +316,62 @@ func TestStopFlushesQueuedEvents(t *testing.T) {
 	}
 }
 
-func TestUnknownOutputTypeFallsBackToStdout(t *testing.T) {
-	out, err := newAuditOutput(config.AuditOutput{Type: "carrier-pigeon"})
-	if err != nil {
-		t.Fatalf("newAuditOutput: %v", err)
+// An unknown type must be refused, not quietly turned into stdout. The old
+// fallback meant `type: fille` produced a broker that started clean and wrote its
+// audit trail to the journal instead of the configured file.
+func TestUnknownOutputTypeIsRejected(t *testing.T) {
+	if _, err := newAuditOutput(config.AuditOutput{Type: "carrier-pigeon"}); err == nil {
+		t.Error("newAuditOutput accepted an unknown type; the audit trail would silently go to stdout")
 	}
-	if _, ok := out.(*stdoutOutput); !ok {
-		t.Errorf("got %T, want *stdoutOutput", out)
+
+	_, err := NewAuditLogger(config.AuditConfig{
+		Enabled: true,
+		Outputs: []config.AuditOutput{{Type: "carrier-pigeon"}},
+	})
+	if err == nil {
+		t.Error("NewAuditLogger accepted an unknown output type")
+	}
+}
+
+// TestSyslogOutputConnects covers the part that can fail on a real host: the
+// dial. It writes nothing, so a developer's auth.log does not fill with test
+// records. It skips where there is no syslog daemon — a container, usually —
+// rather than failing, because the absence of one is a property of the machine
+// and not of this code.
+func TestSyslogOutputConnects(t *testing.T) {
+	out, err := newSyslogOutput(config.AuditOutput{Type: "syslog", Facility: "local7", Severity: "debug"})
+	if err != nil {
+		t.Skipf("no syslog daemon reachable: %v", err)
 	}
 	if err := out.Close(); err != nil {
 		t.Errorf("Close: %v", err)
+	}
+}
+
+func TestSyslogPriority(t *testing.T) {
+	// Defaults: auth.info, so audit records land beside sshd's own.
+	pri, err := syslogPriority("", "")
+	if err != nil {
+		t.Fatalf("syslogPriority: %v", err)
+	}
+	if want := syslog.LOG_AUTH | syslog.LOG_INFO; pri != want {
+		t.Errorf("default priority = %d, want %d (auth.info)", pri, want)
+	}
+
+	pri, err = syslogPriority("LOCAL3", "Warning")
+	if err != nil {
+		t.Fatalf("syslogPriority: %v", err)
+	}
+	if want := syslog.LOG_LOCAL3 | syslog.LOG_WARNING; pri != want {
+		t.Errorf("local3.warning = %d, want %d; names must be case-insensitive", pri, want)
+	}
+
+	// A typo is a startup error, not a record logged somewhere unexpected.
+	if _, err := syslogPriority("athu", ""); err == nil {
+		t.Error("syslogPriority accepted a misspelled facility")
+	}
+	if _, err := syslogPriority("", "verbose"); err == nil {
+		t.Error("syslogPriority accepted an unknown severity")
 	}
 }
 

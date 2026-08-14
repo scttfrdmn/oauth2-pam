@@ -33,6 +33,15 @@ var KnownAuditEvents = []string{
 // listed here would be rejected by Validate before it could ever be built.
 var SupportedProviderTypes = []string{"github"}
 
+// SupportedAuditOutputTypes lists the values audit.outputs[].type may take.
+//
+// Validate checks against it because the sink constructor used to fall back to
+// stdout for anything it did not recognise. `type: fille` therefore produced a
+// working broker whose audit trail went to the journal instead of the file an
+// administrator had configured, with nothing anywhere saying so — the failure
+// mode is discovering it during an incident, when the records are wanted.
+var SupportedAuditOutputTypes = []string{"stdout", "file", "syslog"}
+
 // Config represents the complete configuration for the oauth2-pam broker
 type Config struct {
 	Server         ServerConfig         `mapstructure:"server"`
@@ -238,14 +247,26 @@ type AuditConfig struct {
 	Events  []string      `mapstructure:"events"`
 }
 
-// AuditOutput defines where audit logs are sent
+// AuditOutput defines where audit logs are sent.
+//
+// There is deliberately no url or headers field. Both were parsed and never
+// read — there has never been a webhook sink — so a config that posted audit
+// records to a SIEM was accepted, ignored, and silently wrote to stdout instead.
 type AuditOutput struct {
-	Type     string            `mapstructure:"type"` // "file", "stdout", "syslog"
-	Path     string            `mapstructure:"path"`
-	URL      string            `mapstructure:"url"`
-	Headers  map[string]string `mapstructure:"headers"`
-	Facility string            `mapstructure:"facility"`
-	Severity string            `mapstructure:"severity"`
+	// Type is one of SupportedAuditOutputTypes.
+	Type string `mapstructure:"type"`
+
+	// Path is the audit file, required for type "file" and meaningless for the
+	// others.
+	Path string `mapstructure:"path"`
+
+	// Facility and Severity name the syslog priority to log at, for type
+	// "syslog". Both are optional (auth.info by default) and meaningless for the
+	// other types. The accepted names are defined in pkg/security, which owns the
+	// mapping to syslog's constants; a bad one is a startup error from there
+	// rather than a duplicated list here.
+	Facility string `mapstructure:"facility"`
+	Severity string `mapstructure:"severity"`
 }
 
 // LoadConfig loads configuration from a YAML file and resolves each provider's
@@ -278,7 +299,16 @@ func LoadConfig(configPath string) (*Config, error) {
 	}
 
 	var config Config
-	if err := v.Unmarshal(&config); err != nil {
+	// UnmarshalExact, not Unmarshal: a key with no matching field is an error.
+	//
+	// This project's recurring bug has been the setting that is read, ignored, and
+	// believed — server.audit_log, audit.outputs[].url, six fields in 0.2.0 — and
+	// every one of them was invisible because a lenient decoder discards what it
+	// does not recognise. So does a typo: `secure_token_storge: true` left tokens
+	// in plaintext and said nothing. An operator who writes a key into this file
+	// means it, and the only way to keep that promise is to refuse the ones that
+	// cannot be kept.
+	if err := v.UnmarshalExact(&config); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
@@ -402,6 +432,29 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	for i, o := range c.Audit.Outputs {
+		if o.Type == "" {
+			return fmt.Errorf("audit.outputs[%d].type is required (one of: %s)",
+				i, strings.Join(SupportedAuditOutputTypes, ", "))
+		}
+		if !isSupportedAuditOutputType(o.Type) {
+			return fmt.Errorf("audit.outputs[%d].type %q is not supported (supported: %s)",
+				i, o.Type, strings.Join(SupportedAuditOutputTypes, ", "))
+		}
+		// A field set on the wrong sink type is an error rather than something
+		// ignored, because every way of ignoring it ends with an audit trail
+		// somewhere other than where it was configured to go.
+		if o.Type == "file" && o.Path == "" {
+			return fmt.Errorf("audit.outputs[%d].path is required for type \"file\"", i)
+		}
+		if o.Type != "file" && o.Path != "" {
+			return fmt.Errorf("audit.outputs[%d].path applies only to type \"file\", not %q", i, o.Type)
+		}
+		if o.Type != "syslog" && (o.Facility != "" || o.Severity != "") {
+			return fmt.Errorf("audit.outputs[%d]: facility and severity apply only to type \"syslog\", not %q", i, o.Type)
+		}
+	}
+
 	// What counts as a valid key is defined once, in pkg/security/keys, so this
 	// check and the one at cipher construction cannot drift apart.
 	if c.Security.SecureTokenStorage && c.Security.TokenEncryptionKey != "" {
@@ -439,6 +492,15 @@ func (c *Config) Validate() error {
 
 func isSupportedProviderType(t string) bool {
 	for _, s := range SupportedProviderTypes {
+		if s == t {
+			return true
+		}
+	}
+	return false
+}
+
+func isSupportedAuditOutputType(t string) bool {
+	for _, s := range SupportedAuditOutputTypes {
 		if s == t {
 			return true
 		}
