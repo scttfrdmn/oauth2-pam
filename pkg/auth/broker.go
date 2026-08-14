@@ -1084,6 +1084,20 @@ func (b *Broker) pollDeviceAuthorization(
 						Str("local_user", mapResult.LocalUser).
 						Msg("Could not record the authentication; refusing the login rather than granting one that is not recorded")
 					b.tokenManager.RevokeToken(tokenID)
+					// "The record was not written" and "no sink has the record" are
+					// different facts, and this error only ever meant the first (#91).
+					// Every sink is attempted whatever the earlier ones did, so a broken
+					// file output among several returns an error while syslog holds the
+					// record; and a write that overran its deadline is still in progress
+					// with the bytes already in the file. Where the record may be
+					// readable, the refusal has to be recorded against it — otherwise
+					// failSession refuses the login in silence and the trail's last word
+					// on this session is an authentication_success indistinguishable
+					// from a real grant.
+					if security.RecordMayHaveLanded(err) {
+						b.correctRecordedAuthentication(sessionID, mapResult.LocalUser, prov.Name(), identity.Login,
+							"the authentication record could not be written and the login was refused; the recorded authentication did not take effect")
+					}
 					b.failSession(sessionID, StatusError,
 						"Internal error recording the authentication")
 					return
@@ -1111,18 +1125,8 @@ func (b *Broker) pollDeviceAuthorization(
 					// this session in the audit trail, and an incident reader would
 					// count a login that never happened. So the record is corrected
 					// rather than contradicted by silence.
-					b.auditLogger.LogAuthEvent(security.AuditEvent{
-						EventType:    "session_revoked",
-						UserID:       mapResult.LocalUser,
-						SessionID:    sessionID,
-						Provider:     prov.Name(),
-						Success:      false,
-						ErrorMessage: "session was no longer pending when the device flow completed; the recorded authentication did not take effect",
-						Timestamp:    time.Now(),
-						Metadata: map[string]interface{}{
-							"provider_login": identity.Login,
-						},
-					})
+					b.correctRecordedAuthentication(sessionID, mapResult.LocalUser, prov.Name(), identity.Login,
+						"session was no longer pending when the device flow completed; the recorded authentication did not take effect")
 					log.Info().Str("session_id", sessionID).
 						Msg("Session no longer pending when the device flow completed; discarding result")
 					return
@@ -1136,6 +1140,42 @@ func (b *Broker) pollDeviceAuthorization(
 				return
 			} // end inner block
 		}
+	}
+}
+
+// correctRecordedAuthentication records that the authentication_success already in
+// the trail describes a login that did not take effect.
+//
+// Two branches need it, and each was written thinking it was the only one. The
+// compare-and-set that grants can refuse, because the session was revoked or
+// expired while the identity was being resolved. And the audit write itself can
+// fail in a way that still leaves the record at a sink, which is the case #91 was
+// filed for. In both the success record is already in front of a reader, and left
+// alone it is the last word on the session.
+//
+// Best effort by necessity, and loudly so. The correction can be refused for the
+// same reason the record it corrects was: if the sinks have stalled, writeEvent
+// refuses this record before it reaches any of them, and the trail keeps a success
+// for a login that never happened. That case is logged at error rather than
+// swallowed — it is the one place where the trail is known to be wrong and nothing
+// here can put it right.
+func (b *Broker) correctRecordedAuthentication(sessionID, localUser, providerName, providerLogin, reason string) {
+	if err := b.auditLogger.LogAuthEventErr(security.AuditEvent{
+		EventType:    "session_revoked",
+		UserID:       localUser,
+		SessionID:    sessionID,
+		Provider:     providerName,
+		Success:      false,
+		ErrorMessage: reason,
+		Timestamp:    time.Now(),
+		Metadata: map[string]interface{}{
+			"provider_login": providerLogin,
+		},
+	}); err != nil {
+		log.Error().Err(err).
+			Str("session_id", sessionID).
+			Str("local_user", localUser).
+			Msg("Could not record that the authentication did not take effect; the audit trail still shows a success for a login that was refused")
 	}
 }
 
@@ -1667,10 +1707,15 @@ func errorResponse(code, message string) *AuthResponse {
 // mapper tier whose own limit is 1 MB.
 //
 // The budget is deliberately far below 16 KiB rather than just under it, because
-// JSON escaping is not size-preserving: one control character becomes the six
-// bytes of a \uXXXX escape. Control characters are stripped below, which caps
-// expansion at 2x for quotes and backslashes, and 2x of this budget still leaves
-// room for the rest of the reply.
+// JSON escaping is not size-preserving: one character can become the six bytes of
+// a \uXXXX escape. Control characters are stripped below, but they are not the
+// only characters that expand — encoding/json also escapes &, < and > to &,
+// < and >, and U+2028/9 the same way, which this budget originally did
+// not account for. A group list of ampersands measured 3072 bytes here and
+// serialized to 18432 on the wire, past the cap on its own and #88 straight back
+// open (#92). So the budget is charged in escaped bytes: what is counted below is
+// what json.Marshal will emit, and a bound in the units the cap is enforced in
+// cannot drift from it.
 // The two group bounds are set so that each one can actually be the one that
 // fires: 64 × 96 is 6144, twice the total, so a list of long names is stopped by
 // the total while a list of ordinary ones (Unix group names run to 32 characters)
@@ -1721,23 +1766,67 @@ func (b *Broker) successResponse(session *Session) *AuthResponse {
 }
 
 // boundedReplyField makes one string somebody else chose the length of safe to put
-// in a reply: control characters removed, then truncated to max bytes on a rune
-// boundary so the result is still valid UTF-8 and still valid JSON.
+// in a reply: control characters removed, then truncated on a rune boundary — so
+// the result is still valid UTF-8 and still valid JSON — until it fits max bytes of
+// *encoded* output.
+//
+// max is a wire budget, not a budget on this string. A field measured before
+// escaping is not bounded after it, which is how #92 happened.
 func boundedReplyField(s string, max int) string {
 	if s == "" {
 		return s
 	}
 	var out strings.Builder
+	width := 0
 	for _, r := range s {
 		if r < 0x20 || r == 0x7f {
 			continue
 		}
-		if out.Len()+utf8.RuneLen(r) > max {
+		w := escapedRuneWidth(r)
+		if width+w > max {
 			break
 		}
+		width += w
 		out.WriteRune(r)
 	}
 	return out.String()
+}
+
+// escapedRuneWidth is how many bytes r occupies once encoding/json has written it
+// inside a JSON string.
+//
+// It follows encoding/json's own encoder with HTML escaping on, which is the
+// default and what internal/ipc's bare json.Marshal uses. Control characters are
+// absent by the time this is reached — boundedReplyField strips them — so the
+// six-byte escape they would take does not appear here; if that stripping is ever
+// removed this function has to grow the case back.
+//
+// The expanding characters are spelled as escapes rather than literals on purpose:
+// U+2028 and U+2029 are invisible in an editor and in a diff.
+func escapedRuneWidth(r rune) int {
+	switch r {
+	case '"', '\\':
+		return 2
+	case '&', '<', '>', '\u2028', '\u2029':
+		// Each of these is written as a six-byte escape by encoding/json.
+		return 6
+	}
+	// RuneLen is -1 for a surrogate half or an out-of-range rune; WriteRune replaces
+	// those with U+FFFD, which is three bytes. Range-over-string yields U+FFFD for
+	// invalid UTF-8 already, so this is the belt-and-braces arm.
+	if n := utf8.RuneLen(r); n > 0 {
+		return n
+	}
+	return 3
+}
+
+// escapedLen is the number of bytes s occupies inside an encoded JSON string.
+func escapedLen(s string) int {
+	total := 0
+	for _, r := range s {
+		total += escapedRuneWidth(r)
+	}
+	return total
 }
 
 // replyGroups bounds the advisory group list, reporting whether it was dropped.
@@ -1757,7 +1846,10 @@ func replyGroups(groups []string) ([]string, bool) {
 	out := make([]string, 0, len(groups))
 	for _, g := range groups {
 		clean := boundedReplyField(g, maxReplyGroupBytes)
-		total += len(clean)
+		// Escaped bytes, matching the per-group bound: the total is a wire budget too,
+		// and summing composed lengths let a list of ampersands past it at a sixth of
+		// its real size (#92).
+		total += escapedLen(clean)
 		if total > maxReplyGroupsTotalBytes {
 			return nil, true
 		}

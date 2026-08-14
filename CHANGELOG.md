@@ -18,6 +18,14 @@ where the remaining defects live: all three are places where two fixes from
 must fail a login met a sink that never returns; the 16 KiB reply cap met a mapper
 whose own comment endorsed a group list several times that size.
 
+A fifth round found two, and both were in the fourth round's own fixes — which is
+the more useful result. A fix lands with fresh reasoning and no adversary yet; the
+round after it is the first time anything reads it looking for the case it missed.
+Both misses are of one kind: a guarantee stated in the units it was convenient to
+measure rather than the units it is enforced in. "The record was not written" was
+read as "no sink has the record", and a byte budget was counted before the escaping
+that decides what the bytes are.
+
 **Upgrade notes.** `broker.yaml` must be mode 0600 regardless of where the client
 secret lives — the check used to apply only when the secret was inline, which left
 the file holding the token-encryption key unchecked in every deployment that did the
@@ -26,6 +34,42 @@ start until it is chmodded; the error names the file and the command. A negative
 `mapper.min_uid` is also now rejected rather than silently disabling the UID floor.
 
 ### Fixed
+
+- **A refused login could leave an uncorrected `authentication_success` in the
+  trail.** #87 made a failed audit write refuse the login, and read that failure as
+  "no sink has this record". It never meant that. Every sink is attempted whatever
+  the earlier ones did — deliberately, so a broken file output does not cost the
+  record on syslog — so an ordinary two-sink `audit.outputs` with a full audit
+  filesystem returned an error while syslog held the record; and a write that
+  overran its deadline is still running, with `fileOutput.Write` having written the
+  bytes before it reached the `fsync` it is stuck in, which is the #87 scenario
+  itself. Since `failSession` writes no record of its own, the trail's last word on
+  the session was an `authentication_success` indistinguishable from a real grant —
+  during a disk-full incident, a burst of successful authentications at the moment
+  nobody could log in. `LogAuthEventErr` now returns a `*security.WriteError` that
+  says whether the record may have landed, and the broker corrects the ones that may
+  have with the same compensating `session_revoked` a withdrawn grant gets. The
+  correction is best effort and says so: if the sinks have stalled it is refused for
+  the same reason, logged at `error`. Also on this path: the stalled flag could be
+  set by a write that had already cleared it — leaving every later record refused
+  for the life of the process — and the stdout sink discarded `fmt.Println`'s error,
+  which made the whole guarantee vacuous on the default configuration, where stdout
+  is the only sink and under systemd is a journal socket.
+  ([#91](https://github.com/scttfrdmn/oauth2-pam/issues/91))
+
+- **The reply budget was counted before the escaping that decides the byte count.**
+  #88's bounds are enforced in `pkg/auth` and detected in `internal/ipc`, on either
+  side of a `json.Marshal` — and Go's encoder writes `&`, `<`, `>` and U+2028/9 as
+  six-byte `\uXXXX` escapes with HTML escaping on, which is the default and is not
+  disabled anywhere in the tree. #88 stripped control characters for exactly this
+  reason and then concluded that expansion was capped at 2x. So a mapper on tier 2
+  or 3 answering with 32 group names of 96 ampersands measured 3072 bytes against
+  the group budget and serialized to 18432 — past the entire 16 KiB reply cap on the
+  group list alone, with #88's eight-hour lockout behind it. The budgets are now
+  charged in encoded bytes, so a maximal authorized reply measures about 4 KB
+  whatever its characters are, and one test in each package serializes a group list
+  that the bounds *accept* — neither of #88's own tests did, which is how this got
+  through. ([#92](https://github.com/scttfrdmn/oauth2-pam/issues/92))
 
 - **An audit sink that stalled turned the fail-closed audit guarantee into its
   opposite.** A login is now refused when its audit record cannot be written — but

@@ -176,7 +176,7 @@ func TestAnAuthorizedReplyIsBoundedWhateverTheSessionCarries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal reply: %v", err)
 	}
-	if len(encoded) > 8192 {
+	if len(encoded) > maxMeasuredReplyBytes {
 		t.Errorf("an authorized reply for a pathological session is %d bytes; "+
 			"the socket cap is 16384 and a bound that close to it is not a bound", len(encoded))
 	}
@@ -199,6 +199,139 @@ func TestAnOmittedGroupListIsNotClaimedWhenGroupsFit(t *testing.T) {
 	if len(resp.Groups) != 2 {
 		t.Errorf("got %d groups, want 2", len(resp.Groups))
 	}
+}
+
+// The budget is a wire budget — #92.
+//
+// These bounds are enforced here and detected in internal/ipc, on either side of a
+// json.Marshal, and JSON escaping is not size-preserving. Control characters were
+// handled by removal, but they are not the only characters that expand:
+// encoding/json escapes &, < and > to six bytes each, and U+2028/9 the same way.
+// Measured before escaping, a group list of ampersands passed a 3072-byte budget
+// and serialized to 18432 bytes — past the 16 KiB cap on its own, with #88's
+// eight-hour lockout behind it. So what is counted is what the encoder will write.
+
+// TestEscapedRuneWidthMatchesTheEncoder pins escapedRuneWidth to the encoder it is
+// predicting rather than to what this package believes about it. Nothing else in
+// the tree would notice if encoding/json's escaping changed under it.
+func TestEscapedRuneWidthMatchesTheEncoder(t *testing.T) {
+	for _, r := range []rune{
+		'a', ' ', '~', 0x7f, // unescaped ASCII, DEL included
+		'é', '€', '𝄞', // two, three and four byte runes
+		'"', '\\', '/', // the two-byte escapes, and one that is not escaped at all
+		'&', '<', '>', // HTML escaping, on by default and not disabled anywhere
+		'\u2028', '\u2029', // the line and paragraph separators
+		'\ufffd', // what an invalid encoding becomes on the way in
+	} {
+		encoded, err := json.Marshal(string(r))
+		if err != nil {
+			t.Fatalf("marshal %+q: %v", r, err)
+		}
+		// The surrounding quotes are the string's, not the rune's.
+		want := len(encoded) - 2
+		if got := escapedRuneWidth(r); got != want {
+			t.Errorf("escapedRuneWidth(%+q) = %d, but encoding/json writes it as %d bytes (%s)",
+				r, got, want, encoded)
+		}
+	}
+}
+
+// TestReplyGroupsBudgetsWhatTheEncoderWillWrite: a list well inside the byte total
+// as composed, and at twice it once encoded. This is the list that re-opened #88.
+func TestReplyGroupsBudgetsWhatTheEncoderWillWrite(t *testing.T) {
+	// 64 groups of 16 ampersands: 1024 bytes composed, a third of the budget; 6144
+	// once escaped, twice it. The count bound cannot be what fires here — 64 is the
+	// count bound, not past it — so this is the total bound or nothing.
+	groups := escapingGroups(maxReplyGroups, 16)
+
+	got, omitted := replyGroups(groups)
+	if !omitted {
+		encoded, err := json.Marshal(got)
+		if err != nil {
+			t.Fatalf("marshal groups: %v", err)
+		}
+		t.Errorf("a %d-group list measuring %d bytes composed was accepted and serializes to %d; "+
+			"the budget is %d and the whole reply cap is 16384",
+			len(groups), len(strings.Join(groups, "")), len(encoded), maxReplyGroupsTotalBytes)
+	}
+	if got != nil {
+		t.Errorf("got %d groups, want none: a partial list reads as a complete one", len(got))
+	}
+}
+
+// TestAnAuthorizedReplyIsBoundedInTheUnitsTheCapIsEnforcedIn is the escaping twin of
+// TestAnAuthorizedReplyIsBoundedWhateverTheSessionCarries. Same shape, every field
+// filled with characters that sextuple, and the group list sized to be *accepted* —
+// the earlier test's 700 groups are omitted, so it never puts a group list that
+// replyGroups approves of on the wire at all, which is how this got through.
+func TestAnAuthorizedReplyIsBoundedInTheUnitsTheCapIsEnforcedIn(t *testing.T) {
+	b := &Broker{}
+
+	session := &Session{
+		ID:        strings.Repeat("ab", 16),
+		LocalUser: "alice",
+		// A hostile or misconfigured GHES can answer with anything, and & is a legal
+		// character in both of these.
+		Email:         strings.Repeat("&", 20000) + "@example.com",
+		ProviderLogin: strings.Repeat("<", 20000),
+		// Maximal in both bounds at once: as many escaped bytes as the total allows,
+		// spread over few enough entries to pass the count.
+		Groups:       escapingGroups(maxReplyGroupsTotalBytes/(6*16), 16),
+		Provider:     "acme",
+		ExpiresAt:    time.Now().Add(8 * time.Hour),
+		LastAccessed: time.Now(),
+	}
+
+	resp := b.successResponse(session)
+
+	// The premise. If the group list were dropped this would measure the same reply
+	// the earlier test already measures.
+	if resp.Metadata["groups_omitted"] == "true" {
+		t.Fatalf("the maximal accepted group list was omitted; this no longer measures an accepted list on the wire")
+	}
+	if len(resp.Groups) == 0 {
+		t.Fatal("no groups in the reply")
+	}
+
+	encoded, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal reply: %v", err)
+	}
+	if len(encoded) > maxMeasuredReplyBytes {
+		t.Errorf("an authorized reply whose every field escapes six bytes to the character is %d bytes; "+
+			"the socket cap is 16384 and the same reply in plain ASCII measures around 4 KB — "+
+			"the budget is meant to be escape-invariant", len(encoded))
+	}
+
+	// The fields are bounded, not blanked: a boundedReplyField that returned "" would
+	// pass the measurement above and throw away real information.
+	if resp.Email == "" || resp.Metadata["provider_login"] == "" {
+		t.Error("a bounded field came back empty; the bound truncates, it does not discard")
+	}
+	if got := escapedLen(resp.Email); got > maxReplyEmailBytes {
+		t.Errorf("email occupies %d encoded bytes, want at most %d", got, maxReplyEmailBytes)
+	}
+	if got := escapedLen(resp.Metadata["provider_login"]); got > maxReplyProviderLoginBytes {
+		t.Errorf("provider_login occupies %d encoded bytes, want at most %d", got, maxReplyProviderLoginBytes)
+	}
+}
+
+// maxMeasuredReplyBytes is the ceiling the two whole-reply measurements below hold
+// the encoded reply to. It is not a constant the code enforces — the field budgets
+// are — but a maximal reply measures about 4.1 KB, and it measures that whether its
+// characters escape or not, which is the property #92 was about. Anything
+// materially over this means a budget has stopped predicting the wire again.
+const maxMeasuredReplyBytes = 6144
+
+// escapingGroups builds n group names of width characters, every one of which
+// encoding/json writes as a six-byte escape. The names are identical because
+// nothing downstream distinguishes them; what matters is what they cost.
+func escapingGroups(n, width int) []string {
+	groups := make([]string, n)
+	for i := range groups {
+		groups[i] = strings.Repeat("&", width)
+	}
+	return groups
 }
 
 // makeGroups builds n distinct group names, each padded to width bytes (or left

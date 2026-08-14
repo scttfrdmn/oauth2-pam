@@ -154,12 +154,20 @@ live token for `token_lifetime`, so a handful of attempts locked the account out
 for hours behind sessions no client could resolve. The three fields are now bounded
 where the reply is composed — 320 bytes of `email`, 256 of `provider_login`, and a
 group list capped at 64 entries and 3072 bytes total — which puts a worst-case
-authorized reply under 1 KB. Two consequences a client should know about:
+authorized reply at about 4 KB, a quarter of the cap. Two consequences a client
+should know about:
 
-- Control characters are stripped from those fields rather than escaped. JSON
-  escaping is not size-preserving (one control character becomes the six bytes of a
-  `\uXXXX` escape), so a byte budget on the composed string is not a byte budget on
-  the wire unless the expansion is bounded first.
+- Those budgets are counted in **encoded** bytes: what each character costs after
+  `json.Marshal`, not what it costs in the value. JSON escaping is not
+  size-preserving, and control characters are not the only characters that expand —
+  Go's encoder writes `&`, `<`, `>` and U+2028/9 as six-byte `\uXXXX` escapes with
+  HTML escaping on, which is the default. Counting composed bytes was
+  [#92](https://github.com/scttfrdmn/oauth2-pam/issues/92): a group list of
+  ampersands measured 3072 bytes against the budget and serialized to 18432, past
+  the whole reply cap on its own, which put #88's lockout straight back. Counted
+  after escaping, a maximal reply measures the same ~4 KB whatever its characters
+  are. Control characters are still stripped rather than escaped, so a client will
+  not see them at all.
 - An over-budget `groups` is omitted entirely and `metadata.groups_omitted` is set
   to `"true"`. A truncated list is indistinguishable from a complete one, and a
   client acting on membership would act on a list missing whichever entries sorted
