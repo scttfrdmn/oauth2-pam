@@ -57,6 +57,14 @@ make test-cbridge       # C unit tests for the bridge; see test/cbridge/README.m
 make test-integration   # needs Docker; see test/integration/README.md
 ```
 
+Two more, if you touched `cmd/pam-module/` or a test that guards it. They are
+slower, and CI runs them anyway, so they are not part of the list above:
+
+```sh
+make test-cbridge-mutations      # reintroduce each fixed bridge defect; the C tests must fail
+make test-integration-mutations  # reintroduce the v0.1.x bypass; the harness must refuse the login
+```
+
 `make verify-linux` runs build, vet, `test -race` and lint in a container with the
 PAM and json-c headers present. It matters because a Mac cannot compile
 `cmd/pam-module` at all, so `go build ./...`, `go test ./...` and golangci-lint all
@@ -74,9 +82,11 @@ GOOS=linux golangci-lint run ./...
 Without one or the other, `_linux.go` files are invisible locally and first fail
 in CI.
 
-CI runs all of it on every push and pull request: Linux (where the module
-compiles and `SO_PEERCRED` is real), macOS (where it must still build), lint, and
-the container harness.
+CI runs all of it on every pull request and on pushes to `main`: Linux (where the
+module compiles and `SO_PEERCRED` is real), macOS (where it must still build),
+lint, the container harness, and the two mutation checks. A push to a topic branch
+runs nothing until it opens a pull request, so run the list above locally rather
+than pushing to find out.
 
 `make test-integration` is the only thing that exercises the PAM module in a real
 PAM stack. Any change to `cmd/pam-module/` or to the IPC contract needs it.
@@ -85,7 +95,13 @@ PAM stack. Any change to `cmd/pam-module/` or to the IPC contract needs it.
 harness runs real logins, but it cannot make the broker misbehave in a specific
 way — go there for a reply that exactly fills the read buffer, a broker that
 accepts and then goes silent, or one that hangs up mid-request. It compiles with
-`-Werror -Wconversion`, and a skipped case counts as a failure.
+`-Werror -Wconversion`, and a skipped case counts as a failure. No scanner reads
+this C: CodeQL runs with `languages: go`, so these tests are the whole of its
+coverage.
+
+If you rewrite one of those tests, run `make test-cbridge-mutations` — it puts each
+of the six original defects back and fails if the suite still passes. A test that
+cannot fail is worse than no test, because it reads as protection.
 
 ## Two things that are easy to break
 

@@ -5,8 +5,11 @@ Unit tests for `cmd/pam-module/cgo_bridge_linux.c` — the half of this project 
 `cmd/pam-module` is not compiled at all.
 
 ```
-make test-cbridge          # native on Linux, in a Debian container elsewhere
+make test-cbridge            # native on Linux, in a Debian container elsewhere
 test/cbridge/run.sh
+
+make test-cbridge-mutations  # and the check that these tests can fail
+test/cbridge/mutations.sh
 ```
 
 ## What these cover that the container harness does not
@@ -28,6 +31,45 @@ cannot make the broker misbehave in specific ways. These can, over a
 
 The SIGPIPE case is the one to watch: if it regresses, the test binary is
 *killed* rather than failing, and `run.sh` exits 141.
+
+## Whether these tests can fail
+
+A green suite proves the code does what the tests say. It does not prove the
+tests would notice if it stopped — and a regression test that cannot fail is
+worse than no test, because it reads as protection.
+
+`mutations.sh` is the check on that. For each of the six defects above it
+reintroduces the defect in a copy of the source under `$TMPDIR`, rebuilds, and
+asserts the suite **fails**; a mutation the suite survives is reported as
+`MISSED` and fails the run. Nothing in the working tree is touched, so an
+interrupted run leaves no half-mutated file behind. Output on a healthy tree:
+
+```
+==> baseline
+ok       unmutated suite passes
+
+==> mutations, each of which must be caught
+caught   send() without MSG_NOSIGNAL (killed by SIGPIPE)
+caught   a full buffer means too large (exit 1)
+           FAIL cbridge_test.c:129: rejected a complete 16384-byte response
+...
+```
+
+Two ways a case can be inconclusive rather than reassuring, both reported as
+failures rather than passes:
+
+- `SETUP` — the mutation's pattern matched nothing, or the mutated source did not
+  compile. The source has moved and the mutation is no longer reintroducing the
+  defect it names. Editing the bridge will eventually cause this; fix the pattern
+  in `mutations.sh` rather than dropping the case.
+- `BROKEN` — the *unmutated* baseline failed. Usually this means the run is not
+  privileged, the socket case skipped, and a skip counts as a failure. Run it
+  under `sudo`, as the Makefile target and CI do; the container path is already
+  root.
+
+Mutations are deliberately the specific defect each test was written against,
+not machine-generated. This is a check that six named regression tests still
+bite, not a coverage metric.
 
 ## Notes
 

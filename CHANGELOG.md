@@ -55,14 +55,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Security scanning in CI** (`.github/workflows/security.yml`): CodeQL with
   `security-extended`, gosec with SARIF upload, govulncheck, dependency review on
   pull requests, and OpenSSF Scorecard, plus a weekly schedule. CodeQL installs
-  the PAM headers so `cmd/pam-module` is actually analyzed rather than silently
-  skipped. ([#18](https://github.com/scttfrdmn/oauth2-pam/issues/18))
+  the PAM headers so the Go half of `cmd/pam-module` is actually analyzed rather
+  than silently skipped; the bridge's C is not analyzed by any scanner, because
+  CodeQL runs with `languages: go`. `SECURITY.md` has the table of what runs when
+  and what blocks a merge. ([#18](https://github.com/scttfrdmn/oauth2-pam/issues/18))
 - **A release workflow** (`.github/workflows/release.yml`) and
   `scripts/release.sh`. Tags build amd64 and arm64 on native runners and publish
   `.tar.gz` + `.sha256` archives containing the module, the three binaries,
-  `configs/`, and an installer. Two gates run before anything is published: the
-  tag must agree with the README version badge and the CHANGELOG, and the built
-  `.so` must export all six `pam_sm_*` entry points.
+  `configs/`, and an installer. Three gates run before anything is published: the
+  tag must agree with the README version badge and the CHANGELOG, the whole of
+  `ci.yml` must pass on the tagged commit (called as a reusable workflow, so it
+  cannot drift from what a pull request runs), and the built `.so` must export all
+  six `pam_sm_*` entry points.
   ([#19](https://github.com/scttfrdmn/oauth2-pam/issues/19))
 - `SECURITY.md`, issue and pull-request templates, and `CODEOWNERS`. The security
   policy records what is verified and what is not — including that no login
@@ -86,8 +90,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   peer to UID 0 — root's real UID. Unknown peers now share a sentinel bucket that
   cannot collide with a real UID, and the broker logs whether peer credentials are
   available at all. ([#23](https://github.com/scttfrdmn/oauth2-pam/issues/23))
-
-### Added
 
 - **A UID floor and a system-account denylist on every mapper tier.** Nothing —
   not a rule, not an external script, not an HTTP identity service — can now
@@ -134,6 +136,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the wire. Every case was verified to fail against the unfixed code. A skipped
   case counts as a failure, so the one test that needs root cannot quietly stop
   running in CI.
+
+- **Mutation checks on both C test suites, as CI jobs**
+  (`make test-cbridge-mutations`, `make test-integration-mutations`). A green suite
+  proves the code does what the tests say; it does not prove the tests would notice
+  if it stopped, and a regression test that cannot fail is worse than none because
+  it reads as protection. `test/cbridge/mutations.sh` reintroduces each of the six
+  fixed bridge defects in a copy of the tree and requires the C unit tests to fail;
+  `test/integration/mutations.sh` rebuilds the module with the v0.1.x
+  authentication bypass in place and requires the container harness to refuse the
+  login. Both report an unmatched pattern or a failed build as inconclusive rather
+  than counting it as a pass, and neither touches the working tree. `SECURITY.md`
+  previously described the harness as mutation-verified with nothing in the
+  repository to back it; this is what that sentence now points at.
 
 ### Fixed
 
@@ -413,6 +428,24 @@ And four more in the broker's own defaults:
   ([#14](https://github.com/scttfrdmn/oauth2-pam/issues/14))
 - GitHub Actions are pinned to full commit SHAs rather than floating tags.
   ([#20](https://github.com/scttfrdmn/oauth2-pam/issues/20))
+- **A tag now runs the whole test suite before anything is published.**
+  `release.yml` calls `ci.yml` as a reusable workflow — Linux build/vet/`test -race`,
+  macOS build, lint, the C bridge tests, both mutation checks, and the container
+  harness — between the version check and the build. Previously the only gates were
+  the version agreement and the `nm` entry-point check, so a tag pushed from a
+  commit that never passed CI would publish.
+- **The documented assurances now match what CI does.** Corrected: `SECURITY.md`
+  called the container harness mutation-verified with no script in the repository
+  (now there is one, and it runs in CI); it listed five scanners as running "on
+  every push and pull request" when dependency review is pull-requests-only,
+  Scorecard skips pull requests, gosec is `continue-on-error` and advisory, and a
+  push to a topic branch runs nothing at all — there is now a table of what runs
+  when and what blocks a merge; and the claim that installing PAM headers makes
+  CodeQL analyze `cmd/pam-module` is narrowed to the Go half of it, because
+  `languages: go` puts none of the bridge's C in a CodeQL database. `CONTRIBUTING.md`
+  said "CI runs all of it on every push and pull request" with the same
+  topic-branch inaccuracy. None of these changed what the CI does; they were
+  descriptions of a stronger position than the project held.
 - Audit events that record an access decision — `authentication_success`,
   `authentication_failed`, `authentication_denied`, `session_revoked` — are
   written synchronously instead of queued, so a crash or a full queue cannot

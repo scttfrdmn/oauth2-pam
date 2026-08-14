@@ -37,8 +37,16 @@ jobs:
           cache: true
           check-latest: true
 
-      # Without these, autobuild still succeeds — it just quietly skips
-      # cmd/pam-module, which is the most security-sensitive package in the repo.
+      # Without these, autobuild still succeeds — it just quietly skips the Go
+      # half of cmd/pam-module, which is the most security-sensitive package here.
+      #
+      # It only ever gets that Go half: `languages: go` runs the Go extractor, so
+      # cgo_bridge_linux.c — the file that talks to the socket and parses the
+      # broker's JSON — is in no CodeQL database at all. Analyzing it needs
+      # `c-cpp` added here, which needs a build command autobuild will not guess
+      # for a C file compiled by cgo. Until then, what covers the bridge is
+      # test/cbridge (with -Werror -Wall -Wextra -Wconversion) and its mutation
+      # check, not this job.
       - name: Install PAM and json-c headers
         run: |
           sudo apt-get update

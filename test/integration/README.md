@@ -35,6 +35,33 @@ The same `docker-compose.yml` runs unchanged on a Linux EC2 instance if the
 containers ever need checking against a non-Docker kernel — that is the whole
 difference, so it is not worth paying for by default.
 
+## Whether `never_authorized` can fail
+
+```sh
+make test-integration-mutations              # a few minutes; CI runs it as its own job
+```
+
+The harness's most valuable assertion is a negative one — a device flow nobody
+approved is not a login — and a negative assertion is exactly the kind that can
+rot into passing for the wrong reason. `mutations.sh` reintroduces the v0.1.x
+bypass (`status: pending` → `PAM_SUCCESS`, before the prompt) in a copy of the
+tree under `$TMPDIR`, rebuilds the module, and requires `never_authorized` and
+`denied_by_github` to **fail**:
+
+```
+==> running the harness with the bypass in place: never_authorized denied_by_github
+    FAIL  never_authorized
+    FAIL  denied_by_github
+caught — the harness refuses the login the v0.1.x module would have granted
+```
+
+It insists on seeing those per-case verdicts, so a stack that failed to build is
+reported as inconclusive rather than counted as the bypass being caught. There is
+no baseline run: `make test-integration` is the baseline and CI runs it anyway.
+Do not run it while a healthy stack is up — they share the `oauth2-pam-harness-*`
+image tags. `test/cbridge/mutations.sh` does the same job for the six C bridge
+defects.
+
 ## The cases
 
 | Case | Asserts |

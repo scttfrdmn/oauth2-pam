@@ -354,6 +354,13 @@ The end-to-end tests in `internal/ipc` drive a real broker behind a real IPC ser
 
 `make test-cbridge` covers what neither can: the boundaries. The harness drives the C, but it cannot make the broker misbehave in a specific way, so a reply exactly the size of the read buffer, a broker that accepts a connection and then goes silent, and a broker that hangs up mid-request are all tested directly over a `socketpair`. See [test/cbridge/README.md](test/cbridge/README.md).
 
+```bash
+make test-cbridge-mutations      # put each fixed bridge defect back; the C tests must fail
+make test-integration-mutations  # put the v0.1.x bypass back; the harness must refuse the login
+```
+
+Those two are the check on the checks, and CI runs each as its own job. A green suite proves the code does what the tests say; it does not prove the tests would notice if it stopped — so each of the six C bridge defects fixed in v0.2.0, and the v0.1.x authentication bypass itself, is reintroduced in a copy of the tree and the suite is required to fail. A mutation that survives means that regression test is decoration.
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) for how work is tracked (labels, milestones, the roadmap board), what to run before pushing, and the two invariants that are easy to break.
 
 ## Project Structure
@@ -402,7 +409,7 @@ oauth2-pam/
 - **The local Unix account must already exist**, and the mapping must resolve to the account being logged into.
 - **Supplementary `groups` from the mapper are not applied** to the session ([#12](https://github.com/scttfrdmn/oauth2-pam/issues/12)).
 - **The login requires an interactive terminal**, because the user has to acknowledge the prompt. `scp`, `rsync`, and non-interactive `ssh` cannot complete this flow; keep a key-based or password path available for automation.
-- **No test talks to real GitHub.** Every layer below that is exercised on every push: the broker end to end against a fake GitHub (`internal/ipc`), the C bridge's own boundaries (`test/cbridge`), and real `ssh` logins through a real `sshd` with `oauth2_pam.so` in its PAM stack against a real broker (`test/integration`). What none of them prove is behaviour against the live device endpoint — its actual `slow_down` and rate-limit responses, and a real interactive terminal — so treat a first deployment as the thing that verifies that.
+- **No test talks to real GitHub.** Every layer below that is exercised in CI on every pull request and every push to `main`: the broker end to end against a fake GitHub (`internal/ipc`), the C bridge's own boundaries (`test/cbridge`), real `ssh` logins through a real `sshd` with `oauth2_pam.so` in its PAM stack against a real broker (`test/integration`), and mutation checks that require both C suites to fail when the defects they guard are put back. What none of them prove is behaviour against the live device endpoint — its actual `slow_down` and rate-limit responses, and a real interactive terminal — so treat a first deployment as the thing that verifies that.
 
 ## License
 

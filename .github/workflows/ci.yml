@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # release.yml calls this workflow as its gate, so a tag runs exactly these jobs
+  # rather than a copy of them that can drift. A tag is the one push where nothing
+  # rechecks the result afterwards.
+  workflow_call:
 
 permissions:
   contents: read
@@ -83,6 +87,14 @@ jobs:
       - name: C bridge tests
         run: sudo env NATIVE=1 test/cbridge/run.sh
 
+      # And the check on that check: reintroduce each of the six fixed defects in
+      # a copy of the source and assert the suite fails. Without this, SECURITY.md
+      # claiming the tests are mutation-verified is a claim about a run nobody can
+      # see. Same sudo/NATIVE reasoning as above — the mutated suite has to be
+      # able to fail for the right reason, not skip the privileged case.
+      - name: C bridge mutation check
+        run: sudo env NATIVE=1 test/cbridge/mutations.sh
+
       # `make build` verifies with nm that all six pam_sm_* entry points made it
       # into the .so. v0.1.1 shipped a module with none, and nothing failed.
       - name: Build all binaries and verify PAM entry points
@@ -150,3 +162,17 @@ jobs:
       # collect.
       - name: Run the harness
         run: make test-integration
+
+  # The check on that check. SECURITY.md claims the harness would catch the v0.1.x
+  # bypass; this is what makes that a statement about a run rather than a belief.
+  # A separate job so a failure here is unambiguous, and so it does not share a
+  # runner (and therefore the harness image tags) with the job above.
+  integration-mutations:
+    name: Container harness — catches the v0.1.x bypass
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Reintroduce the bypass and require the harness to refuse the login
+        run: make test-integration-mutations

@@ -1,4 +1,4 @@
-.PHONY: build test test-unit test-cbridge test-integration verify-linux install clean lint fmt vet tidy help
+.PHONY: build test test-unit test-cbridge test-cbridge-mutations test-integration test-integration-mutations verify-linux install clean lint fmt vet tidy help
 
 # Build variables
 BINARY_DIR := bin
@@ -92,10 +92,30 @@ test-cbridge:
 	@echo "Running C bridge tests..."
 	test/cbridge/run.sh
 
+## Check that the C bridge tests would catch the defects they were written for
+##
+## A green suite proves the code does what the tests say; it does not prove the
+## tests would notice if it stopped. This reintroduces each of the six fixed
+## bridge defects in a copy of the source under $$TMPDIR and asserts the suite
+## fails. An uncaught mutation means that regression test is decoration.
+test-cbridge-mutations:
+	@echo "Running C bridge mutation check..."
+	test/cbridge/mutations.sh
+
 ## Run the container integration harness (real sshd + PAM vs a real broker)
 test-integration:
 	@echo "Running container integration harness..."
 	test/integration/run-tests.sh
+
+## Check that the harness still catches the v0.1.x auth bypass
+##
+## The harness's most important claim is a negative one — an unapproved device
+## flow is not a login — and negative assertions are the ones that rot into
+## passing for the wrong reason. This rebuilds the module with the bypass
+## reintroduced and insists the harness refuses the login.
+test-integration-mutations:
+	@echo "Running container harness mutation check..."
+	test/integration/mutations.sh
 
 ## Run the Linux vet/test/lint sweep in a container, cgo packages included
 ##
@@ -220,9 +240,13 @@ help:
 	@echo "  build-pam         Build PAM module (.so) — Linux only"
 	@echo "  docker-build-pam  Build the PAM module in a Linux container"
 	@echo "  build-admin       Build admin CLI tool"
+	@echo "  build-enroll      Build enrollment CLI tool"
 	@echo "  test              Run all tests"
 	@echo "  test-unit         Run unit tests only"
+	@echo "  test-cbridge      C unit tests for the PAM module bridge"
 	@echo "  test-integration  Run the container harness (needs Docker)"
+	@echo "  test-cbridge-mutations      Check the C bridge tests can still fail"
+	@echo "  test-integration-mutations  Check the harness still catches the v0.1.x bypass"
 	@echo "  verify-linux      Vet, test and lint under Linux, cgo included (needs Docker)"
 	@echo "  install           Install binaries to system"
 	@echo "  install-dev       Install development version"

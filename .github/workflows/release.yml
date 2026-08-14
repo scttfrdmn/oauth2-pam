@@ -38,9 +38,23 @@ jobs:
           [ "$fail" -eq 0 ] || exit 1
           echo "Tag, README badge and CHANGELOG all say $VERSION."
 
+  # The full CI suite, called rather than copied so it cannot drift from what a
+  # pull request runs: Linux build/vet/test -race, macOS build, lint, the C bridge
+  # tests and their mutation check, and the container harness with real sshd and a
+  # real PAM stack.
+  #
+  # Tagging from a green main is not the same as verifying the tag: scripts/release.sh
+  # rewrites the version badge and the CHANGELOG, `main` may have moved, and a tag
+  # can be pushed from any commit at all. Nothing rechecks a published artifact, so
+  # the checks run here.
+  test:
+    name: CI
+    needs: verify-version
+    uses: ./.github/workflows/ci.yml
+
   build:
     name: Build (${{ matrix.arch }})
-    needs: verify-version
+    needs: [verify-version, test]
     runs-on: ${{ matrix.runs_on }}
     strategy:
       fail-fast: false

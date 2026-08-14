@@ -64,8 +64,13 @@ This is pre-1.0 software with no third-party audit. Concretely, as of v0.2.0:
   that a started device flow is not an authentication.
 - The client half — `oauth2_pam.so` inside a real PAM stack, driven by real
   `sshd` over a real ssh connection — is covered by the container harness in
-  `test/integration/`. That suite was mutation-verified: reintroducing the v0.1.x
-  bypass in the C makes it fail.
+  `test/integration/`.
+- **Both suites are mutation-checked in CI, by scripts you can run yourself.**
+  `test/integration/mutations.sh` rebuilds the module with the v0.1.x bypass
+  reintroduced and requires the harness to refuse the login; `test/cbridge/mutations.sh`
+  reintroduces each of the six C bridge defects fixed in v0.2.0 and requires the
+  C unit tests to fail. Both run as their own CI jobs, so "these tests would
+  catch it" is a check rather than a claim.
 - **A login against real github.com has never been verified by the test suite.**
   Everything above fakes the provider.
 - Tokens are held encrypted in memory (AES-256-GCM) and never written to disk.
@@ -79,8 +84,31 @@ This is pre-1.0 software with no third-party audit. Concretely, as of v0.2.0:
 
 ## Security scanning
 
-CodeQL, gosec, govulncheck, dependency review, and OpenSSF Scorecard run on every
-push and pull request, plus weekly — see `.github/workflows/security.yml`. The
-`nm` entry-point check in `make build` and in the container harness build is not a
-scanner but belongs in the same list: it is what stops a release shipping a
+`.github/workflows/security.yml`. Not all of it runs on everything, and the
+differences matter if you are relying on one of them:
+
+| Tool | When | A finding fails the run? |
+|---|---|---|
+| CodeQL (`security-extended`) | pushes to `main`, every PR, weekly | yes |
+| govulncheck | pushes to `main`, every PR, weekly | yes |
+| gosec | pushes to `main`, every PR, weekly | **no** — `continue-on-error`; findings go to the Security tab for triage |
+| Dependency review | pull requests only | yes, at `moderate` |
+| OpenSSF Scorecard | pushes to `main`, weekly — not on PRs | no, it is a posture report |
+
+Three gaps worth stating plainly rather than leaving to be inferred:
+
+- **No scanner analyzes the C.** CodeQL runs with `languages: go`, so
+  `cmd/pam-module/cgo_bridge_linux.c` is in no database. What covers it is
+  `test/cbridge` — compiled `-Werror -Wall -Wextra -Wconversion`, and
+  mutation-checked as described above.
+- **A push to a topic branch runs nothing.** Both workflows are `push` on `main`
+  plus `pull_request`; the scans reach a branch when it opens a pull request, not
+  while it is being pushed to.
+- **`main` has no branch protection, so a failing run does not by itself stop a
+  merge or a push.** "Fails the run" above means exactly that and no more. The
+  place a check is unconditionally binding is a release: `release.yml` runs the
+  whole of `ci.yml` on the tagged commit and publishes nothing if it fails.
+
+The `nm` entry-point check in `make build` and in the container harness build is
+not a scanner but belongs in the same list: it is what stops a release shipping a
 module PAM cannot load.
