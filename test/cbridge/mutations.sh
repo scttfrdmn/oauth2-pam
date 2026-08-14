@@ -8,9 +8,9 @@
 # the tests would notice if the code stopped doing it — and a regression test that
 # cannot fail is worse than none, because it reads as protection.
 #
-# So each case here reintroduces one of the six defects test/cbridge/README.md
-# lists, and asserts the suite *fails*. A mutation that goes uncaught means the
-# test meant to pin that defect down is not pinning anything.
+# So each case here reintroduces one of the defects test/cbridge/README.md lists,
+# and asserts the suite *fails*. A mutation that goes uncaught means the test meant
+# to pin that defect down is not pinning anything.
 #
 # Mutations are applied to a copy of the source under $TMPDIR. Nothing in the
 # repository is touched, so an interrupted run leaves no half-mutated file behind.
@@ -164,6 +164,32 @@ run "any protocol version is acceptable" fail \
 # invisible to a broker that starts enforcing one.
 run "protocol_version omitted from requests" fail \
     '$n = s/^.*json_object_object_add\(req, "protocol_version".*\n//mg'
+
+# The grant decision itself, which until v0.4.0 no case here pointed at: both of
+# the mutations below were green in every suite this repository has, which is what
+# an authorization bypass looks like on the way in.
+#
+# authorized_for stops deciding anything. This is the client half of the two
+# independent checks docs/wire-protocol.md specifies — delete it and the module
+# acts on whatever a broker says "authorized" about, for whatever account.
+run "authorized_for accepts every reply" fail \
+    '$n = s/(static int authorized_for\(const struct broker_response \*r, const char \*username\) \{\n)/$1    return 1;\n/g'
+
+# And the specific comparison inside it: the broker authorized somebody, but not
+# the account this login is for.
+run "authorized_for ignores which user was authorized" fail \
+    '$n = s/if \(strcmp\(r->user_id, username\) != 0\) \{/if (0) {/g'
+
+# terminal_status_to_pam stops mapping, so denied, expired and error all read as
+# a successful login — the fail-open direction of the same decision.
+run "every terminal status is a successful login" fail \
+    '$n = s/(static int terminal_status_to_pam\(const struct broker_response \*r, const char \*username\) \{\n)/$1    return PAM_SUCCESS;\n/g'
+
+# Only the unrecognized-status branch fails open. A status this module has never
+# heard of is the one a future broker reaches first, and "unrecognized" is where
+# "nothing wrong" is easiest to write by accident.
+run "an unknown broker status grants the login" fail \
+    '$n = s/(    log_pam_message\(LOG_ERR, "Unknown broker status .*\n.*\n)    return PAM_AUTH_ERR;/$1    return PAM_SUCCESS;/g'
 
 echo
 if [ "$failures" -ne 0 ]; then

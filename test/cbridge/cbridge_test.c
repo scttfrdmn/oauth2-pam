@@ -566,6 +566,171 @@ static void test_protocol_version(void) {
     json_object_put(req);
 }
 
+/* ------------------------------------------------------- the grant decision */
+
+/* parsed returns the broker_response for one JSON reply, or NULL if it did not
+   parse. Caller frees. Going through parse_broker_response rather than filling
+   the struct by hand keeps these tests honest about the path a real reply
+   takes: the fields the decision reads are the fields the parser wrote. */
+static struct broker_response *parsed(const char *json_text) {
+    struct broker_response *r = NULL;
+
+    if (parse_broker_response(json_text, &r) != 0) return NULL;
+    return r;
+}
+
+static void test_authorized_for(void) {
+    printf("  authorized_for: the client half of the grant decision\n");
+
+    /* This is the whole client half of the contract docs/wire-protocol.md
+       describes as "two independent checks, because one of them is in a
+       different process and might be an older version of itself". The broker
+       enforces the same rule before it activates a session; this is the second,
+       independent check on the value the module is about to act on.
+
+       Until this test existed, nothing in the repository called it — neither the
+       unit suite nor any mutation nor the container harness, which drives an
+       honest broker and so can never answer "authorized" for the wrong user. So
+       `authorized_for() { return 1; }` was green in every suite here, which is
+       the exact shape of an authorization bypass that ships. */
+    struct broker_response *r;
+
+    r = parsed("{\"success\":true,\"status\":\"authorized\",\"user_id\":\"alice\"}");
+    CHECK(r != NULL, "a well-formed authorized reply did not parse");
+    if (r != NULL) {
+        CHECK(authorized_for(r, "alice") == 1, "refused an authorized reply for the right user");
+
+        /* The bypass. A reply that says "authorized" for a different account
+           must never open a shell as the one the login asked for. */
+        CHECK(authorized_for(r, "bob") == 0, "a reply authorizing alice opened a login for bob");
+
+        /* Not a prefix comparison: alic and alicia are different accounts, and a
+           strncmp with the wrong length is how this quietly stops being a
+           comparison at all. */
+        CHECK(authorized_for(r, "alic") == 0, "a prefix of the authorized user was accepted");
+        CHECK(authorized_for(r, "alicia") == 0, "an extension of the authorized user was accepted");
+        /* Unix accounts are case-sensitive, so Alice is not alice. */
+        CHECK(authorized_for(r, "Alice") == 0, "the comparison was case-insensitive");
+        CHECK(authorized_for(r, "") == 0, "an empty login name matched a named user");
+        free(r);
+    }
+
+    /* status and success are two statements about the same outcome, and a reply
+       where they disagree is not a reply this module can act on: whichever one is
+       wrong, it does not know which. Failing closed is the only answer. */
+    r = parsed("{\"success\":false,\"status\":\"authorized\",\"user_id\":\"alice\"}");
+    CHECK(r != NULL, "an authorized/success=false reply did not parse");
+    if (r != NULL) {
+        CHECK(authorized_for(r, "alice") == 0, "status=authorized with success=false granted a login");
+        free(r);
+    }
+
+    /* A reply that never says it succeeded has not. */
+    r = parsed("{\"status\":\"authorized\",\"user_id\":\"alice\"}");
+    CHECK(r != NULL, "a reply without success did not parse");
+    if (r != NULL) {
+        CHECK(authorized_for(r, "alice") == 0, "an absent success was read as true");
+        free(r);
+    }
+
+    /* An empty user_id is not "no opinion", it is a reply that authorized nobody
+       — and it would compare equal to an empty PAM username. Refused before the
+       comparison, so that neither side of it can be empty. */
+    r = parsed("{\"success\":true,\"status\":\"authorized\",\"user_id\":\"\"}");
+    CHECK(r != NULL, "a reply with an empty user_id did not parse");
+    if (r != NULL) {
+        CHECK(authorized_for(r, "") == 0, "an empty user_id authorized an empty username");
+        CHECK(authorized_for(r, "alice") == 0, "an empty user_id authorized alice");
+        free(r);
+    }
+}
+
+static void test_terminal_status_to_pam(void) {
+    printf("  terminal_status_to_pam: a terminal status is never a login\n");
+
+    /* The other half of the decision, and equally uncovered until now: deleting
+       this mapping was green in every suite here too.
+
+       Two things are asserted of every case. First that it is not PAM_SUCCESS —
+       no terminal status is a login. Second *which* failure it is, because the
+       two are not interchangeable in a stack: a decision about the user is
+       PAM_AUTH_ERR, while an operational failure is PAM_AUTHINFO_UNAVAIL, which
+       invites the rest of the stack to answer instead. Reporting a denial as
+       "ask someone else" is how a provider's "no" becomes somebody else's yes. */
+    struct broker_response *r;
+    int rc;
+
+    r = parsed("{\"status\":\"denied\",\"error_message\":\"not a member of the team\"}");
+    CHECK(r != NULL, "a denied reply did not parse");
+    if (r != NULL) {
+        rc = terminal_status_to_pam(r, "alice");
+        CHECK(rc == PAM_AUTH_ERR, "denied mapped to %d, want PAM_AUTH_ERR (%d)", rc, PAM_AUTH_ERR);
+        free(r);
+    }
+
+    r = parsed("{\"status\":\"expired\",\"error_message\":\"the code expired\"}");
+    CHECK(r != NULL, "an expired reply did not parse");
+    if (r != NULL) {
+        rc = terminal_status_to_pam(r, "alice");
+        CHECK(rc == PAM_AUTH_ERR, "expired mapped to %d, want PAM_AUTH_ERR (%d)", rc, PAM_AUTH_ERR);
+        free(r);
+    }
+
+    /* Capacity conditions are not decisions about the user: the host is busy,
+       not the account unwelcome. PAM_AUTHINFO_UNAVAIL — "ask someone else, or
+       try again" — is the honest answer. */
+    r = parsed("{\"status\":\"error\",\"error_code\":\"RATE_LIMITED\"}");
+    CHECK(r != NULL, "a rate-limited reply did not parse");
+    if (r != NULL) {
+        rc = terminal_status_to_pam(r, "alice");
+        CHECK(rc == PAM_AUTHINFO_UNAVAIL, "RATE_LIMITED mapped to %d, want PAM_AUTHINFO_UNAVAIL (%d)",
+              rc, PAM_AUTHINFO_UNAVAIL);
+        free(r);
+    }
+
+    r = parsed("{\"status\":\"error\",\"error_code\":\"AUTH_LIMIT_REACHED\"}");
+    CHECK(r != NULL, "an at-capacity reply did not parse");
+    if (r != NULL) {
+        rc = terminal_status_to_pam(r, "alice");
+        CHECK(rc == PAM_AUTHINFO_UNAVAIL,
+              "AUTH_LIMIT_REACHED mapped to %d, want PAM_AUTHINFO_UNAVAIL (%d)",
+              rc, PAM_AUTHINFO_UNAVAIL);
+        free(r);
+    }
+
+    r = parsed("{\"status\":\"error\",\"error_code\":\"DEVICE_FLOW_FAILED\","
+               "\"error_message\":\"provider unreachable\"}");
+    CHECK(r != NULL, "an error reply did not parse");
+    if (r != NULL) {
+        rc = terminal_status_to_pam(r, "alice");
+        CHECK(rc == PAM_AUTHINFO_UNAVAIL, "an operational error mapped to %d, want %d",
+              rc, PAM_AUTHINFO_UNAVAIL);
+        free(r);
+    }
+
+    /* A status this module does not know must fail closed. It is the branch a
+       future broker reaches first, and the one place where "unrecognized" could
+       most easily be read as "nothing wrong". */
+    r = parsed("{\"status\":\"granted\",\"user_id\":\"alice\",\"success\":true}");
+    CHECK(r != NULL, "a reply with an unknown status did not parse");
+    if (r != NULL) {
+        rc = terminal_status_to_pam(r, "alice");
+        CHECK(rc == PAM_AUTH_ERR, "an unknown status mapped to %d, want PAM_AUTH_ERR (%d)",
+              rc, PAM_AUTH_ERR);
+        free(r);
+    }
+
+    /* An absent status parses to the empty string, which is no status at all. */
+    r = parsed("{\"success\":true,\"user_id\":\"alice\"}");
+    CHECK(r != NULL, "a reply with no status did not parse");
+    if (r != NULL) {
+        rc = terminal_status_to_pam(r, "alice");
+        CHECK(rc == PAM_AUTH_ERR, "a missing status mapped to %d, want PAM_AUTH_ERR (%d)",
+              rc, PAM_AUTH_ERR);
+        free(r);
+    }
+}
+
 /* ------------------------------------------------------ parse_arguments */
 
 static void test_parse_arguments(void) {
@@ -669,6 +834,8 @@ int main(void) {
     test_target_host_is_this_host();
     test_parse_reads_the_error_code();
     test_protocol_version();
+    test_authorized_for();
+    test_terminal_status_to_pam();
     test_parse_arguments();
 
     printf("\n%d checks, %d failures", checks, failures);

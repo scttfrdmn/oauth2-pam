@@ -28,6 +28,7 @@ cannot make the broker misbehave in specific ways. These can, over a
 | the assembled `authenticate` request | the module sent `PAM_RHOST` as `target_host` and never sent `source_ip`, so every audit record named the client as the target and left the origin blank |
 | `error_code` parsing | `RATE_LIMITED` arrives as `status: "error"` and was treated as terminal, failing logins that were only being asked to slow down |
 | `validate_socket_path` | `/run/oauth2-pam/` — where systemd's `RuntimeDirectory=` puts the socket — was refused as unsafe |
+| `authorized_for` and `terminal_status_to_pam` | the grant decision had **no coverage of any kind**: `authorized_for() { return 1; }` was green in every suite here, and the harness drives an honest broker that can never answer "authorized" for the wrong user |
 
 The SIGPIPE case is the one to watch: if it regresses, the test binary is
 *killed* rather than failing, and `run.sh` exits 141.
@@ -38,7 +39,7 @@ A green suite proves the code does what the tests say. It does not prove the
 tests would notice if it stopped — and a regression test that cannot fail is
 worse than no test, because it reads as protection.
 
-`mutations.sh` is the check on that. For each of the six defects above it
+`mutations.sh` is the check on that. For each of the defects above it
 reintroduces the defect in a copy of the source under `$TMPDIR`, rebuilds, and
 asserts the suite **fails**; a mutation the suite survives is reported as
 `MISSED` and fails the run. Nothing in the working tree is touched, so an
@@ -68,8 +69,8 @@ failures rather than passes:
   root.
 
 Mutations are deliberately the specific defect each test was written against,
-not machine-generated. This is a check that six named regression tests still
-bite, not a coverage metric.
+not machine-generated. This is a check that named regression tests still bite,
+not a coverage metric.
 
 ## Notes
 
