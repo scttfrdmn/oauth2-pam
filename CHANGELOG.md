@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-14
+
+0.2.0 made authentication work. This release is about being able to trust it:
+repeated adversarial review, of the design and of the security of the
+implementation, and the findings each round produced — plus the contract the whole
+thing rests on, written down.
+
+The protocol between broker and module is now a **specified, versioned contract**
+that this repository owns ([`docs/wire-protocol.md`](docs/wire-protocol.md),
+version 1), with `protocol_version` on the wire in both directions and a
+conformance checklist whose every item is something an implementation in this
+family has actually got wrong. Two of the defects fixed here were exploitable as
+shipped, and they need different things from an attacker. `refresh_session`
+extended sessions that had already expired and answered `authorized` — reachable
+only by something that can reach the broker socket, which in this project's
+packaging means root, a boundary this release also stops merely implying and starts
+stating. The other needs no local access at all: the provider chose the strings a
+root process drew on a terminal before anyone had authenticated, so a compromised
+GitHub Enterprise deployment could draw a fake password prompt on every host
+configured against it.
+
+**Upgrade notes.** An unknown key in `broker.yaml` is now a startup error rather
+than a silently ignored line, so a config with a typo that used to "work" will
+refuse to start — deliberately, because six fields in 0.2.0 were parsed and
+ignored. `audit.outputs[].url` and `.headers` are gone. The documented PAM stack
+changes to `auth required` after the distribution's own module, the module's
+`timeout=` default drops from 300s to 90s to fit inside sshd's `LoginGraceTime`,
+and the minimum Go version is 1.25.
+
 ### Added
 
 - **Version 1 says what an absent `source_ip` means, and that a zoned IPv6
