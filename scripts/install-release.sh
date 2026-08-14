@@ -25,6 +25,28 @@ for f in oauth2_pam.so oauth2-pam-broker oauth2-pam-admin oauth2-pam-enroll; do
     [ -f "$f" ] || die "$f not found — run this from the unpacked archive directory"
 done
 
+# Check the archive this directory came out of, if it is still beside it. Every
+# release publishes a .sha256 next to the tarball and until now nothing read it,
+# which made it a file rather than a check.
+#
+# Verifying after the unpack is weaker than verifying before, which is why the
+# README documents doing it first — but this is the check that runs on the host
+# where nobody read the README, and a truncated or substituted download still
+# fails it. It is not a signature: tarball and checksum come from the same place,
+# so this says the bytes arrived intact, not who produced them (see #40).
+archive="$(basename "$PWD").tar.gz"
+if [ -f "../$archive" ] && [ -f "../$archive.sha256" ]; then
+    command -v sha256sum >/dev/null 2>&1 \
+        || die "sha256sum not found, so ../$archive cannot be verified — install coreutils"
+    (cd .. && sha256sum -c "$archive.sha256" >/dev/null) \
+        || die "$archive does not match its published sha256 — do not install this artifact"
+    echo "Verified $archive against its published sha256."
+else
+    echo "Note: $archive and its .sha256 are not next to this directory, so the"
+    echo "      download itself was not verified here. See \"Get the software\" in"
+    echo "      README.md for the check to run before unpacking."
+fi
+
 # The module must export its entry points. A .so without them loads as nothing:
 # PAM logs an error and the auth line behaves as though the module were absent.
 #

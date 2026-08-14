@@ -63,7 +63,30 @@ Go to **GitHub → Settings → Developer settings → OAuth Apps → New OAuth 
 
 Copy the **Client ID** and generate a **Client Secret**.
 
-### 2. Build
+### 2. Get the software
+
+Either a published release archive — which carries a checksum, an installer, and a
+`.so` built on a native runner for its architecture — or a source build.
+
+**From a release archive:**
+
+```bash
+VERSION=v0.3.0
+ARCH=amd64        # or arm64
+BASE=https://github.com/scttfrdmn/oauth2-pam/releases/download/$VERSION
+curl -fLO "$BASE/oauth2-pam-$VERSION-linux-$ARCH.tar.gz"
+curl -fLO "$BASE/oauth2-pam-$VERSION-linux-$ARCH.tar.gz.sha256"
+
+sha256sum -c "oauth2-pam-$VERSION-linux-$ARCH.tar.gz.sha256"
+tar xzf "oauth2-pam-$VERSION-linux-$ARCH.tar.gz"
+```
+
+Run the `sha256sum -c` before unpacking, and stop if it fails. What it proves is
+that the download arrived intact; it is not a signature, and the checksum comes
+from the same place as the tarball, so it says nothing about who built either.
+Signing and provenance are [#40](https://github.com/scttfrdmn/oauth2-pam/issues/40).
+
+**From source:**
 
 ```bash
 git clone https://github.com/scttfrdmn/oauth2-pam
@@ -71,7 +94,27 @@ cd oauth2-pam
 make build
 ```
 
+`make build` checks with `nm` that the module it just built exports all six
+`pam_sm_*` entry points, and fails if `nm` is not there to ask — v0.1.1 shipped a
+module with none of them and nothing noticed for a month.
+
 ### 3. Install
+
+**From the unpacked archive:**
+
+```bash
+cd "oauth2-pam-$VERSION-linux-$ARCH"
+sudo ./install.sh
+```
+
+It re-checks the archive's `sha256` if the tarball is still next to the directory,
+re-checks the module's entry points, asks the package manager where this
+distribution keeps its PAM modules rather than assuming, and writes
+`/etc/oauth2-pam/broker.yaml` from the example with a generated
+`token_encryption_key`. It does not touch `/etc/pam.d` — that is step 6, and it is
+the step that can lock you out.
+
+**From a source build:**
 
 ```bash
 sudo make install
