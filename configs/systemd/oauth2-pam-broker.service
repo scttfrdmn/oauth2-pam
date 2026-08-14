@@ -14,8 +14,16 @@ RestartSec=5s
 User=root
 Group=root
 
-# Runtime directory. 0750 matches the MkdirAll the broker performs itself and
-# the 0660 socket inside it: root and the group may connect, nobody else.
+# Runtime directory. 0750 matches the MkdirAll the broker performs itself and the
+# 0660 socket inside it. With Group=root above, the group is root, so this is the
+# whole access model: only root can traverse the directory and connect to the
+# socket. The PAM module qualifies because it runs inside sshd's pre-auth child.
+#
+# Do not relax either mode, and do not introduce an oauth2-pam group here, without
+# reading the note above os.Chmod in internal/ipc/server.go first: an
+# unauthenticated caller that reaches the socket can start device flows for any
+# account, and several accepted risks in this project are accepted only because
+# that caller can only be root.
 RuntimeDirectory=oauth2-pam
 RuntimeDirectoryMode=0750
 
