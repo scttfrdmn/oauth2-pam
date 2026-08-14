@@ -6,6 +6,7 @@ package enrollment
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -62,12 +63,34 @@ var Unvalidated LocalUserValidator
 
 // Load reads the enrollment file at path. If the file does not exist, an
 // empty Store is returned without error.
+//
+// The file's mode and owner are checked before anything is parsed — see
+// checkPerms. A file this process cannot trust is an error rather than an empty
+// store: falling through to the later tiers would turn "somebody else can rewrite
+// tier 0" into a silent change of mapping policy.
 func Load(path string) (*Store, error) {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path) // #nosec G304 -- path comes from the broker's own root-owned config
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return &Store{}, nil
 		}
+		return nil, fmt.Errorf("open enrollment file %s: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+
+	// Stat the open descriptor, not the path: what is checked has to be the same
+	// bytes that are then read, and a stat by path can be answered by one file and
+	// the read served by another.
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat enrollment file %s: %w", path, err)
+	}
+	if err := checkPerms(path, info); err != nil {
+		return nil, err
+	}
+
+	data, err := io.ReadAll(f)
+	if err != nil {
 		return nil, fmt.Errorf("read enrollment file %s: %w", path, err)
 	}
 	var s Store
@@ -164,9 +187,21 @@ func (s *Store) Save(path string) error {
 // were named keeps working. A record that names one must be matched exactly:
 // otherwise, on a host with two providers, "alice" at either of them could
 // claim a local account enrolled for only one.
+//
+// An empty login never matches, on either side. EqualFold("", "") is true, so a
+// record whose login: key is missing — a hand edit, or a write that stopped
+// halfway — would otherwise be a wildcard in the most authoritative mapping tier,
+// matching every identity that also arrived without one. Add refuses to create
+// such a record; this is the half that covers the ones already on disk.
 func (s *Store) Find(localUser, login, providerName string) *Record {
+	if localUser == "" || login == "" {
+		return nil
+	}
 	for i := range s.Enrollments {
 		r := &s.Enrollments[i]
+		if r.Login == "" {
+			continue
+		}
 		if !strings.EqualFold(r.LocalUser, localUser) || !strings.EqualFold(r.Login, login) {
 			continue
 		}
@@ -190,9 +225,9 @@ func (s *Store) FindByLocalUser(localUser string) *Record {
 	return nil
 }
 
-// Add appends a new enrollment record. Returns an error if a record for the
-// same local user already exists (use Remove first to re-enroll), or if validate
-// refuses rec.LocalUser.
+// Add appends a new enrollment record. Returns an error if the record names no
+// provider login, if a record for the same local user already exists (use Remove
+// first to re-enroll), or if validate refuses rec.LocalUser.
 //
 // validate is applied to the new record only, and only here — never on Load or
 // Save. A record already in the file, however it got there, must not stop the
@@ -201,6 +236,13 @@ func (s *Store) FindByLocalUser(localUser string) *Record {
 // into a broken enrollment file for everybody, including the operator trying to
 // remove it. Pass Unvalidated if there is no configuration to validate against.
 func (s *Store) Add(rec Record, validate LocalUserValidator) error {
+	// A record is half of a pair, and a record with no login is half of nothing.
+	// Written out it would be a record Find could only ever match against an
+	// identity that also arrived with no login — which is to say a wildcard in the
+	// most authoritative tier, granting rec.LocalUser to whoever produces one.
+	if rec.Login == "" {
+		return fmt.Errorf("enrollment for local user %q names no provider login", rec.LocalUser)
+	}
 	if existing := s.FindByLocalUser(rec.LocalUser); existing != nil {
 		return fmt.Errorf("local user %q is already enrolled as %q; remove first",
 			rec.LocalUser, existing.Login)

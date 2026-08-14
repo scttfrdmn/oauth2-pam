@@ -292,6 +292,18 @@ func (c *Chain) Map(ctx context.Context, id *provider.Identity, requestedLocalUs
 // --- Tier 0: enrollment file ---
 
 func mapViaEnrollment(path, localUser string, id *provider.Identity) *Result {
+	// An identity with no login has nothing for this tier to match on, and must not
+	// be allowed to try. Matching is case-insensitive, EqualFold("", "") is true,
+	// and so an enrollment record whose login: key is missing would answer for every
+	// such identity — a wildcard in the tier that outranks every other one. The
+	// store refuses to write a record like that and refuses to match one; this is
+	// the same rule on the identity side, where a provider that returned no login
+	// gets no tier 0 answer rather than the first empty record in the file.
+	if id.Login == "" {
+		log.Warn().Str("provider", id.Provider).Str("path", path).
+			Msg("mapper tier0: identity has no provider login; skipping enrollment tier")
+		return nil
+	}
 	store, err := enrollment.Load(path)
 	if err != nil {
 		log.Warn().Err(err).Str("path", path).Msg("mapper tier0: failed to load enrollment file")
