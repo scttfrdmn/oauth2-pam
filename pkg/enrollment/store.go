@@ -6,6 +6,7 @@ package enrollment
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -62,12 +63,34 @@ var Unvalidated LocalUserValidator
 
 // Load reads the enrollment file at path. If the file does not exist, an
 // empty Store is returned without error.
+//
+// The file's mode and owner are checked before anything is parsed — see
+// checkPerms. A file this process cannot trust is an error rather than an empty
+// store: falling through to the later tiers would turn "somebody else can rewrite
+// tier 0" into a silent change of mapping policy.
 func Load(path string) (*Store, error) {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path) // #nosec G304 -- path comes from the broker's own root-owned config
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return &Store{}, nil
 		}
+		return nil, fmt.Errorf("open enrollment file %s: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+
+	// Stat the open descriptor, not the path: what is checked has to be the same
+	// bytes that are then read, and a stat by path can be answered by one file and
+	// the read served by another.
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat enrollment file %s: %w", path, err)
+	}
+	if err := checkPerms(path, info); err != nil {
+		return nil, err
+	}
+
+	data, err := io.ReadAll(f)
+	if err != nil {
 		return nil, fmt.Errorf("read enrollment file %s: %w", path, err)
 	}
 	var s Store

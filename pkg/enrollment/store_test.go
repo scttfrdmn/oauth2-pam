@@ -67,6 +67,64 @@ func TestLoadMalformedFile(t *testing.T) {
 	}
 }
 
+// TestLoadRefusesAWritableFile is the point of checkPerms. Tier 0 says which
+// provider identity owns which local account, so any local user who can write
+// this file can add a record aiming their own provider login at somebody else's
+// Unix account — and the login that follows looks exactly like a legitimate one.
+// Load has to refuse before it parses, not warn.
+func TestLoadRefusesAWritableFile(t *testing.T) {
+	for _, mode := range []os.FileMode{0620, 0602, 0660, 0666, 0777} {
+		t.Run(fmt.Sprintf("%04o", mode), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "enrolled-users.yaml")
+			store := &Store{Enrollments: []Record{{LocalUser: "alice", Login: "alice-gh"}}}
+			if err := store.Save(path); err != nil {
+				t.Fatalf("Save: %v", err)
+			}
+			// Chmod rather than a mode passed to WriteFile, which the umask can trim.
+			if err := os.Chmod(path, mode); err != nil {
+				t.Fatalf("chmod: %v", err)
+			}
+
+			if _, err := Load(path); err == nil {
+				t.Fatalf("Load accepted a mode-%04o enrollment file; anyone in its group chooses who logs in as whom", mode)
+			} else if !strings.Contains(err.Error(), "chmod 600") {
+				t.Errorf("err = %q, want it to say how to fix the mode", err)
+			}
+		})
+	}
+}
+
+// The other half: group-*readable* still loads. A 0640 enrollment file is a
+// disclosure worth fixing, but refusing to load it would lock every enrolled
+// user off the host, and that is the worse failure of the two.
+func TestLoadAcceptsAGroupReadableFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "enrolled-users.yaml")
+	store := &Store{Enrollments: []Record{{LocalUser: "alice", Login: "alice-gh"}}}
+	if err := store.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := os.Chmod(path, 0644); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load of a 0644 file: %v", err)
+	}
+	if loaded.FindByLocalUser("alice") == nil {
+		t.Error("the record did not load")
+	}
+}
+
+// A path that is not a regular file is not an enrollment file, whatever it
+// contains.
+func TestLoadRefusesANonRegularFile(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Load(dir); err == nil {
+		t.Error("Load accepted a directory as the enrollment file")
+	}
+}
+
 // TestSaveIsNotWorldReadable: the file links Unix accounts to GitHub identities,
 // which is exactly the information an attacker needs to target a device-flow
 // phish at the right person.
