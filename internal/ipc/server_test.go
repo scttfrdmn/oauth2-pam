@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -39,6 +40,17 @@ func TestValidateRequest(t *testing.T) {
 		{"session id at the limit", Request{Type: "check_session", SessionID: strings.Repeat("a", 128)}, ""},
 		{"session id over the limit", Request{Type: "check_session", SessionID: strings.Repeat("a", 129)}, "session_id too long"},
 		{"source ip over the limit", Request{Type: "authenticate", UserID: "alice", SourceIP: strings.Repeat("a", 46)}, "source_ip too long"},
+
+		// user_agent and device_id had no bound and no NUL check at all: a 64 KB
+		// user_agent was accepted and written to the audit trail, and a NUL
+		// survived into both. Everything a request carries is bounded, including
+		// the fields nothing here interprets.
+		{"user agent at the limit", Request{Type: "authenticate", UserID: "alice", UserAgent: strings.Repeat("a", maxUserAgentLen)}, ""},
+		{"user agent over the limit", Request{Type: "authenticate", UserID: "alice", UserAgent: strings.Repeat("a", maxUserAgentLen+1)}, "user_agent too long"},
+		{"user agent of 64 KB", Request{Type: "authenticate", UserID: "alice", UserAgent: strings.Repeat("a", 65476)}, "user_agent too long"},
+		{"device id at the limit", Request{Type: "authenticate", UserID: "alice", DeviceID: strings.Repeat("a", maxDeviceIDLen)}, ""},
+		{"device id over the limit", Request{Type: "authenticate", UserID: "alice", DeviceID: strings.Repeat("a", maxDeviceIDLen+1)}, "device_id too long"},
+
 		// docs/wire-protocol.md requires a receiver to accept a zoned IPv6
 		// literal, and it is the one address shape a well-meaning validator
 		// breaks: net.ParseIP fails on a zone, as does inet_pton. This request is
@@ -67,6 +79,42 @@ func TestValidateRequest(t *testing.T) {
 			Request{Type: "authenticate", UserID: "alice", Metadata: map[string]string{"k\x00": "v"}},
 			"NUL byte",
 		},
+		// metadata is a map, so the count is a bound of its own: 3000 keys used to
+		// be accepted, none of them individually remarkable.
+		{
+			"metadata at the entry limit",
+			Request{Type: "authenticate", UserID: "alice", Metadata: metadataWith(maxMetadataEntries)},
+			"",
+		},
+		{
+			"metadata over the entry limit",
+			Request{Type: "authenticate", UserID: "alice", Metadata: metadataWith(maxMetadataEntries + 1)},
+			"too many entries",
+		},
+		{
+			"metadata flood",
+			Request{Type: "authenticate", UserID: "alice", Metadata: metadataWith(3000)},
+			"too many entries",
+		},
+		{
+			"metadata key over the limit",
+			Request{Type: "authenticate", UserID: "alice", Metadata: map[string]string{strings.Repeat("k", maxMetadataKeyLen+1): "v"}},
+			"metadata key too long",
+		},
+		{
+			"metadata value over the limit",
+			Request{Type: "authenticate", UserID: "alice", Metadata: map[string]string{"k": strings.Repeat("v", maxMetadataValueLen+1)}},
+			"metadata value too long",
+		},
+		// What the reference client actually sends, so the ceilings above cannot be
+		// tightened into refusing it.
+		{
+			"the reference client's metadata",
+			Request{Type: "authenticate", UserID: "alice", Metadata: map[string]string{
+				"service": "sshd", "tty": "ssh", "pid": "12345", "rhost": "client.example.com",
+			}},
+			"",
+		},
 	}
 
 	for _, tc := range tests {
@@ -87,6 +135,120 @@ func TestValidateRequest(t *testing.T) {
 			}
 		})
 	}
+}
+
+// metadataWith builds a metadata map of n entries, each small enough that only
+// the count can be what refuses it.
+func metadataWith(n int) map[string]string {
+	m := make(map[string]string, n)
+	for i := 0; i < n; i++ {
+		m[fmt.Sprintf("k%d", i)] = "v"
+	}
+	return m
+}
+
+// TestEveryRequestStringIsBounded is what keeps broker conformance item 6 —
+// "bounds every request field" — true as Request grows.
+//
+// The claim was false when it was written: user_agent and device_id were added to
+// the struct and never to the validator, because the validator was a run of ifs
+// somebody had to remember to extend. This test reads the struct rather than a
+// list of names, so a new string field fails here until it is either bounded in
+// requestFields or whitelisted against fixed values the way type and login_type
+// are.
+func TestEveryRequestStringIsBounded(t *testing.T) {
+	bounded := map[string]int{}
+	for _, f := range requestFields(&Request{}) {
+		if f.max <= 0 {
+			t.Errorf("requestFields lists %q with max %d; a non-positive ceiling refuses every value", f.name, f.max)
+		}
+		bounded[f.name] = f.max
+	}
+	// Whitelisted against a fixed set of values in validateRequest, which is a
+	// tighter bound than a length.
+	whitelisted := map[string]bool{"type": true, "login_type": true}
+
+	rt := reflect.TypeOf(Request{})
+	for i := 0; i < rt.NumField(); i++ {
+		field := rt.Field(i)
+		if field.Type.Kind() != reflect.String {
+			continue
+		}
+		name := jsonName(field)
+		if _, ok := bounded[name]; ok {
+			continue
+		}
+		if whitelisted[name] {
+			continue
+		}
+		t.Errorf("request field %q (%s) is neither bounded in requestFields nor whitelisted; "+
+			"it reaches the log and the audit trail with whatever length and bytes the caller chose",
+			name, field.Name)
+	}
+}
+
+// TestEveryBoundedFieldRefusesNULAndOverlength drives requestFields itself, so a
+// field added to the list is covered without a test being written for it — which
+// is the whole reason the list exists.
+//
+// The NUL half is the one that had holes: session_id, source_ip and target_host
+// were length-bounded with no NUL check, and source_ip and target_host are copied
+// into an audit event verbatim.
+func TestEveryBoundedFieldRefusesNULAndOverlength(t *testing.T) {
+	for _, f := range requestFields(&Request{}) {
+		t.Run(f.name, func(t *testing.T) {
+			// check_session rather than authenticate so that a user_id set to a NUL
+			// string is refused by the NUL check and not by the non-empty rule.
+			withNUL := Request{Type: "check_session", UserID: "alice"}
+			setRequestString(t, &withNUL, f.name, "alice\x00bob")
+			assertRejected(t, &withNUL, "NUL byte")
+
+			tooLong := Request{Type: "check_session", UserID: "alice"}
+			setRequestString(t, &tooLong, f.name, strings.Repeat("a", f.max+1))
+			assertRejected(t, &tooLong, f.name+" too long")
+
+			atLimit := Request{Type: "check_session", UserID: "alice"}
+			setRequestString(t, &atLimit, f.name, strings.Repeat("a", f.max))
+			if err := validateRequest(&atLimit); err != nil {
+				t.Errorf("a %s of exactly %d bytes was refused (%v); the bound must be a maximum, not one short of it",
+					f.name, f.max, err)
+			}
+		})
+	}
+}
+
+func assertRejected(t *testing.T, req *Request, want string) {
+	t.Helper()
+	err := validateRequest(req)
+	if err == nil {
+		t.Fatalf("validateRequest() = nil, want an error mentioning %q", want)
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("validateRequest() = %q, want it to mention %q", err, want)
+	}
+}
+
+// setRequestString sets the request field carrying the given wire name, so a test
+// can be driven from requestFields rather than from a struct literal per field.
+func setRequestString(t *testing.T, req *Request, wireName, value string) {
+	t.Helper()
+	rv := reflect.ValueOf(req).Elem()
+	rt := rv.Type()
+	for i := 0; i < rt.NumField(); i++ {
+		if rt.Field(i).Type.Kind() == reflect.String && jsonName(rt.Field(i)) == wireName {
+			rv.Field(i).SetString(value)
+			return
+		}
+	}
+	t.Fatalf("requestFields names %q but Request has no string field with that json tag", wireName)
+}
+
+func jsonName(field reflect.StructField) string {
+	name := strings.Split(field.Tag.Get("json"), ",")[0]
+	if name == "" {
+		return field.Name
+	}
+	return name
 }
 
 // rawRoundtrip writes arbitrary bytes to the socket, bypassing Request
@@ -112,8 +274,8 @@ func (h *harness) rawRoundtrip(payload []byte) Response {
 	return resp
 }
 
-// TestOversizedRequestIsRejected: the read is capped before decoding so a local
-// caller cannot make the broker allocate without bound.
+// TestOversizedRequestIsRejected: the read is capped at 64 KB so a local caller
+// cannot make the broker allocate without bound.
 func TestOversizedRequestIsRejected(t *testing.T) {
 	h := newHarness(t)
 
@@ -136,6 +298,67 @@ func TestOversizedRequestIsRejected(t *testing.T) {
 	if resp.Status != auth.StatusError {
 		t.Errorf("status = %q, want %q", resp.Status, auth.StatusError)
 	}
+	// And it says it was too big. Capping the read truncates the object, so the
+	// decoder's own account of it is "unexpected EOF" — which sends a client
+	// looking for a bug in its serializer instead of at the size of what it sent.
+	if !strings.Contains(resp.ErrorMessage, "limit") {
+		t.Errorf("error_message = %q; an oversized request must be reported as a size "+
+			"failure, not as a decode failure", resp.ErrorMessage)
+	}
+}
+
+// TestRequestSizeCapBoundary pins both sides of the 64 KB cap to the byte.
+//
+// The over-by-one half is the one worth having: the read is capped at
+// maxRequestSize+1 so that reaching the extra byte is what identifies an
+// oversized body, which means a body of exactly maxRequestSize+1 bytes decodes
+// cleanly inside the limiter. Without a check on what was actually consumed, that
+// one byte is the difference between the documented limit and the enforced one.
+func TestRequestSizeCapBoundary(t *testing.T) {
+	// requestOfSize builds a valid check_session body of exactly n bytes by padding
+	// the session ID. Padding a field rather than adding whitespace keeps the bytes
+	// inside the JSON value, which is what the decoder has to read to find its end
+	// and therefore what the cap is protecting.
+	requestOfSize := func(t *testing.T, n int) []byte {
+		t.Helper()
+		empty, err := json.Marshal(Request{Type: "check_session"})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		body, err := json.Marshal(Request{Type: "check_session", SessionID: strings.Repeat("a", n-len(empty))})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if len(body) != n {
+			t.Fatalf("built a %d-byte body, want exactly %d", len(body), n)
+		}
+		return body
+	}
+
+	t.Run("exactly at the cap", func(t *testing.T) {
+		h := newHarness(t)
+		resp := h.rawRoundtrip(requestOfSize(t, maxRequestSize))
+		// The session ID is far over its own 128-byte bound, so the answer is a field
+		// refusal — what matters is that it got as far as being validated rather than
+		// being refused for its size.
+		if strings.Contains(resp.ErrorMessage, "limit") {
+			t.Errorf("a request of exactly %d bytes was refused for its size (%q); the cap "+
+				"is a maximum, not one byte short of it", maxRequestSize, resp.ErrorMessage)
+		}
+	})
+
+	t.Run("one byte over the cap", func(t *testing.T) {
+		h := newHarness(t)
+		resp := h.rawRoundtrip(requestOfSize(t, maxRequestSize+1))
+		if resp.ErrorCode != "INVALID_REQUEST" {
+			t.Errorf("error_code = %q, want INVALID_REQUEST", resp.ErrorCode)
+		}
+		if !strings.Contains(resp.ErrorMessage, "limit") {
+			t.Errorf("a request of %d bytes was answered %q; one byte over the cap is over "+
+				"the cap, and the limiter's spare byte must not become a spare byte of budget",
+				maxRequestSize+1, resp.ErrorMessage)
+		}
+	})
 }
 
 func TestMalformedRequestIsRejected(t *testing.T) {
@@ -217,6 +440,82 @@ func TestClientSessionIDIsIgnored(t *testing.T) {
 	// And the attacker's ID must not resolve to anything.
 	if got := h.check(attacker); got.ErrorCode != "SESSION_NOT_FOUND" {
 		t.Errorf("client-chosen session ID resolved to %+v", got)
+	}
+}
+
+// TestDispatchBudgetBoundsTheHandlerSlot is the regression test for a false
+// comment with real consequences: maxConcurrentHandlers said a slot could not be
+// held longer than server.read_timeout, but dispatch runs inside the slot and its
+// only clock was the provider HTTP client's 30s. 64 connections against a
+// provider that accepts and stalls held every slot, and acceptConnections blocks
+// after accepting, so no login on the host was served — including polls for
+// logins that had already succeeded.
+//
+// The comment is now true because dispatchWithin makes it true. What this test
+// pins is the property the comment claims: the handler comes back on its own.
+func TestDispatchBudgetBoundsTheHandlerSlot(t *testing.T) {
+	// A dispatch that never returns, standing in for a provider that accepts the
+	// connection and says nothing. Released at the end so the goroutine does not
+	// outlive the test.
+	stall := make(chan struct{})
+	t.Cleanup(func() { close(stall) })
+
+	entered := make(chan struct{})
+	dispatch := func(*Request) *Response {
+		close(entered)
+		<-stall
+		return &Response{Success: true, Status: auth.StatusAuthorized}
+	}
+
+	start := time.Now()
+	resp := dispatchWithin(20*time.Millisecond, &Request{Type: "authenticate", UserID: "alice"}, dispatch)
+	elapsed := time.Since(start)
+
+	<-entered
+	if elapsed > 5*time.Second {
+		t.Errorf("dispatchWithin held its caller for %s against a 20ms budget", elapsed)
+	}
+	if resp.Success {
+		t.Error("a dispatch that never answered was reported as a success")
+	}
+	if resp.Status != auth.StatusError {
+		t.Errorf("status = %q, want %q", resp.Status, auth.StatusError)
+	}
+	// The verb's own internal-error code, not a new one: see verbErrorCode.
+	if resp.ErrorCode != "AUTHENTICATION_FAILED" {
+		t.Errorf("error_code = %q, want AUTHENTICATION_FAILED", resp.ErrorCode)
+	}
+}
+
+// TestDispatchWithinPassesTheReplyThrough is the no-regression half. The budget
+// is a backstop for a provider with no clock of its own, and it must be invisible
+// to every request that answers in time — including the reply's error code, which
+// dispatchWithin only substitutes on a timeout.
+func TestDispatchWithinPassesTheReplyThrough(t *testing.T) {
+	want := &Response{Success: true, Status: auth.StatusAuthorized, UserID: "alice"}
+	got := dispatchWithin(5*time.Second, &Request{Type: "authenticate", UserID: "alice"},
+		func(*Request) *Response { return want })
+
+	if got != want {
+		t.Errorf("dispatchWithin returned %+v, want the dispatch's own reply %+v", got, want)
+	}
+}
+
+// TestVerbErrorCodeIsRegisteredInTheSpec: a timeout is reported with the verb's
+// own internal-error code because those are already in docs/wire-protocol.md and
+// a client already treats them as terminal. A code invented here would be a
+// contract change and a C-module change for nothing.
+func TestVerbErrorCodeIsRegisteredInTheSpec(t *testing.T) {
+	spec, err := os.ReadFile(filepath.Join("..", "..", "docs", "wire-protocol.md"))
+	if err != nil {
+		t.Fatalf("read the spec: %v", err)
+	}
+	for _, verb := range []string{"authenticate", "check_session", "refresh_session", "revoke_session"} {
+		code := verbErrorCode(verb)
+		if !strings.Contains(string(spec), code) {
+			t.Errorf("%s times out as %q, which docs/wire-protocol.md does not register; "+
+				"a client cannot be expected to know what it means", verb, code)
+		}
 	}
 }
 
