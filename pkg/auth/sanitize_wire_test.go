@@ -2,11 +2,87 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/scttfrdmn/oauth2-pam/pkg/provider"
 )
+
+// unreachableProvider fails to start a device flow the way a real HTTP client
+// does: with the URL it dialled and the address behind it in the error string.
+// For a host configured against a GitHub Enterprise Server, that is the
+// deployment's internal name and IP.
+type unreachableProvider struct {
+	*fakeProvider
+}
+
+const unreachableDetail = `Post "https://ghes.corp.internal:8443/login/device/code": ` +
+	`dial tcp 10.1.2.3:8443: connect: connection refused`
+
+func (u unreachableProvider) StartDeviceFlow(context.Context) (*provider.DeviceFlow, error) {
+	return nil, errors.New(unreachableDetail)
+}
+
+// TestInternalErrorDetailStaysOffTheWire is broker conformance item 7 in
+// docs/wire-protocol.md: "Never puts internal error detail on the wire.
+// error_code is a category; the detail belongs in the broker's log."
+//
+// Both refusals in Authenticate used to answer with err.Error(), and
+// internal/ipc copies error_message verbatim to the socket — so an unreachable
+// or misconfigured Enterprise deployment put its own hostname and address into
+// the reply, and a selection failure echoed back the provider name the client
+// sent, unsanitized.
+//
+// The audience is root, so the disclosure ceiling is low. The contract is the
+// point: error_message is documented as being for the log and never for a
+// decision, and a client that starts finding detail there is a client that will
+// start parsing it.
+func TestInternalErrorDetailStaysOffTheWire(t *testing.T) {
+	b := startBroker(t, brokerConfig(t), unreachableProvider{newFakeProvider("ghes")})
+
+	t.Run("device flow failure", func(t *testing.T) {
+		resp, err := b.Authenticate(&AuthRequest{UserID: "alice", LoginType: "ssh"})
+		if err != nil {
+			t.Fatalf("Authenticate: %v", err)
+		}
+		if resp.ErrorCode != "DEVICE_FLOW_FAILED" {
+			t.Fatalf("error_code = %q, want DEVICE_FLOW_FAILED", resp.ErrorCode)
+		}
+		assertNoInternalDetail(t, resp.ErrorMessage,
+			"ghes.corp.internal", "10.1.2.3", "8443", "connection refused", "Post")
+	})
+
+	t.Run("provider selection failure", func(t *testing.T) {
+		// The requested name is the client's own bytes coming back out of a root
+		// process, which is the second reason not to echo it.
+		const asked = "sso.corp.internal"
+
+		resp, err := b.Authenticate(&AuthRequest{UserID: "alice", LoginType: "ssh", Provider: asked})
+		if err != nil {
+			t.Fatalf("Authenticate: %v", err)
+		}
+		if resp.ErrorCode != "NO_PROVIDER" {
+			t.Fatalf("error_code = %q, want NO_PROVIDER", resp.ErrorCode)
+		}
+		assertNoInternalDetail(t, resp.ErrorMessage, asked)
+	})
+}
+
+// assertNoInternalDetail fails if any of detail appears in the wire message, and
+// also if the message is empty: a category with nothing in it would satisfy every
+// other assertion while telling an operator's client nothing at all.
+func assertNoInternalDetail(t *testing.T, message string, detail ...string) {
+	t.Helper()
+	if message == "" {
+		t.Error("error_message is empty; the category still has to say something")
+	}
+	for _, d := range detail {
+		if strings.Contains(message, d) {
+			t.Errorf("error_message contains internal detail %q: %q", d, message)
+		}
+	}
+}
 
 // hostileProvider is a provider whose device flow returns strings laced with
 // terminal escapes, as a compromised or malicious GitHub Enterprise deployment

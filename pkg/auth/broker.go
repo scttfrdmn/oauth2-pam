@@ -293,10 +293,16 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 		Timestamp:  time.Now(),
 	})
 
+	// Both refusals below carry a fixed category string, not err.Error().
+	// docs/wire-protocol.md's broker conformance item 7: error_code is the
+	// category and the detail belongs in the broker's log. internal/ipc copies
+	// ErrorMessage verbatim to the socket, so wrapping the underlying error put
+	// the configured Enterprise hostname or IP — and, for a selection failure,
+	// the client's own unsanitized provider name — into the reply.
 	prov, err := b.selectProvider(req.Provider)
 	if err != nil {
 		log.Warn().Err(err).Str("provider", req.Provider).Msg("Cannot select a provider")
-		return errorResponse("NO_PROVIDER", err.Error()), nil
+		return errorResponse("NO_PROVIDER", "Requested authentication provider is not available"), nil
 	}
 
 	// Generate a cryptographically random session ID server-side.
@@ -330,6 +336,10 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 	if err != nil {
 		// Release the reservation: a flow that never started holds no slot.
 		b.removeSession(sessionID)
+		log.Error().Err(err).Str("provider", prov.Name()).
+			Msg("Could not start a device flow at the provider")
+		// The audit record keeps the detail: it is a local log, and an operator
+		// diagnosing an unreachable provider has nowhere else to read it.
 		b.auditLogger.LogAuthEvent(security.AuditEvent{
 			EventType:    "device_flow_failed",
 			UserID:       req.UserID,
@@ -340,7 +350,7 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 			ErrorMessage: err.Error(),
 			Timestamp:    time.Now(),
 		})
-		return errorResponse("DEVICE_FLOW_FAILED", err.Error()), nil
+		return errorResponse("DEVICE_FLOW_FAILED", "Could not start device authorization"), nil
 	}
 
 	// The provider chose these two strings, and they are printed to a terminal by
