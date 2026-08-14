@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -141,6 +142,57 @@ type gitHubTeam struct {
 	Organization gitHubOrg `json:"organization"`
 }
 
+// Response body bounds. Every body below arrives from the GitHub instance an
+// operator pointed the broker at — on a GHES, a machine this host does not
+// control — and nothing on the wire says how long a response will be until it
+// has already been buffered. A broker that runs out of memory takes every OAuth
+// login on the host down with it, so each decode gets a ceiling. Both figures
+// are orders of magnitude above what a real response needs: reaching one means
+// the peer is broken or hostile, not that a large site was unlucky.
+const (
+	// maxAuthResponseSize bounds the device authorization and token endpoint
+	// bodies. Each is a handful of short fields — github.com's are under 512
+	// bytes, and the longest value either can carry is an error_description — so
+	// 64 KB is the same "generous but bounded" figure the IPC server allows for a
+	// PAM request.
+	maxAuthResponseSize = 64 * 1024
+
+	// maxAPIResponseSize bounds one REST API page. The largest real body is a
+	// per_page=100 page of /user/teams, where every entry carries a full team
+	// object and its parent organization: a few hundred KB. 1 MB leaves room for a
+	// GHES that is more verbose than github.com, and keeps the worst case of a
+	// paginated walk at maxAPIPages × 1 MB of transient decode buffer.
+	maxAPIResponseSize = 1024 * 1024
+)
+
+// Device flow bounds. expires_in and interval are numbers the provider chooses,
+// and they become a session deadline and a poll sleep in the broker, so neither
+// is taken as given.
+const (
+	// defaultDeviceCodeLifetime is github.com's own expires_in, applied when the
+	// response omits the field or sends a value that cannot be a lifetime.
+	// Without it, a missing expires_in produced an ExpiresAt of "now" and the
+	// login was dead before the user could read the code.
+	defaultDeviceCodeLifetime = 15 * time.Minute
+
+	// maxDeviceCodeLifetime caps how long a pending session may sit waiting for a
+	// user to approve. It also removes an overflow: time.Duration(expires_in) *
+	// time.Second wraps past int64 nanoseconds above ~9.2e9 seconds, so an absurd
+	// expires_in became an ExpiresAt in the *past*. The broker applies
+	// authentication.device_flow_timeout on top of this; 30 minutes is the bound
+	// that still holds when that setting is unset.
+	maxDeviceCodeLifetime = 30 * time.Minute
+
+	// defaultPollInterval is RFC 8628 §3.5's default for a missing interval.
+	defaultPollInterval = 5
+
+	// maxPollInterval bounds the interval upward, in seconds. A provider that
+	// answers "poll me in a year" is a slow-loris: the pending session and its
+	// polling goroutine stay alive while the flow makes no progress. At 60s a
+	// flow still gets many attempts inside maxDeviceCodeLifetime.
+	maxPollInterval = 60
+)
+
 // New creates a new GitHub provider from the given config. It targets
 // github.com unless the config names a GitHub Enterprise Server base_url.
 func New(cfg config.ProviderConfig) (*Provider, error) {
@@ -229,7 +281,7 @@ func (p *Provider) StartDeviceFlow(ctx context.Context) (*provider.DeviceFlow, e
 	}
 
 	var dar deviceAuthResponse
-	if err := json.NewDecoder(resp.Body).Decode(&dar); err != nil {
+	if err := decodeJSONBody(resp.Body, maxAuthResponseSize, &dar); err != nil {
 		return nil, fmt.Errorf("github device flow: decode response: %w", err)
 	}
 
@@ -238,16 +290,30 @@ func (p *Provider) StartDeviceFlow(ctx context.Context) (*provider.DeviceFlow, e
 		verifyURL = dar.VerificationURIComplete
 	}
 
+	// Clamp both provider-supplied numbers here, where they are read, rather than
+	// leaving the broker to defend itself against a deadline in the past or a
+	// poll interval measured in weeks.
+	lifetimeSeconds := dar.ExpiresIn
+	switch {
+	case lifetimeSeconds <= 0:
+		lifetimeSeconds = int(defaultDeviceCodeLifetime / time.Second)
+	case lifetimeSeconds > int(maxDeviceCodeLifetime/time.Second):
+		lifetimeSeconds = int(maxDeviceCodeLifetime / time.Second)
+	}
+
 	interval := dar.Interval
-	if interval <= 0 {
-		interval = 5
+	switch {
+	case interval <= 0:
+		interval = defaultPollInterval
+	case interval > maxPollInterval:
+		interval = maxPollInterval
 	}
 
 	df := &provider.DeviceFlow{
 		DeviceCode:      dar.DeviceCode,
 		UserCode:        dar.UserCode,
 		DeviceURL:       verifyURL,
-		ExpiresAt:       time.Now().Add(time.Duration(dar.ExpiresIn) * time.Second),
+		ExpiresAt:       time.Now().Add(time.Duration(lifetimeSeconds) * time.Second),
 		PollingInterval: interval,
 	}
 
@@ -286,7 +352,7 @@ func (p *Provider) PollDeviceAuthorization(ctx context.Context, deviceCode strin
 	defer func() { _ = resp.Body.Close() }()
 
 	var tr tokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
+	if err := decodeJSONBody(resp.Body, maxAuthResponseSize, &tr); err != nil {
 		return nil, fmt.Errorf("github poll: decode response: %w", err)
 	}
 
@@ -490,10 +556,17 @@ const (
 	// a member whose org fell off page one was denied the login.
 	apiPageSize = 100
 
-	// maxAPIPages bounds the walk at 2,000 entries. The cursor comes from the
-	// server, so a loop that only stops when it says to is a loop a broken or
-	// hostile API can hold a login open in.
+	// maxAPIPages bounds the number of requests one walk may make. The cursor comes
+	// from the server, so a loop that only stops when it says to is a loop a broken
+	// or hostile API can hold a login open in.
 	maxAPIPages = 20
+
+	// maxAPIEntries bounds what a walk accumulates. maxAPIPages alone does not:
+	// nothing obliges a server to honour per_page, so twenty pages of minimal
+	// objects — `{"login":"a"}` is fourteen bytes — fit hundreds of thousands of
+	// entries inside maxAPIResponseSize each, and those are retained rather than
+	// transient. 2,000 is the count maxAPIPages was always meant to imply.
+	maxAPIEntries = maxAPIPages * apiPageSize
 )
 
 // apiGetAll fetches every page of a paginated GitHub list endpoint, following the
@@ -516,6 +589,9 @@ func apiGetAll[T any](ctx context.Context, p *Provider, accessToken, path string
 			return nil, err
 		}
 		all = append(all, batch...)
+		if len(all) > maxAPIEntries {
+			return nil, fmt.Errorf("GET %s: more than %d entries", path, maxAPIEntries)
+		}
 
 		// An empty page with a next cursor is how a server could keep this loop
 		// going for free; maxAPIPages is the real bound, but stopping here means
@@ -618,11 +694,28 @@ func (p *Provider) apiGetURL(ctx context.Context, accessToken, rawURL string, de
 		return "", fmt.Errorf("GET %s: unexpected status %d", rawURL, resp.StatusCode)
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(dest); err != nil {
+	if err := decodeJSONBody(resp.Body, maxAPIResponseSize, dest); err != nil {
 		return "", fmt.Errorf("decode %s: %w", rawURL, err)
 	}
 
 	return resp.Header.Get("Link"), nil
+}
+
+// decodeJSONBody decodes a JSON response body into dest, refusing a body longer
+// than limit instead of buffering it.
+//
+// The reader is allowed limit+1 bytes so that the two cases stay
+// distinguishable: a body at or under the limit decodes as it always did, and
+// one over it is reported as too large rather than as the "unexpected end of
+// JSON input" a bare truncation would produce — an operator reading that in a
+// log would go looking for the wrong fault.
+func decodeJSONBody(body io.Reader, limit int64, dest interface{}) error {
+	limited := &io.LimitedReader{R: body, N: limit + 1}
+	err := json.NewDecoder(limited).Decode(dest)
+	if limited.N <= 0 {
+		return fmt.Errorf("response exceeds the %d byte limit", limit)
+	}
+	return err
 }
 
 // tokenDisplayLabel returns a human-readable prefix…suffix label for audit logs.

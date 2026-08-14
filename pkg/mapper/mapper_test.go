@@ -507,6 +507,27 @@ fi
 	}
 }
 
+// TestScriptOutputIsBounded: cmd.Output() buffered everything the script chose to
+// write, so a mapping script stuck in a print loop was a way to exhaust the
+// broker's memory — and with it every OAuth login on the host.
+func TestScriptOutputIsBounded(t *testing.T) {
+	// Valid-shaped output with a real local_user, so size is the only thing wrong
+	// with it: unbounded, this maps to alice.
+	script := writeScript(t, `
+printf '{"local_user":"alice","padding":"'
+yes aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa | head -c 2000000 | tr -d '\n'
+printf '"}'
+`)
+
+	res, err := mapViaScript(context.Background(), script, identity())
+	if err == nil {
+		t.Fatalf("an oversized script output was accepted: %+v", res)
+	}
+	if !strings.Contains(err.Error(), "byte limit") {
+		t.Errorf("err = %v, want the output refused for its size", err)
+	}
+}
+
 // --- Tier 3: HTTP service ---
 
 func TestHTTPTier(t *testing.T) {
@@ -581,6 +602,30 @@ func TestHTTPTierRefusesRedirects(t *testing.T) {
 	}
 	if internalHit {
 		t.Error("the mapper followed a redirect to another host (SSRF)")
+	}
+}
+
+// TestHTTPTierRefusesAnOversizedResponse: io.ReadAll took whatever the mapping
+// service sent. That service is reachable over the network and need not be
+// healthy, and a body large enough to exhaust the broker's memory costs the far
+// side nothing to generate.
+func TestHTTPTierRefusesAnOversizedResponse(t *testing.T) {
+	// Valid JSON naming a real local_user: read without a bound, this maps to
+	// alice, so refusing it can only be the size check.
+	body := `{"local_user":"alice","padding":"` + strings.Repeat("a", maxTierResultSize) + `"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	c := New(config.MapperConfig{HTTPEndpoint: srv.URL, HTTPTimeout: 5 * time.Second})
+
+	res, err := mapViaHTTP(context.Background(), c.httpClient, srv.URL, identity())
+	if err == nil {
+		t.Fatalf("a %d byte response was accepted: %+v", len(body), res)
+	}
+	if !strings.Contains(err.Error(), "byte limit") {
+		t.Errorf("err = %v, want the response refused for its size", err)
 	}
 }
 

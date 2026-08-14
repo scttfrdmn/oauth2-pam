@@ -404,6 +404,15 @@ func expandLocalUser(tmplStr string, id *provider.Identity) (string, error) {
 
 // --- Tier 2: external script ---
 
+// maxTierResultSize bounds what Tier 2 and Tier 3 may hand back. Both answer with
+// the same object: one local_user and a group list. A user in a thousand groups
+// is a few tens of KB, so 1 MB is generous, and neither reply is worth a byte more
+// than that — the alternative is buffering whatever the far side sends, which for
+// Tier 3 is a network service the broker does not control and for Tier 2 is a
+// process that may simply be looping on a write. A broker that runs out of memory
+// takes every OAuth login on the host with it.
+const maxTierResultSize = 1024 * 1024
+
 // scriptInput is the JSON sent to the external script on stdin, and posted to
 // the HTTP mapping service.
 //
@@ -462,12 +471,50 @@ func mapViaScript(ctx context.Context, scriptPath string, id *provider.Identity)
 		"HOME=/nonexistent",
 	}
 
-	out, err := cmd.Output()
-	if err != nil {
+	// cmd.Output() would buffer the whole of stdout, so a script that writes
+	// without stopping is a way to exhaust the broker's memory rather than merely
+	// fail its own tier.
+	out := &boundedBuffer{limit: maxTierResultSize}
+	cmd.Stdout = out
+	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("script %q: %w", scriptPath, err)
 	}
+	if out.overflowed {
+		return nil, fmt.Errorf("script %q: output exceeds the %d byte limit", scriptPath, maxTierResultSize)
+	}
 
-	return parseResult(out)
+	return parseResult(out.buf.Bytes())
+}
+
+// boundedBuffer collects up to limit bytes and discards the rest, recording that
+// it did.
+//
+// Discarding rather than returning a write error is deliberate: os/exec copies the
+// child's stdout through this writer and closes the pipe when the copy stops, so a
+// write error kills the script with SIGPIPE and cmd.Wait then reports that signal
+// — an operator would see a script that crashed rather than one that was told to
+// stop talking. Draining keeps the diagnosis honest, and the buffer is bounded
+// either way.
+type boundedBuffer struct {
+	limit      int
+	buf        bytes.Buffer
+	overflowed bool
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	total := len(p)
+	if room := b.limit - b.buf.Len(); room < total {
+		b.overflowed = true
+		if room < 0 {
+			room = 0
+		}
+		p = p[:room]
+	}
+	// bytes.Buffer.Write never fails, and the whole write is reported as accepted:
+	// a short count here would surface as io.ErrShortWrite from cmd.Wait, hiding
+	// the overflow behind a less true error.
+	_, _ = b.buf.Write(p)
+	return total, nil
 }
 
 // --- Tier 3: HTTP service ---
@@ -499,9 +546,15 @@ func mapViaHTTP(ctx context.Context, client *http.Client, endpoint string, id *p
 		return nil, fmt.Errorf("POST %s: unexpected status %d", endpoint, resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	// One byte past the limit is read so that a body at the limit still parses and
+	// one over it is refused by size, rather than reaching parseResult truncated
+	// and being reported as malformed JSON.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTierResultSize+1))
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
+	}
+	if len(body) > maxTierResultSize {
+		return nil, fmt.Errorf("POST %s: response exceeds the %d byte limit", endpoint, maxTierResultSize)
 	}
 
 	return parseResult(body)

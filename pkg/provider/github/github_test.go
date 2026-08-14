@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/scttfrdmn/oauth2-pam/pkg/config"
@@ -320,6 +322,79 @@ func TestStartDeviceFlowDefaultsPollingInterval(t *testing.T) {
 	}
 	if df.PollingInterval != 5 {
 		t.Errorf("PollingInterval = %d, want the 5s default", df.PollingInterval)
+	}
+}
+
+// TestDeviceCodeLifetimeIsClamped: expires_in is a number the provider chooses
+// and it becomes the pending session's deadline. Taken as given, an absent field
+// expired the login immediately, a value above ~9.2e9 overflowed int64
+// nanoseconds into a deadline in the past, and anything in between could hold a
+// session open for as long as the provider liked.
+func TestDeviceCodeLifetimeIsClamped(t *testing.T) {
+	tests := []struct {
+		name      string
+		expiresIn string
+		wantAtMost,
+		wantAtLeast time.Duration
+	}{
+		{"github's own value", "900", 15 * time.Minute, 14 * time.Minute},
+		{"absent", "0", defaultDeviceCodeLifetime, defaultDeviceCodeLifetime - time.Minute},
+		{"negative", "-1", defaultDeviceCodeLifetime, defaultDeviceCodeLifetime - time.Minute},
+		{"a week", "604800", maxDeviceCodeLifetime, maxDeviceCodeLifetime - time.Minute},
+		// Large enough that time.Duration(expires_in) * time.Second wraps.
+		{"overflowing", "9223372036854", maxDeviceCodeLifetime, maxDeviceCodeLifetime - time.Minute},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`{"device_code":"d","user_code":"U","verification_uri":"https://x/",` +
+					`"expires_in":` + tc.expiresIn + `}`))
+			}))
+			defer srv.Close()
+
+			df, err := providerFor(t, srv.URL).StartDeviceFlow(context.Background())
+			if err != nil {
+				t.Fatalf("StartDeviceFlow: %v", err)
+			}
+			lifetime := time.Until(df.ExpiresAt)
+			if lifetime > tc.wantAtMost || lifetime < tc.wantAtLeast {
+				t.Errorf("lifetime = %s, want between %s and %s", lifetime, tc.wantAtLeast, tc.wantAtMost)
+			}
+		})
+	}
+}
+
+// TestPollingIntervalIsClamped: the interval becomes the broker's poll ticker, so
+// an interval the size of a week is a flow that never makes progress while its
+// session and polling goroutine stay alive.
+func TestPollingIntervalIsClamped(t *testing.T) {
+	tests := []struct {
+		interval string
+		want     int
+	}{
+		{"5", 5},
+		{"0", defaultPollInterval},
+		{"-3", defaultPollInterval},
+		{"86400", maxPollInterval},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.interval, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`{"device_code":"d","user_code":"U","verification_uri":"https://x/",` +
+					`"expires_in":900,"interval":` + tc.interval + `}`))
+			}))
+			defer srv.Close()
+
+			df, err := providerFor(t, srv.URL).StartDeviceFlow(context.Background())
+			if err != nil {
+				t.Fatalf("StartDeviceFlow: %v", err)
+			}
+			if df.PollingInterval != tc.want {
+				t.Errorf("PollingInterval = %d, want %d", df.PollingInterval, tc.want)
+			}
+		})
 	}
 }
 
@@ -670,6 +745,118 @@ func TestPaginationStopsOnAnEmptyPage(t *testing.T) {
 	}
 }
 
+// TestPaginationStopsAtTheEntryLimit: nothing obliges a server to honour
+// per_page, so the page count alone did not bound what a walk accumulated — a
+// server returning thousands of tiny entries per page reached hundreds of
+// thousands of retained entries inside the twenty-page budget.
+func TestPaginationStopsAtTheEntryLimit(t *testing.T) {
+	const perPage = 500
+
+	var requests atomic.Int32
+	var base string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Link", `<`+base+`/user/orgs?per_page=100&page=2>; rel="next"`)
+		_, _ = w.Write([]byte(jsonList("org-%d", perPage, `{"login":"%s"}`)))
+	}))
+	defer srv.Close()
+	base = srv.URL
+
+	_, err := providerFor(t, srv.URL).getUserOrgs(context.Background(), "gho_abc")
+	if err == nil {
+		t.Fatal("getUserOrgs accepted an unbounded number of entries")
+	}
+	if !strings.Contains(err.Error(), "entries") {
+		t.Errorf("err = %v, want the entry limit named", err)
+	}
+	// The entry bound has to bite before the page bound, or it is not the thing
+	// stopping the walk.
+	if got := requests.Load(); got >= maxAPIPages {
+		t.Errorf("made %d requests, want fewer than the %d page budget", got, maxAPIPages)
+	}
+}
+
+// TestOversizedResponsesAreRefused: a response body is buffered before anything
+// knows how long it is, and every one of these bodies comes from the GitHub
+// instance rather than from this host. Without a ceiling, a hostile or broken
+// GHES exhausts the broker's memory and takes OAuth logins down host-wide.
+func TestOversizedResponsesAreRefused(t *testing.T) {
+	tests := []struct {
+		name  string
+		limit int
+		call  func(*Provider) error
+	}{
+		{"device authorization", maxAuthResponseSize, func(p *Provider) error {
+			_, err := p.StartDeviceFlow(context.Background())
+			return err
+		}},
+		{"token", maxAuthResponseSize, func(p *Provider) error {
+			_, err := p.PollDeviceAuthorization(context.Background(), "dev-code")
+			return err
+		}},
+		{"api", maxAPIResponseSize, func(p *Provider) error {
+			_, err := p.getUser(context.Background(), realisticToken)
+			return err
+		}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Valid JSON, in a field the adapter ignores: the body is refused for
+			// its size, not because it failed to parse.
+			body := `{"padding":"` + strings.Repeat("a", tc.limit+1024) + `"}`
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(body))
+			}))
+			defer srv.Close()
+
+			err := tc.call(providerFor(t, srv.URL))
+			if err == nil {
+				t.Fatalf("a %d byte response was accepted", len(body))
+			}
+			if !strings.Contains(err.Error(), "byte limit") {
+				t.Errorf("err = %v, want the response refused for its size", err)
+			}
+		})
+	}
+}
+
+// TestDecodeJSONBodyStopsReadingAtTheLimit is the "refused, not consumed" half of
+// the bound: the reader here never ends, so a decoder that drained its input
+// would never return at all.
+func TestDecodeJSONBodyStopsReadingAtTheLimit(t *testing.T) {
+	const limit = 4096
+
+	body := &countingReader{r: io.MultiReader(strings.NewReader(`{"login":"`), endlessReader{})}
+	var dest gitHubUser
+
+	err := decodeJSONBody(body, limit, &dest)
+	if err == nil {
+		t.Fatal("an endless body was accepted")
+	}
+	if !strings.Contains(err.Error(), "byte limit") {
+		t.Errorf("err = %v, want the body refused for its size", err)
+	}
+	// limit+1 is the whole budget: one byte past the limit is what proves the body
+	// was over it.
+	if body.n > limit+1 {
+		t.Errorf("read %d bytes, want at most %d", body.n, limit+1)
+	}
+}
+
+// A body that fits must still decode, or the bound has broken the common case.
+func TestDecodeJSONBodyAcceptsABodyAtTheLimit(t *testing.T) {
+	var dest gitHubUser
+
+	body := `{"login":"alice","name":"` + strings.Repeat("n", 100) + `"}`
+	if err := decodeJSONBody(strings.NewReader(body), int64(len(body)), &dest); err != nil {
+		t.Fatalf("decodeJSONBody: %v", err)
+	}
+	if dest.Login != "alice" {
+		t.Errorf("Login = %q, want alice", dest.Login)
+	}
+}
+
 func TestParseNextLink(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -846,6 +1033,29 @@ func providerFor(t *testing.T, baseURL string) *Provider {
 		t.Fatalf("NewWithEndpoints: %v", err)
 	}
 	return p
+}
+
+// endlessReader is a body that never ends: it always has more of a JSON string
+// to hand over.
+type endlessReader struct{}
+
+func (endlessReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'a'
+	}
+	return len(p), nil
+}
+
+// countingReader records how much of the wrapped reader was actually consumed.
+type countingReader struct {
+	r io.Reader
+	n int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += n
+	return n, err
 }
 
 func jsonDecode(r *http.Request, dest interface{}) error {
