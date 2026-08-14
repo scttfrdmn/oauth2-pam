@@ -16,6 +16,77 @@ GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 GO_BUILD_FLAGS := -ldflags="-s -w -X main.version=$(VERSION) -X main.buildDate=$(BUILD_DATE) -X main.gitCommit=$(GIT_COMMIT)" -trimpath
 GO_TEST_FLAGS := -race -coverprofile=coverage.out
 
+# ---------------------------------------------------------------------------
+# PAM module build (plain C, no Go — issue #65)
+#
+# The module is a Linux-PAM module written in C, compiled by cc directly. It used
+# to be built with `go build -buildmode=c-shared ./cmd/pam-module`, which linked
+# the whole Go runtime — goroutine scheduler, garbage collector and, decisively,
+# the runtime's signal handlers — into sshd's address space for the sake of two Go
+# files that contained no logic at all. Every PAM entry point is and always was in
+# cgo_bridge_linux.c. So the Go shim is gone and this is the compile line.
+#
+# The flags below moved here from the #cgo directives in the deleted
+# cmd/pam-module/pam_linux.go. They are the only hardening this artifact gets, and
+# it is an artifact loaded into a process that runs as root while holding a
+# pre-auth network connection — so the reasoning travels with them rather than
+# being rediscovered:
+#
+#   -Werror, on a *release* artifact, is a deliberate risk: a future compiler that
+#   warns about untouched code turns a build into a failure. It is taken because
+#   the alternative is a warning nobody reads in a module that runs as root, and
+#   because CI builds this on a pinned image. The same C compiles warning-clean
+#   under the same flags in test/cbridge/, which is why turning them on costs
+#   nothing today and is worth doing before it does.
+#
+#   -D_FORTIFY_SOURCE=2, not 3. Level 3 needs gcc 12 and glibc 2.35; on an older
+#   toolchain glibc's features.h answers with a #warning, which -Werror above
+#   would turn into a build failure on exactly the enterprise distributions this
+#   module is meant to install on. -U first because Debian's and Ubuntu's gcc
+#   already define it, and a redefinition is itself a warning.
+#
+#   -fstack-clash-protection is x86-64 and aarch64 only; both are the release
+#   targets. -fcf-protection is deliberately absent: it is x86-only and would
+#   break the aarch64 build outright rather than warn.
+#
+#   No -fPIE/-pie: this links a shared object, which is already
+#   position-independent, and -pie on a .so is a link error. -fPIC is what a .so
+#   needs and is passed explicitly, since cc does not imply it.
+#
+# Two dynamic flags the c-shared build used to set are gone, and neither is a lost
+# mitigation. `go build -buildmode=c-shared` also passed -Bsymbolic and marked the
+# object NODELETE. SYMBOLIC has nothing left to do here: every function in
+# cgo_bridge_linux.c except the six pam_sm_* entry points is static, so there are no
+# internal references for the dynamic linker to resolve elsewhere. NODELETE existed
+# because the Go runtime cannot survive being unloaded — it pinned the module, and
+# 1.2 MB of scheduler with it, in sshd for the life of the process. A plain C module
+# has no such problem, so letting PAM dlclose it again is the correct behaviour.
+# BIND_NOW and full RELRO, which are the ones that matter for a writable GOT in a
+# root process, are set explicitly above and survive.
+#
+# Verify the mitigations actually took on the built .so rather than trusting this
+# comment:
+#
+#	readelf -lWd bin/oauth2_pam.so | grep -E 'GNU_RELRO|BIND_NOW|FLAGS'
+#	nm -D --undefined-only bin/oauth2_pam.so | grep __stack_chk_fail
+CC ?= cc
+PAM_SRC := cmd/pam-module/cgo_bridge_linux.c
+PAM_CFLAGS := -std=c11 -D_GNU_SOURCE -Icmd/pam-module -I/usr/include/security \
+	-Wall -Wextra -Wconversion -Wformat -Wformat-security -Werror \
+	-fstack-protector-strong -fstack-clash-protection -fno-common \
+	-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 -O2
+PAM_LDFLAGS := -shared -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
+PAM_LDLIBS := -lpam -ljson-c
+
+# Version stamping, which -ldflags used to do and cannot any more: there is no Go
+# in this artifact, so `-X main.version=...` had nothing to set. PAM_MODULE_VERSION
+# and PAM_MODULE_BUILD in cgo_bridge.h are what the module logs at the start of
+# every authentication, and each has a literal fallback so a bare
+# `cc cgo_bridge_linux.c` with no -D still compiles and still reports something
+# truthful about itself.
+PAM_VERSION_FLAGS := -DPAM_MODULE_VERSION='"$(VERSION)"' \
+	-DPAM_MODULE_BUILD='"$(GIT_COMMIT) $(BUILD_DATE)"'
+
 # Default target
 all: build
 
@@ -28,17 +99,25 @@ build-broker:
 	@mkdir -p $(BINARY_DIR)
 	go build $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(BROKER_BINARY) ./cmd/broker
 
-## Build PAM module (Linux only — needs Linux-PAM headers and json-c)
+## Build PAM module (Linux only — needs a C toolchain, Linux-PAM headers, json-c)
+##
+## The guard asks the C toolchain, not `go env GOOS`: there is no Go in this
+## artifact any more, so what has to exist is a compiler that can find
+## security/pam_appl.h and json-c/json.h. uname is the cheap version of that
+## question and the one that names the actual obstacle — libpam does not exist on
+## macOS at all, so no amount of toolchain will do.
 build-pam:
-	@if [ "$$(go env GOOS)" != "linux" ]; then \
-		echo "build-pam: skipped — the PAM module requires Linux (Linux-PAM headers"; \
-		echo "  and json-c). Build it in a Linux container:"; \
+	@if [ "$$(uname -s)" != "Linux" ]; then \
+		echo "build-pam: skipped — the PAM module needs a Linux C toolchain"; \
+		echo "  (Linux-PAM headers and json-c, neither of which exists on this"; \
+		echo "  platform). Build it in a Linux container:"; \
 		echo "    make docker-build-pam"; \
 		exit 1; \
 	fi
 	@echo "Building PAM module..."
 	@mkdir -p $(BINARY_DIR)
-	CGO_ENABLED=1 go build -buildmode=c-shared $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(PAM_MODULE) ./cmd/pam-module
+	$(CC) $(PAM_CFLAGS) $(PAM_VERSION_FLAGS) -fPIC $(PAM_LDFLAGS) \
+		-o $(BINARY_DIR)/$(PAM_MODULE) $(PAM_SRC) $(PAM_LDLIBS)
 	@echo "Verifying PAM entry points are present..."
 	@# Per symbol, and a build host without nm fails here rather than passing
 	@# quietly. The same script runs in release.yml and in the installer, so a
@@ -46,13 +125,19 @@ build-pam:
 	@scripts/verify-pam-symbols.sh $(BINARY_DIR)/$(PAM_MODULE)
 
 ## Build the PAM module in a Linux container (works from macOS)
+##
+## debian:stable-slim rather than a Go image: the module is C, and the toolchain it
+## needs is gcc plus two -dev packages. binutils comes along because
+## verify-pam-symbols.sh refuses to pass without nm — a build host that cannot
+## answer "are the entry points there" has not answered it.
 docker-build-pam:
 	@echo "Building PAM module in a Linux container..."
 	@mkdir -p $(BINARY_DIR)
-	docker run --rm -v "$(PWD)":/src -w /src golang:1.25 sh -c '\
+	docker run --rm -v "$(PWD)":/src -w /src debian:stable-slim sh -c '\
 		apt-get update -qq && \
-		apt-get install -y -qq libpam0g-dev libjson-c-dev >/dev/null && \
-		make build-pam'
+		apt-get install -y -qq --no-install-recommends \
+			gcc libc6-dev libpam0g-dev libjson-c-dev binutils make >/dev/null && \
+		make build-pam VERSION=$(VERSION) GIT_COMMIT=$(GIT_COMMIT) BUILD_DATE=$(BUILD_DATE)'
 
 ## Build admin CLI tool
 build-admin:
@@ -211,23 +296,25 @@ security:
 
 ## Create release build (linux only - PAM modules are linux-specific)
 ##
-## The three binaries cross-compile. The module does not: it is -buildmode=c-shared
-## against the host's libpam and libjson-c, so this target can only produce a .so
-## for the architecture it is running on. That is why release.yml builds on native
-## amd64 and arm64 runners, and why a published release comes from the workflow
-## rather than from here — this target produces one architecture's module and both
-## architectures' binaries, and used to name the module amd64 whatever it ran on.
+## The three binaries cross-compile. The module does not: it is a shared object
+## linked against the host's libpam and libjson-c, so this target can only produce
+## a .so for the architecture it is running on. That is why release.yml builds on
+## native amd64 and arm64 runners, and why a published release comes from the
+## workflow rather than from here — this target produces one architecture's module
+## and both architectures' binaries, and used to name the module amd64 whatever it
+## ran on.
 release: clean
 	@echo "Creating release build..."
 	@mkdir -p $(BINARY_DIR)
 	GOOS=linux GOARCH=amd64 go build $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(BROKER_BINARY)-linux-amd64 ./cmd/broker
-	@if [ "$$(go env GOOS)" = "linux" ]; then \
+	@if [ "$$(uname -s)" = "Linux" ]; then \
 		arch=$$(go env GOARCH); \
-		CGO_ENABLED=1 go build -buildmode=c-shared $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(PAM_MODULE)-linux-$$arch ./cmd/pam-module; \
+		$(CC) $(PAM_CFLAGS) $(PAM_VERSION_FLAGS) -fPIC $(PAM_LDFLAGS) \
+			-o $(BINARY_DIR)/$(PAM_MODULE)-linux-$$arch $(PAM_SRC) $(PAM_LDLIBS); \
 		scripts/verify-pam-symbols.sh $(BINARY_DIR)/$(PAM_MODULE)-linux-$$arch; \
 		echo "release: built $(PAM_MODULE)-linux-$$arch — the other architecture needs a host of that architecture"; \
 	else \
-		echo "release: skipping $(PAM_MODULE) — requires a Linux build host (see docker-build-pam)"; \
+		echo "release: skipping $(PAM_MODULE) — requires a Linux C toolchain (see docker-build-pam)"; \
 	fi
 	GOOS=linux GOARCH=amd64 go build $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(ADMIN_BINARY)-linux-amd64 ./cmd/oauth2-pam-admin
 	GOOS=linux GOARCH=amd64 go build $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(ENROLL_BINARY)-linux-amd64 ./cmd/oauth2-pam-enroll

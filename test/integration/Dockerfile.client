@@ -3,26 +3,35 @@
 #
 # Build context is the repository root.
 
-FROM golang:1.25-bookworm AS build
+# The module is plain C — no Go toolchain is involved in building it any more
+# (issue #65), so the build stage is a Debian image with gcc, the two -dev packages
+# and binutils. make is here because the compile line lives in the Makefile: the
+# harness must build the module the way a release does, and a second copy of that
+# command line here is a second place for the hardening flags to drift out of.
+FROM debian:bookworm-slim AS build
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends libpam0g-dev libjson-c-dev \
+ && apt-get install -y --no-install-recommends \
+      gcc libc6-dev libpam0g-dev libjson-c-dev binutils make \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
 COPY . .
 
-# Build the module the way make build-pam does, then insist the entry points are
-# actually in it. A .so without pam_sm_authenticate is exactly the defect this
-# harness exists to catch, and it is silent at build time.
-RUN go build -buildmode=c-shared -trimpath -o /out/oauth2_pam.so ./cmd/pam-module \
- && for sym in pam_sm_authenticate pam_sm_setcred pam_sm_acct_mgmt \
-               pam_sm_open_session pam_sm_close_session pam_sm_chauthtok; do \
-      nm -D --defined-only /out/oauth2_pam.so | grep -q " T $sym\$" \
-        || { echo "MISSING ENTRY POINT: $sym"; exit 1; }; \
-    done
+# Build the module the way make build-pam does — literally, by calling it — and
+# then insist the entry points are actually in it. A .so without
+# pam_sm_authenticate is exactly the defect this harness exists to catch, and it is
+# silent at build time.
+#
+# The verification is scripts/verify-pam-symbols.sh rather than a loop written out
+# here. This file held the fourth copy of that loop (issue #76): `make build-pam`,
+# release.yml and the installer were consolidated onto the script and this one was
+# missed, so the harness went on asking the question its own way — which is how the
+# three earlier copies came to disagree about what counted as an answer. VERSION is
+# passed explicitly because the build context has no .git for `git describe`.
+RUN make build-pam VERSION=harness GIT_COMMIT=harness BUILD_DATE=harness \
+ && mkdir -p /out \
+ && cp bin/oauth2_pam.so /out/oauth2_pam.so
 
 FROM debian:bookworm-slim
 

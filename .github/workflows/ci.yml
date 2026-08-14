@@ -30,9 +30,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # The Linux job is the real one: it is the only place the PAM module compiles,
-  # and the only place SO_PEERCRED (peercred_linux.go, the per-UID rate limiter)
-  # is more than dead code.
+  # The Linux job is the real one: it is the only place the PAM module compiles —
+  # it is a Linux-PAM module in C, built by cc — and the only place SO_PEERCRED
+  # (peercred_linux.go, the per-UID rate limiter) is more than dead code.
   linux:
     name: Linux — build, vet, test
     runs-on: ubuntu-latest
@@ -95,13 +95,35 @@ jobs:
       - name: C bridge mutation check
         run: sudo env NATIVE=1 test/cbridge/mutations.sh
 
-      # `make build` verifies with nm that all six pam_sm_* entry points made it
-      # into the .so. v0.1.1 shipped a module with none, and nothing failed.
+      # `make build` compiles the module with cc and then verifies with nm that all
+      # six pam_sm_* entry points made it into the .so. v0.1.1 shipped a module with
+      # none, and nothing failed.
       - name: Build all binaries and verify PAM entry points
         run: make build
 
-  # Proves the module's cgo is quarantined: cmd/pam-module/main.go must stay
-  # buildable off Linux, or the project cannot be developed on a Mac.
+      # The point of dropping -buildmode=c-shared (issue #65): the artifact loaded
+      # into sshd must not carry the Go runtime, whose signal handlers were
+      # installed into a process that did not ask for them. This is the assertion
+      # that keeps it out — a `.so` with a Go runtime in it is a megabyte of
+      # scheduler and garbage collector, so both the symbols and the size are
+      # checked, the size because a stripped runtime has no symbols to find.
+      - name: The module carries no Go runtime
+        run: |
+          if nm -D --defined-only bin/oauth2_pam.so | grep -qE ' (T|D|B) (runtime|go:)'; then
+            echo "::error::bin/oauth2_pam.so exports Go runtime symbols; it is not a plain C module"
+            exit 1
+          fi
+          bytes=$(stat -c %s bin/oauth2_pam.so)
+          echo "bin/oauth2_pam.so is $bytes bytes"
+          if [ "$bytes" -gt 262144 ]; then
+            echo "::error::bin/oauth2_pam.so is $bytes bytes; a plain C module is tens of kilobytes."
+            echo "::error::A megabyte-scale .so means a runtime got linked back in."
+            exit 1
+          fi
+
+  # Proves the Go half of the project stays portable: the PAM module is C and does
+  # not build here at all, so what this job guards is that no Go package has grown
+  # a dependency on Linux-PAM. The project has to remain developable on a Mac.
   macos:
     name: macOS — build and test
     runs-on: macos-latest
