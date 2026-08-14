@@ -86,7 +86,10 @@ cat <<'EOF'
 Installed. Nothing is running and no PAM stack has been changed yet.
 
 Next:
-  1. Edit the config — at minimum client_id, client_secret and a mapper rule.
+  1. Edit the config — at minimum client_id, a mapper rule, and the client
+     secret. The config is installed 0600 root-owned so an inline
+     client_secret is accepted; to keep the secret out of the file, see
+     client_secret_file and LoadCredential= in the config's comments.
   2. sudo systemctl enable --now oauth2-pam-broker
   3. oauth2-pam-admin status         # confirm the broker is answering
   4. oauth2-pam-admin test-auth --user YOUR_GITHUB_LOGIN

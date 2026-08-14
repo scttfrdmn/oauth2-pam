@@ -124,7 +124,16 @@ install-dev: build
 	sudo cp $(BINARY_DIR)/$(ADMIN_BINARY) /usr/local/bin/
 	sudo cp $(BINARY_DIR)/$(ENROLL_BINARY) /usr/local/bin/
 	sudo mkdir -p /etc/oauth2-pam
-	sudo cp configs/example.yaml /etc/oauth2-pam/broker.yaml
+	@# 0600 root-owned, because the example carries client_secret inline and the
+	@# broker refuses to read a secret out of a file other users can read. And it
+	@# is never overwritten: this target is run repeatedly during development, and
+	@# clobbering an edited config with the placeholder example loses the work.
+	@if [ -f /etc/oauth2-pam/broker.yaml ]; then \
+		echo "  keeping existing /etc/oauth2-pam/broker.yaml"; \
+	else \
+		sudo install -m 0600 -o root -g root configs/example.yaml /etc/oauth2-pam/broker.yaml; \
+		echo "  wrote /etc/oauth2-pam/broker.yaml from the example — edit it before starting the broker"; \
+	fi
 	sudo cp configs/systemd/oauth2-pam-broker.service /etc/systemd/system/
 	sudo systemctl daemon-reload
 

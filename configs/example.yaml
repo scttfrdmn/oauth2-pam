@@ -19,7 +19,39 @@ providers:
   - name: github
     type: github
     client_id: "Iv1.xxxxxxxxxxxx"          # GitHub OAuth App client ID
-    client_secret: "your-client-secret"    # GitHub OAuth App client secret
+
+    # The client secret can come from three places. Highest precedence first:
+    #
+    #   1. $OAUTH2_PAM_CLIENT_SECRET_GITHUB — the variable is named after the
+    #      provider (uppercased, anything but A-Z0-9 becomes "_"), so a second
+    #      provider named github-enterprise reads
+    #      $OAUTH2_PAM_CLIENT_SECRET_GITHUB_ENTERPRISE. Set but empty is an
+    #      error, not a fallback.
+    #
+    #   2. client_secret_file — an absolute path to a file containing the
+    #      secret and nothing else, or a bare systemd credential name. This is
+    #      the recommended form under systemd: add
+    #
+    #        LoadCredential=github-client-secret:/etc/oauth2-pam/github.secret
+    #
+    #      to the unit (see configs/systemd/oauth2-pam-broker.service) and then
+    #      write only the credential's name here:
+    #
+    #        client_secret_file: github-client-secret
+    #
+    #      systemd stages it at 0400 in a tmpfs only this unit can see, and the
+    #      config stops naming the secret's location at all.
+    #
+    #   3. client_secret, inline below. Supported, but it makes this file a
+    #      secret-bearing file: the broker then requires broker.yaml to have no
+    #      group or other permission bits (chmod 600) and to be owned by root,
+    #      and refuses to start otherwise. A secret in a world-readable config
+    #      is a secret every local user on the host already has.
+    #
+    # Whichever file holds the secret, the same rule applies to it: mode 0600,
+    # owned by root. Set exactly one of client_secret and client_secret_file.
+    client_secret: "your-client-secret"     # GitHub OAuth App client secret
+    # client_secret_file: github-client-secret
 
     github:
       # Require membership in this GitHub org (leave empty to allow any GitHub user)

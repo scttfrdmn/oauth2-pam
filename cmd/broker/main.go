@@ -54,6 +54,16 @@ func main() {
 		log.Fatal().Err(err).Msg("Invalid configuration")
 	}
 
+	// Where each secret came from, never the secret. An operator who has just
+	// moved a secret into a systemd credential or a file needs to see that the
+	// broker actually read it from there and is not still using an inline copy.
+	for _, p := range cfg.Providers {
+		log.Info().
+			Str("provider", p.Name).
+			Str("client_secret_from", string(p.SecretSource())).
+			Msg("Provider configured")
+	}
+
 	// Create broker
 	broker, err := auth.NewBroker(cfg)
 	if err != nil {

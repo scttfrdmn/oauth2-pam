@@ -34,6 +34,15 @@ RUN mkdir -p /etc/fakegithub \
  && update-ca-certificates
 
 COPY test/integration/broker.yaml /etc/oauth2-pam/broker.yaml
+
+# The client secret lives in its own 0600 file, which is what broker.yaml points
+# at. Written here rather than COPYed so the mode is not whatever the repo
+# checkout happens to be: the broker refuses to read a secret out of a file other
+# users can read.
+RUN printf 'fakeclientsecret0000000000000000\n' > /etc/oauth2-pam/fakegithub.secret \
+ && chmod 0600 /etc/oauth2-pam/fakegithub.secret \
+ && chown root:root /etc/oauth2-pam/fakegithub.secret
+
 RUN mkdir -p /var/log/oauth2-pam
 
 CMD ["oauth2-pam-broker", "--config", "/etc/oauth2-pam/broker.yaml"]

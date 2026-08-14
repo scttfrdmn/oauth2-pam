@@ -52,10 +52,28 @@ type ServerConfig struct {
 // ProviderConfig represents a single OAuth2 provider configuration.
 // Currently "github" is the only supported type.
 type ProviderConfig struct {
-	Name         string `mapstructure:"name"`
-	Type         string `mapstructure:"type"` // "github"
-	ClientID     string `mapstructure:"client_id"`
+	Name     string `mapstructure:"name"`
+	Type     string `mapstructure:"type"` // "github"
+	ClientID string `mapstructure:"client_id"`
+
+	// ClientSecret is the secret inline in the config file. Supplying it this way
+	// is supported, but it makes broker.yaml a secret-bearing file: ResolveSecrets
+	// then requires that file to have no group or other permission bits, and the
+	// broker refuses to start otherwise.
+	//
+	// After LoadConfig this field holds the secret whatever its source was, so
+	// everything downstream reads one field.
 	ClientSecret string `mapstructure:"client_secret"`
+
+	// ClientSecretFile keeps the secret out of the config: an absolute path to a
+	// file containing it, or a bare systemd credential name resolved under
+	// $CREDENTIALS_DIRECTORY. Mutually exclusive with ClientSecret. See
+	// ResolveSecrets for the precedence and the permission rules.
+	ClientSecretFile string `mapstructure:"client_secret_file"`
+
+	// clientSecretSource records which of the three sources supplied the secret,
+	// for the startup log. Unexported so that no config key can set it.
+	clientSecretSource SecretSource
 
 	// GitHub-specific access controls
 	GitHub GitHubConfig `mapstructure:"github"`
@@ -182,12 +200,14 @@ type AuditOutput struct {
 	Severity string            `mapstructure:"severity"`
 }
 
-// LoadConfig loads configuration from a YAML file.
+// LoadConfig loads configuration from a YAML file and resolves each provider's
+// client secret.
 //
 // The file is required. Environment variables (OAUTH2_PAM_*) can override
 // scalar values that have defaults, but they cannot stand in for the file: the
 // providers list is a slice, which AutomaticEnv cannot populate, and Validate
-// requires at least one provider.
+// requires at least one provider. Client secrets are the exception and have
+// their own per-provider variable — see ResolveSecrets.
 func LoadConfig(configPath string) (*Config, error) {
 	v := viper.New()
 
@@ -212,6 +232,13 @@ func LoadConfig(configPath string) (*Config, error) {
 	var config Config
 	if err := v.Unmarshal(&config); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
+	}
+
+	// Before Validate, so that a secret which is present but unreadable — or
+	// readable by every user on the host — is reported as what it is rather than
+	// as "client_secret is required".
+	if err := config.ResolveSecrets(configPath); err != nil {
+		return nil, err
 	}
 
 	return &config, nil
@@ -251,10 +278,19 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("at least one provider must be configured")
 	}
 
+	seenNames := make(map[string]int, len(c.Providers))
 	for i, p := range c.Providers {
 		if p.Name == "" {
 			return fmt.Errorf("providers[%d].name is required", i)
 		}
+		// Names identify a provider in the audit log and in the environment
+		// variable that can carry its secret, so two providers sharing one are
+		// ambiguous in both places.
+		if first, dup := seenNames[p.Name]; dup {
+			return fmt.Errorf("providers[%d].name %q is already used by providers[%d]", i, p.Name, first)
+		}
+		seenNames[p.Name] = i
+
 		if p.Type == "" {
 			return fmt.Errorf("providers[%d].type is required", i)
 		}
@@ -265,7 +301,8 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("providers[%d].client_id is required", i)
 		}
 		if p.ClientSecret == "" {
-			return fmt.Errorf("providers[%d].client_secret is required", i)
+			return fmt.Errorf("providers[%d]: a client secret is required — set client_secret_file, "+
+				"$%s, or client_secret in the config file", i, ClientSecretEnvVar(p.Name))
 		}
 		// The client secret and the access token both travel to this host.
 		if p.GitHub.BaseURL != "" && !strings.HasPrefix(p.GitHub.BaseURL, "https://") {

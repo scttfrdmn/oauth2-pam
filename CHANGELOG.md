@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The client secret can be kept out of the config file.** Each provider's
+  secret now comes from one of three sources, highest precedence first:
+  `$OAUTH2_PAM_CLIENT_SECRET_<PROVIDER>`, the new `client_secret_file` (an
+  absolute path, or a bare [systemd credential](https://systemd.io/CREDENTIALS/)
+  name resolved under `$CREDENTIALS_DIRECTORY`, which is the recommended form and
+  is what `LoadCredential=` in the shipped unit sets up), or `client_secret`
+  inline as before. Setting both `client_secret` and `client_secret_file` is a
+  startup error rather than a precedence puzzle, and an environment variable that
+  is set but empty is an error too — a container that meant to pass a secret and
+  passed nothing should fail loudly rather than fall back to whatever the image's
+  config contains. The broker logs which source each provider's secret came from,
+  never the secret. The container harness now feeds the broker through
+  `client_secret_file`, so the file path is covered end to end.
+  ([#14](https://github.com/scttfrdmn/oauth2-pam/issues/14))
+
 - **Security scanning in CI** (`.github/workflows/security.yml`): CodeQL with
   `security-extended`, gosec with SARIF upload, govulncheck, dependency review on
   pull requests, and OpenSSF Scorecard, plus a weekly schedule. CodeQL installs
@@ -57,6 +72,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A file holding a client secret must not be readable by other users, and the
+  broker refuses to start otherwise.** This applies to `client_secret_file` and,
+  when the secret is inline, to `broker.yaml` itself: no group or other permission
+  bits, owned by root or by the broker's own uid. The error names the file and the
+  `chmod 600` / `chown root` that fixes it. **This is a breaking change for anyone
+  running with a world-readable config that carries an inline `client_secret`** —
+  which was the documented setup before this release, so it is a likely upgrade
+  step. `scripts/install-release.sh` and `make install-dev` install the config
+  `0600` root-owned (and no longer overwrite one that already exists);
+  the reasoning is that a secret in a world-readable file is a secret every local
+  user on the host already has, and a 0600 file owned by *another* user is a secret
+  that user can replace — which would let them choose the OAuth app the broker
+  authenticates against. ([#14](https://github.com/scttfrdmn/oauth2-pam/issues/14))
+- Two providers may no longer share a `name`. The name identifies a provider in
+  the audit log and in the environment variable that can carry its secret, so a
+  duplicate is ambiguous in both places.
+  ([#14](https://github.com/scttfrdmn/oauth2-pam/issues/14))
 - GitHub Actions are pinned to full commit SHAs rather than floating tags.
   ([#20](https://github.com/scttfrdmn/oauth2-pam/issues/20))
 - Audit events that record an access decision — `authentication_success`,

@@ -65,7 +65,7 @@ func TestValidate(t *testing.T) {
 		{"provider without type", func(c *Config) { c.Providers[0].Type = "" }, "type is required"},
 		{"unsupported provider type", func(c *Config) { c.Providers[0].Type = "gitlab" }, "not supported"},
 		{"provider without client id", func(c *Config) { c.Providers[0].ClientID = "" }, "client_id is required"},
-		{"provider without client secret", func(c *Config) { c.Providers[0].ClientSecret = "" }, "client_secret is required"},
+		{"provider without client secret", func(c *Config) { c.Providers[0].ClientSecret = "" }, "a client secret is required"},
 
 		// The client secret and the access token both travel to base_url.
 		{"plaintext enterprise base url", func(c *Config) { c.Providers[0].GitHub.BaseURL = "http://github.acme.internal" }, "must use HTTPS"},
@@ -321,9 +321,20 @@ func TestEnvironmentOverridesScalars(t *testing.T) {
 // rejects, so the documented starting point was one the broker refused to
 // start from.
 func TestShippedExampleConfigIsValid(t *testing.T) {
-	path := filepath.Join("..", "..", "configs", "example.yaml")
-	if _, err := os.Stat(path); err != nil {
+	src := filepath.Join("..", "..", "configs", "example.yaml")
+	example, err := os.ReadFile(src)
+	if err != nil {
 		t.Fatalf("the example config is missing: %v", err)
+	}
+
+	// Loaded from a 0600 copy, because the example carries a placeholder
+	// client_secret inline and ResolveSecrets refuses to read one out of a file
+	// other users can read — which every file in a git checkout is. That is not a
+	// wrinkle of the test: it is what `install -m 0600` in scripts/install-release.sh
+	// exists for, and this copy is the same step an operator takes.
+	path := filepath.Join(t.TempDir(), "broker.yaml")
+	if err := os.WriteFile(path, example, 0600); err != nil {
+		t.Fatal(err)
 	}
 
 	cfg, err := LoadConfig(path)

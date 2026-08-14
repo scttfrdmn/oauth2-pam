@@ -23,6 +23,20 @@ RuntimeDirectoryMode=0750
 LogsDirectory=oauth2-pam
 LogsDirectoryMode=0750
 
+# Keep the client secret out of broker.yaml. systemd reads the file as root
+# before the hardening below applies, then stages it mode 0400 in a tmpfs at
+# $CREDENTIALS_DIRECTORY under the name on the left, visible to this unit only.
+# The config then refers to it by that bare name:
+#
+#   providers:
+#     - name: github
+#       client_secret_file: github-client-secret
+#
+# Uncomment once /etc/oauth2-pam/github.secret exists (chmod 600, owned by
+# root). Without it, put the secret inline in broker.yaml — which then has to
+# be 0600 root-owned itself, or the broker refuses to start.
+# LoadCredential=github-client-secret:/etc/oauth2-pam/github.secret
+
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict

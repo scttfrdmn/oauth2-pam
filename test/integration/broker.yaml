@@ -14,7 +14,11 @@ providers:
   - name: fakegithub
     type: github
     client_id: Iv1.fakeclientid00
-    client_secret: fakeclientsecret0000000000000000
+    # Out of the config, the way the docs recommend — and so the harness covers
+    # the file path rather than just the inline one. Dockerfile.broker writes the
+    # file 0600 root-owned; a config carrying the secret inline would itself have
+    # to be 0600, which a file COPYed from the repo is not.
+    client_secret_file: /etc/oauth2-pam/fakegithub.secret
     github:
       # HTTPS is mandatory; the certificate is in the image's trust store.
       base_url: https://fakegithub:8443
