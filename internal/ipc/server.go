@@ -50,6 +50,11 @@ type Request struct {
 	DeviceID   string            `json:"device_id"`
 	SessionID  string            `json:"session_id"`
 	Metadata   map[string]string `json:"metadata"`
+
+	// Provider selects which configured provider to authenticate against, by
+	// its providers[].name. Optional: empty means the first configured provider.
+	// An older PAM module that never sends it therefore keeps working.
+	Provider string `json:"provider"`
 }
 
 // Response is a message from the broker to the PAM module.
@@ -271,6 +276,14 @@ func validateRequest(req *Request) error {
 	if len(req.SessionID) > 128 {
 		return fmt.Errorf("session_id too long (%d bytes)", len(req.SessionID))
 	}
+	// A provider name is only ever compared against the configured ones, but it
+	// reaches the log and the error message, so bound it like the rest.
+	if len(req.Provider) > 256 {
+		return fmt.Errorf("provider too long (%d bytes)", len(req.Provider))
+	}
+	if strings.ContainsRune(req.Provider, '\x00') {
+		return fmt.Errorf("provider contains NUL byte")
+	}
 	if len(req.SourceIP) > 45 {
 		return fmt.Errorf("source_ip too long (%d bytes)", len(req.SourceIP))
 	}
@@ -324,6 +337,7 @@ func (s *Server) handleAuthenticate(req *Request) *Response {
 		// its own session IDs with crypto/rand to prevent session fixation.
 		Timestamp: time.Now(),
 		Metadata:  req.Metadata,
+		Provider:  req.Provider,
 	}
 
 	ar, err := s.broker.Authenticate(authReq)

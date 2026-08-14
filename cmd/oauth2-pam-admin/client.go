@@ -12,7 +12,7 @@ import (
 	"github.com/scttfrdmn/oauth2-pam/pkg/auth"
 	"github.com/scttfrdmn/oauth2-pam/pkg/config"
 	"github.com/scttfrdmn/oauth2-pam/pkg/mapper"
-	"github.com/scttfrdmn/oauth2-pam/pkg/provider/github"
+	"github.com/scttfrdmn/oauth2-pam/pkg/provider"
 )
 
 // ipcClient is a thin client for the broker IPC socket.
@@ -144,12 +144,15 @@ func runTestMapping(cfgPath, login, org, team string) error {
 		teams = append(teams, team)
 	}
 
-	id := &github.Identity{
+	// A synthetic identity, so the type is "github" only in the sense that the
+	// org/team claims are the ones a GitHub provider asserts.
+	id := &provider.Identity{
 		Provider: "github",
+		Type:     "github",
 		Login:    login,
-		Orgs:     orgs,
-		Teams:    teams,
 	}
+	id.AddClaim(provider.ClaimOrg, orgs...)
+	id.AddClaim(provider.ClaimTeam, teams...)
 
 	chain := mapper.New(cfg.Mapper)
 	result, err := chain.Map(context.Background(), id, "") // "" = skip Tier 0 enrollment in dry-run
@@ -161,7 +164,7 @@ func runTestMapping(cfgPath, login, org, team string) error {
 	}
 
 	log.Info().
-		Str("github_login", login).
+		Str("login", login).
 		Str("local_user", result.LocalUser).
 		Strs("groups", result.Groups).
 		Msg("Mapping result")

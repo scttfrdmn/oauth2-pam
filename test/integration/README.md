@@ -44,6 +44,8 @@ difference, so it is not worth paying for by default.
 | `denied_by_github` | a denial fails promptly rather than waiting out the deadline |
 | `mapped_user_mismatch` | GitHub says alice, the request is for bob: refused |
 | `mapped_user_match` | bob logs in when the mapping yields bob, so the case above fails for the right reason |
+| `named_provider` | `provider=fakegithub` on the `pam.d` line reaches the broker and is accepted, behaving exactly like omitting it |
+| `unknown_provider_refused` | `provider=nope` is refused immediately, with no prompt and no device flow started, rather than falling back to the default |
 | `broker_down` | an unreachable broker fails closed, immediately, and sshd survives |
 
 ## How a login is driven without a human
@@ -91,3 +93,6 @@ never started", which is why `never_authorized` checks it.
   time.
 - `timeout=20 poll_interval=1` in `/etc/pam.d/sshd` keeps `never_authorized`
   down to about twenty seconds; production defaults are 300 and 5.
+- The two `provider=` cases rewrite the `oauth2_pam.so` line in
+  `/etc/pam.d/sshd` and restore it before asserting. `sshd` re-reads that file
+  for every session, so nothing needs restarting.

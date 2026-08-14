@@ -13,7 +13,14 @@ server:
 # ---------------------------------------------------------------------------
 # OAuth2 Providers
 # ---------------------------------------------------------------------------
-# Only GitHub is supported today. Additional providers can be added in future.
+# type selects the implementation; "github" (which also covers GitHub Enterprise
+# Server, via github.base_url) is the only one shipped today. An unsupported type
+# is rejected at startup with the list of supported ones.
+#
+# name is yours, and is what the audit log records, what the client secret's
+# environment variable is derived from, and what a PAM request may name to pick
+# this provider. Configure several by listing several entries; the first is the
+# default for a request that does not name one.
 
 providers:
   - name: github
@@ -90,9 +97,14 @@ mapper:
 
   # --- Tier 0: enrollment file (optional) ---
   # Users self-enroll once with: sudo oauth2-pam-enroll --user <local-user>
-  # The enrollment file maps local Unix usernames to their GitHub logins.
+  # The enrollment file maps local Unix usernames to their provider logins.
   # On auth, the broker checks whether the PAM-supplied username matches an
-  # enrolled GitHub identity before falling through to the other tiers.
+  # enrolled identity before falling through to the other tiers.
+  #
+  # Each record carries the provider it was enrolled against, so on a host with
+  # two providers an account named "alice" at the other one cannot claim the
+  # enrollment. Records written before v0.3.0 name no provider and match any;
+  # re-enroll (--remove, then enroll) to scope them.
   #
   enrollment_enabled: false
   enrollment_file: /etc/oauth2-pam/enrolled-users.yaml
@@ -102,6 +114,26 @@ mapper:
   # the first matching rule wins. local_user supports the {{ .Login }},
   # {{ .Email }}, and {{ .Name }} templates, and must expand to a valid POSIX
   # username — which has to be the same name the user is logging in as.
+  #
+  # Match keys:
+  #
+  #   github_login / github_org / github_team
+  #       The GitHub spelling. Still supported, unchanged.
+  #
+  #   login
+  #       The identity's username at the provider, whatever it calls it.
+  #       Same thing as github_login; takes precedence if both are set.
+  #
+  #   claims: {<name>: <value>}
+  #       Matches the provider's membership assertions by name. GitHub asserts
+  #       "org" and "team" (so `claims: {org: my-org}` is exactly
+  #       `github_org: my-org`); a provider asserting flat groups asserts
+  #       "group". Every named claim must match, along with the other keys.
+  #
+  #       - match:
+  #           claims:
+  #             group: platform-team
+  #         local_user: platformuser
 
   rules:
     # Org admins get sudo

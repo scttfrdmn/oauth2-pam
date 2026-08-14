@@ -24,6 +24,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `client_secret_file`, so the file path is covered end to end.
   ([#14](https://github.com/scttfrdmn/oauth2-pam/issues/14))
 
+- **A provider interface, and a provider-neutral identity.** `pkg/provider`
+  defines what the broker needs from an OAuth2 provider (`Provider`) and the
+  types that flow out of one (`Identity`, `Token`, `DeviceFlow`, the RFC 8628
+  sentinel errors). The broker, the mapper, the session, and the audit trail now
+  work only in those terms; `pkg/provider/github` is one implementation behind
+  the interface, and `pkg/provider/registry` maps `providers[].type` to it, so a
+  new provider means an implementation plus one line in the registry. A second,
+  non-GitHub implementation in `pkg/auth`'s tests drives a full login end to end,
+  which is what makes the abstraction more than a rename.
+
+  Memberships are carried as named multi-valued **claims** rather than
+  provider-specific fields, so a mapper rule can match a provider the mapper has
+  never heard of. GitHub asserts `org` and `team`; an OIDC provider would assert
+  `group`. Mapper rules gained `login` and `claims:` as the neutral spelling of
+  `github_login` / `github_org` / `github_team`, all of which keep working
+  unchanged, and the Tier 2/3 payload gained `type`, `subject`, and `claims`
+  alongside the existing `orgs` and `teams`.
+  ([#13](https://github.com/scttfrdmn/oauth2-pam/issues/13))
+
+- **Per-request provider selection.** With several providers configured, an
+  `authenticate` request may name one (`provider` in the IPC request, `provider=`
+  on the `pam.d` line, `--provider` for `oauth2-pam-enroll`). Omitting it selects
+  the first configured provider, so an older PAM module that never sends the field
+  keeps working. A name that is not configured is refused with `NO_PROVIDER`
+  rather than falling back to the default: a client that asked for one identity
+  source and silently got another would be authenticated against something nobody
+  chose. ([#13](https://github.com/scttfrdmn/oauth2-pam/issues/13))
+
 - **Security scanning in CI** (`.github/workflows/security.yml`): CodeQL with
   `security-extended`, gosec with SARIF upload, govulncheck, dependency review on
   pull requests, and OpenSSF Scorecard, plus a weekly schedule. CodeQL installs
@@ -72,6 +100,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Enrollment records name the provider they were created against**, and the
+  login is now spelled `login` rather than `github_login`. On a host with two
+  providers, an account with the same login at the one a user did *not* enroll
+  with can no longer claim their enrollment. Existing files keep working: the
+  legacy `github_login` key is accepted on read and migrated on the next write,
+  and a record with no `provider` matches any provider — which is what such a
+  record has always meant and what a single-provider host wants. Re-enroll
+  (`--remove`, then enroll) to scope those records. A file setting both `login`
+  and `github_login` to different values is refused rather than guessed at.
+  ([#13](https://github.com/scttfrdmn/oauth2-pam/issues/13))
+- The `provider_login` key replaces `github_login` in session metadata and in the
+  audit event for a successful login, and the success event now also records the
+  provider's stable `provider_subject` (GitHub's numeric user ID) alongside the
+  full `claims` map — a login can be renamed, a subject cannot, so an audit trail
+  keyed on the login can be made to point at the wrong account.
+  ([#13](https://github.com/scttfrdmn/oauth2-pam/issues/13))
+- The poll loop now recognizes the RFC 8628 sentinel errors with `errors.Is`
+  rather than equality, so a provider implementation may wrap them with context.
+  Previously a wrapped `authorization_pending` would have failed a login that was
+  merely still waiting for the user.
+  ([#13](https://github.com/scttfrdmn/oauth2-pam/issues/13))
 - **A file holding a client secret must not be readable by other users, and the
   broker refuses to start otherwise.** This applies to `client_secret_file` and,
   when the secret is inline, to `broker.yaml` itself: no group or other permission

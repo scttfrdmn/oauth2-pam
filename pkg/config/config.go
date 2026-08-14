@@ -24,6 +24,15 @@ var KnownAuditEvents = []string{
 	"session_revoked",
 }
 
+// SupportedProviderTypes lists the values providers[].type may take. Validate
+// checks against it, so an unsupported type is a startup error naming the ones
+// that exist rather than a failure halfway through building the broker.
+//
+// pkg/provider/registry holds the constructor for each of these, and a test
+// there pins the two lists together — a provider that is registered but not
+// listed here would be rejected by Validate before it could ever be built.
+var SupportedProviderTypes = []string{"github"}
+
 // Config represents the complete configuration for the oauth2-pam broker
 type Config struct {
 	Server         ServerConfig         `mapstructure:"server"`
@@ -149,16 +158,33 @@ type MappingRule struct {
 	Groups []string `mapstructure:"groups"`
 }
 
-// MatchCriteria specifies what must match for a rule to apply
+// MatchCriteria specifies what must match for a rule to apply. Every non-empty
+// field must match (AND), and matching is case-insensitive throughout.
+//
+// The github_* keys are the GitHub spelling of provider-neutral concepts and
+// keep working unchanged: github_login is the identity's login, and github_org /
+// github_team are its "org" and "team" claims. login and claims are the neutral
+// forms, for a provider whose vocabulary is something else — an OIDC issuer
+// asserting flat groups is matched with `claims: {group: platform-team}`.
 type MatchCriteria struct {
-	// GitHubLogin matches a specific GitHub username
+	// GitHubLogin matches a specific GitHub username. Equivalent to Login.
 	GitHubLogin string `mapstructure:"github_login"`
 
-	// GitHubOrg requires membership in this GitHub org
+	// GitHubOrg requires membership in this GitHub org (the "org" claim).
 	GitHubOrg string `mapstructure:"github_org"`
 
-	// GitHubTeam requires membership in this team (format: "org/team-slug")
+	// GitHubTeam requires membership in this team, "org/team-slug" (the "team"
+	// claim).
 	GitHubTeam string `mapstructure:"github_team"`
+
+	// Login matches the identity's username at the provider, whatever the
+	// provider calls it. Takes precedence over GitHubLogin if both are set.
+	Login string `mapstructure:"login"`
+
+	// Claims requires each named claim to carry the given value. The well-known
+	// names are "org", "team", "group", and "role"; a provider may assert others
+	// and a rule may match them by name without any change here.
+	Claims map[string]string `mapstructure:"claims"`
 }
 
 // AuthenticationConfig contains authentication session policies
@@ -294,8 +320,9 @@ func (c *Config) Validate() error {
 		if p.Type == "" {
 			return fmt.Errorf("providers[%d].type is required", i)
 		}
-		if p.Type != "github" {
-			return fmt.Errorf("providers[%d].type %q is not supported (only \"github\")", i, p.Type)
+		if !isSupportedProviderType(p.Type) {
+			return fmt.Errorf("providers[%d].type %q is not supported (supported: %s)",
+				i, p.Type, strings.Join(SupportedProviderTypes, ", "))
 		}
 		if p.ClientID == "" {
 			return fmt.Errorf("providers[%d].client_id is required", i)
@@ -366,6 +393,15 @@ func (c *Config) Validate() error {
 	}
 
 	return nil
+}
+
+func isSupportedProviderType(t string) bool {
+	for _, s := range SupportedProviderTypes {
+		if s == t {
+			return true
+		}
+	}
+	return false
 }
 
 func isKnownAuditEvent(name string) bool {

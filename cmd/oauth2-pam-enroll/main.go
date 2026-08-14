@@ -1,4 +1,4 @@
-// Command oauth2-pam-enroll links a local Unix user to a GitHub identity by
+// Command oauth2-pam-enroll links a local Unix user to a provider identity by
 // running a Device Authorization Grant flow and writing the result to the
 // enrollment file.
 //
@@ -25,7 +25,8 @@ import (
 
 	"github.com/scttfrdmn/oauth2-pam/pkg/config"
 	"github.com/scttfrdmn/oauth2-pam/pkg/enrollment"
-	"github.com/scttfrdmn/oauth2-pam/pkg/provider/github"
+	"github.com/scttfrdmn/oauth2-pam/pkg/provider"
+	"github.com/scttfrdmn/oauth2-pam/pkg/provider/registry"
 )
 
 var (
@@ -43,18 +44,19 @@ func main() {
 
 func buildRootCmd() *cobra.Command {
 	var (
-		cfgPath    string
-		localUser  string
-		groups     []string
-		removeMode bool
-		verbose    bool
+		cfgPath      string
+		localUser    string
+		providerName string
+		groups       []string
+		removeMode   bool
+		verbose      bool
 	)
 
 	cmd := &cobra.Command{
 		Use:   "oauth2-pam-enroll",
-		Short: "Enroll a local Unix user with a GitHub identity for oauth2-pam authentication",
-		Long: `oauth2-pam-enroll links a local Unix username to a GitHub account so that
-the user can authenticate via the GitHub Device Flow in future PAM sessions.
+		Short: "Enroll a local Unix user with a provider identity for oauth2-pam authentication",
+		Long: `oauth2-pam-enroll links a local Unix username to a provider account so that
+the user can authenticate via the OAuth2 Device Flow in future PAM sessions.
 
 Run as root (or via sudo) since the enrollment file lives in /etc/oauth2-pam/.
 
@@ -67,6 +69,9 @@ Examples:
 
   # Enroll with supplementary group overrides
   sudo oauth2-pam-enroll --user alice --groups users,docker
+
+  # Enroll against a specific configured provider
+  sudo oauth2-pam-enroll --user alice --provider github-enterprise
 
   # Remove an enrollment
   sudo oauth2-pam-enroll --user alice --remove`,
@@ -100,12 +105,13 @@ Examples:
 			if removeMode {
 				return runRemove(localUser, enrollFile)
 			}
-			return runEnroll(localUser, groups, enrollFile, cfg)
+			return runEnroll(localUser, providerName, groups, enrollFile, cfg)
 		},
 	}
 
 	cmd.Flags().StringVarP(&cfgPath, "config", "c", "/etc/oauth2-pam/broker.yaml", "Broker config file")
 	cmd.Flags().StringVarP(&localUser, "user", "u", "", "Local Unix username to enroll (default: caller)")
+	cmd.Flags().StringVar(&providerName, "provider", "", "Configured provider name to enroll against (default: the first one)")
 	cmd.Flags().StringSliceVar(&groups, "groups", nil, "Supplementary Unix groups (overrides mapper defaults)")
 	cmd.Flags().BoolVar(&removeMode, "remove", false, "Remove an existing enrollment")
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Enable verbose/debug output")
@@ -154,9 +160,9 @@ func runRemove(localUser, enrollFile string) error {
 	return nil
 }
 
-// runEnroll runs the Device Flow, confirms the GitHub identity, and writes
+// runEnroll runs the Device Flow, confirms the provider identity, and writes
 // the enrollment record.
-func runEnroll(localUser string, groups []string, enrollFile string, cfg *config.Config) error {
+func runEnroll(localUser, providerName string, groups []string, enrollFile string, cfg *config.Config) error {
 	// Verify the local Unix user exists before starting the device flow.
 	if _, err := user.Lookup(localUser); err != nil {
 		return fmt.Errorf("local user %q not found: %w", localUser, err)
@@ -169,11 +175,12 @@ func runEnroll(localUser string, groups []string, enrollFile string, cfg *config
 		}
 	}
 
-	if len(cfg.Providers) == 0 {
-		return fmt.Errorf("no providers configured in %s", "config")
+	pc, err := selectProviderConfig(cfg, providerName)
+	if err != nil {
+		return err
 	}
 
-	provider, err := github.New(cfg.Providers[0])
+	prov, err := registry.New(pc)
 	if err != nil {
 		return fmt.Errorf("create provider: %w", err)
 	}
@@ -182,24 +189,24 @@ func runEnroll(localUser string, groups []string, enrollFile string, cfg *config
 	defer cancel()
 
 	// Start the Device Flow
-	flow, err := provider.StartDeviceFlow(ctx)
+	flow, err := prov.StartDeviceFlow(ctx)
 	if err != nil {
 		return fmt.Errorf("start device flow: %w", err)
 	}
 
-	fmt.Printf("\nTo enroll %q, authorize this application on GitHub:\n\n", localUser)
+	fmt.Printf("\nTo enroll %q, authorize this application at %s:\n\n", localUser, prov.Name())
 	fmt.Printf("  Visit:      %s\n", flow.DeviceURL)
 	fmt.Printf("  User Code:  %s\n\n", flow.UserCode)
 	fmt.Printf("Waiting for authorization (expires in %s)...\n", time.Until(flow.ExpiresAt).Round(time.Second))
 
-	token, err := pollUntilAuthorized(ctx, provider, flow)
+	token, err := pollUntilAuthorized(ctx, prov, flow)
 	if err != nil {
 		return err
 	}
 
-	identity, err := provider.GetIdentity(ctx, token)
+	identity, err := prov.GetIdentity(ctx, token)
 	if err != nil {
-		return fmt.Errorf("get GitHub identity: %w", err)
+		return fmt.Errorf("get provider identity: %w", err)
 	}
 
 	// Write enrollment record
@@ -214,11 +221,15 @@ func runEnroll(localUser string, groups []string, enrollFile string, cfg *config
 	}
 
 	rec := enrollment.Record{
-		LocalUser:   localUser,
-		GitHubLogin: identity.Login,
-		EnrolledAt:  time.Now().UTC(),
-		EnrolledBy:  enrolledBy,
-		Groups:      groups,
+		LocalUser: localUser,
+		Login:     identity.Login,
+		// Recorded even on a single-provider host: if a second provider is added
+		// later, an enrollment that names its provider cannot be claimed by a
+		// same-named account at the new one.
+		Provider:   prov.Name(),
+		EnrolledAt: time.Now().UTC(),
+		EnrolledBy: enrolledBy,
+		Groups:     groups,
 	}
 
 	if err := store.Add(rec); err != nil {
@@ -231,20 +242,42 @@ func runEnroll(localUser string, groups []string, enrollFile string, cfg *config
 
 	log.Info().
 		Str("local_user", localUser).
-		Str("github_login", identity.Login).
+		Str("provider", prov.Name()).
+		Str("login", identity.Login).
 		Str("enrollment_file", enrollFile).
 		Msg("Enrollment successful")
 
-	fmt.Printf("\nEnrolled %q → GitHub user %q\n", localUser, identity.Login)
+	fmt.Printf("\nEnrolled %q → %s user %q\n", localUser, prov.Name(), identity.Login)
 	if len(groups) > 0 {
 		fmt.Printf("Groups: %s\n", strings.Join(groups, ", "))
 	}
 	return nil
 }
 
-// pollUntilAuthorized polls the GitHub token endpoint until the user
+// selectProviderConfig picks the providers[] entry to enroll against: the named
+// one, or the first configured. A name that is not configured is an error naming
+// the ones that are, rather than a silent enrollment against the wrong provider.
+func selectProviderConfig(cfg *config.Config, name string) (config.ProviderConfig, error) {
+	if len(cfg.Providers) == 0 {
+		return config.ProviderConfig{}, fmt.Errorf("no providers are configured")
+	}
+	if name == "" {
+		return cfg.Providers[0], nil
+	}
+	names := make([]string, 0, len(cfg.Providers))
+	for _, pc := range cfg.Providers {
+		if strings.EqualFold(pc.Name, name) {
+			return pc, nil
+		}
+		names = append(names, pc.Name)
+	}
+	return config.ProviderConfig{}, fmt.Errorf("no provider named %q is configured (configured: %s)",
+		name, strings.Join(names, ", "))
+}
+
+// pollUntilAuthorized polls the provider's token endpoint until the user
 // completes authorization or the device code expires.
-func pollUntilAuthorized(ctx context.Context, p *github.Provider, flow *github.DeviceFlow) (*github.Token, error) {
+func pollUntilAuthorized(ctx context.Context, p provider.Provider, flow *provider.DeviceFlow) (*provider.Token, error) {
 	interval := time.Duration(flow.PollingInterval) * time.Second
 	if interval <= 0 {
 		interval = 5 * time.Second
@@ -270,15 +303,15 @@ func pollUntilAuthorized(ctx context.Context, p *github.Provider, flow *github.D
 			}
 
 			switch {
-			case errors.Is(err, github.ErrAuthorizationPending):
+			case errors.Is(err, provider.ErrAuthorizationPending):
 				// still waiting — keep polling
-			case errors.Is(err, github.ErrSlowDown):
+			case errors.Is(err, provider.ErrSlowDown):
 				interval += 5 * time.Second
 				ticker.Reset(interval)
-			case errors.Is(err, github.ErrExpiredToken):
+			case errors.Is(err, provider.ErrExpiredToken):
 				return nil, fmt.Errorf("device code expired; please run the command again")
-			case errors.Is(err, github.ErrAccessDenied):
-				return nil, fmt.Errorf("authorization denied on GitHub")
+			case errors.Is(err, provider.ErrAccessDenied):
+				return nil, fmt.Errorf("authorization was denied at the provider")
 			default:
 				return nil, fmt.Errorf("poll authorization: %w", err)
 			}

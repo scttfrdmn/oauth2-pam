@@ -144,8 +144,13 @@ func TestSecretFromSystemdCredential(t *testing.T) {
 }
 
 func TestRelativeSecretFileWithoutCredentialsDirectory(t *testing.T) {
+	// Setenv first, so the variable is restored after the test whatever it was;
+	// then unset it, because "set but empty" and "absent" are different states
+	// and this test is about the absent one.
 	t.Setenv("CREDENTIALS_DIRECTORY", "")
-	os.Unsetenv("CREDENTIALS_DIRECTORY")
+	if err := os.Unsetenv("CREDENTIALS_DIRECTORY"); err != nil {
+		t.Fatal(err)
+	}
 
 	err := providerWith("", "github-client-secret").ResolveSecrets("")
 	if err == nil {

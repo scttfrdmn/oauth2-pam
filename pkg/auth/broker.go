@@ -14,7 +14,8 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/scttfrdmn/oauth2-pam/pkg/config"
 	"github.com/scttfrdmn/oauth2-pam/pkg/mapper"
-	"github.com/scttfrdmn/oauth2-pam/pkg/provider/github"
+	"github.com/scttfrdmn/oauth2-pam/pkg/provider"
+	"github.com/scttfrdmn/oauth2-pam/pkg/provider/registry"
 	"github.com/scttfrdmn/oauth2-pam/pkg/security"
 )
 
@@ -70,8 +71,11 @@ const maxPendingFlowsPerUser = 3
 
 // Broker manages authentication requests, device flows, and sessions.
 type Broker struct {
-	config       *config.Config
-	providers    []*github.Provider
+	config *config.Config
+	// providers in configuration order; providers[0] is the default for a request
+	// that does not name one. byName indexes the same values.
+	providers []provider.Provider
+	byName    map[string]provider.Provider
 	mapper       *mapper.Chain
 	tokenManager *TokenManager
 	auditLogger  *security.AuditLogger
@@ -90,7 +94,9 @@ type Session struct {
 	TokenID            string // key into TokenManager for the stored access token
 	LocalUser          string
 	RequestedLocalUser string // UserID from the PAM auth request; used by Tier 0 enrollment
-	GitHubLogin        string
+	// ProviderLogin is the identity's username at the provider, whatever that
+	// provider calls it.
+	ProviderLogin string
 	Email              string
 	Groups             []string
 	Provider           string
@@ -119,6 +125,12 @@ type AuthRequest struct {
 	SessionID  string
 	Timestamp  time.Time
 	Metadata   map[string]string
+
+	// Provider names which configured provider to authenticate against. Empty
+	// means the first one configured, which is the whole story on a
+	// single-provider host; a name that is not configured is an error rather
+	// than a silent fall back to the default.
+	Provider string
 }
 
 // AuthResponse is the broker's response to an auth request.
@@ -153,24 +165,23 @@ func NewBroker(cfg *config.Config) (*Broker, error) {
 		return nil, fmt.Errorf("at least one provider must be configured")
 	}
 
-	// Build provider instances
-	providers := make([]*github.Provider, 0, len(cfg.Providers))
-	for _, pc := range cfg.Providers {
-		p, err := github.New(pc)
-		if err != nil {
-			return nil, fmt.Errorf("provider %q: %w", pc.Name, err)
-		}
-		providers = append(providers, p)
+	// The registry maps providers[].type to an implementation, so a new provider
+	// type needs no change here.
+	providers, err := registry.NewAll(cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	return NewBrokerWithProviders(cfg, providers)
 }
 
 // NewBrokerWithProviders creates a Broker from already-constructed providers.
-// It exists so callers can supply providers pointed at a non-default GitHub
-// instance — a GitHub Enterprise Server, or the fake GitHub the end-to-end
-// tests run against.
-func NewBrokerWithProviders(cfg *config.Config, providers []*github.Provider) (*Broker, error) {
+// It exists so callers can supply providers the registry would not build from
+// config alone — pointed at a GitHub Enterprise Server, at the fake GitHub the
+// end-to-end tests run against, or at a test double implementing the interface.
+//
+// The first provider is the default for requests that do not name one.
+func NewBrokerWithProviders(cfg *config.Config, providers []provider.Provider) (*Broker, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("config cannot be nil")
 	}
@@ -191,9 +202,21 @@ func NewBrokerWithProviders(cfg *config.Config, providers []*github.Provider) (*
 		return nil, fmt.Errorf("audit logger: %w", err)
 	}
 
+	byName := make(map[string]provider.Provider, len(providers))
+	for _, p := range providers {
+		if _, dup := byName[p.Name()]; dup {
+			// config.Validate rejects duplicate names, but a caller constructing
+			// providers directly bypasses it, and a silently shadowed provider
+			// would make audit records ambiguous.
+			return nil, fmt.Errorf("two providers are both named %q", p.Name())
+		}
+		byName[p.Name()] = p
+	}
+
 	return &Broker{
 		config:       cfg,
 		providers:    providers,
+		byName:       byName,
 		mapper:       mapper.New(cfg.Mapper),
 		tokenManager: tokenManager,
 		auditLogger:  auditLogger,
@@ -263,11 +286,11 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 		Timestamp:  time.Now(),
 	})
 
-	// Pick the first configured provider (single-provider for now)
-	if len(b.providers) == 0 {
-		return errorResponse("NO_PROVIDER", "No authentication provider configured"), nil
+	prov, err := b.selectProvider(req.Provider)
+	if err != nil {
+		log.Warn().Err(err).Str("provider", req.Provider).Msg("Cannot select a provider")
+		return errorResponse("NO_PROVIDER", err.Error()), nil
 	}
-	provider := b.providers[0]
 
 	// Enforce the per-user limit on *established* sessions. Pending flows are
 	// counted separately below: an abandoned SSH attempt must not consume a
@@ -299,14 +322,14 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 	}
 
 	// Start device flow
-	deviceFlow, err := provider.StartDeviceFlow(b.ctx)
+	deviceFlow, err := prov.StartDeviceFlow(b.ctx)
 	if err != nil {
 		b.auditLogger.LogAuthEvent(security.AuditEvent{
 			EventType:    "device_flow_failed",
 			UserID:       req.UserID,
 			SourceIP:     req.SourceIP,
 			TargetHost:   req.TargetHost,
-			Provider:     provider.Name(),
+			Provider:     prov.Name(),
 			Success:      false,
 			ErrorMessage: err.Error(),
 			Timestamp:    time.Now(),
@@ -333,7 +356,7 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 	session := &Session{
 		ID:                 sessionID,
 		RequestedLocalUser: req.UserID,
-		Provider:           provider.Name(),
+		Provider:           prov.Name(),
 		CreatedAt:          time.Now(),
 		ExpiresAt:          deviceFlow.ExpiresAt,
 		LastAccessed:       time.Now(),
@@ -346,7 +369,7 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 
 	// Poll in the background; update session when the device flow completes.
 	b.wg.Add(1)
-	go b.pollDeviceAuthorization(sessionID, provider, deviceFlow)
+	go b.pollDeviceAuthorization(sessionID, prov, deviceFlow)
 
 	// Success is false: a started device flow is not an authenticated user.
 	return &AuthResponse{
@@ -359,7 +382,7 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 		ExpiresAt:      deviceFlow.ExpiresAt,
 		RequiresDevice: true,
 		Metadata: map[string]string{
-			"provider":         provider.Name(),
+			"provider":         prov.Name(),
 			"polling_interval": fmt.Sprintf("%d", deviceFlow.PollingInterval),
 		},
 	}, nil
@@ -509,7 +532,7 @@ func (b *Broker) RevokeSession(sessionID string) error {
 // pollDeviceAuthorization polls the GitHub token endpoint in the background.
 // It takes sessionID (not a *Session pointer) to avoid data races; all
 // session reads/writes go through getSession/setSession under the mutex.
-func (b *Broker) pollDeviceAuthorization(sessionID string, provider *github.Provider, df *github.DeviceFlow) {
+func (b *Broker) pollDeviceAuthorization(sessionID string, prov provider.Provider, df *provider.DeviceFlow) {
 	defer b.wg.Done()
 
 	interval := time.Duration(df.PollingInterval) * time.Second
@@ -535,23 +558,27 @@ func (b *Broker) pollDeviceAuthorization(sessionID string, provider *github.Prov
 			return
 
 		case <-ticker.C:
-			token, err := provider.PollDeviceAuthorization(b.ctx, df.DeviceCode)
+			token, err := prov.PollDeviceAuthorization(b.ctx, df.DeviceCode)
 			if err != nil {
-				switch err {
-				case github.ErrAuthorizationPending:
+				// errors.Is, not equality: an implementation is entitled to wrap
+				// a sentinel with context ("poll acme-sso: %w"), and treating
+				// that as an unknown error would fail a login that is merely
+				// still pending.
+				switch {
+				case errors.Is(err, provider.ErrAuthorizationPending):
 					continue
-				case github.ErrSlowDown:
+				case errors.Is(err, provider.ErrSlowDown):
 					interval += 5 * time.Second
 					ticker.Reset(interval)
 					continue
-				case github.ErrExpiredToken:
+				case errors.Is(err, provider.ErrExpiredToken):
 					b.failSession(sessionID, StatusExpired, "Device code expired before authorization")
 					return
-				case github.ErrAccessDenied:
+				case errors.Is(err, provider.ErrAccessDenied):
 					b.auditLogger.LogAuthEvent(security.AuditEvent{
 						EventType:    "authentication_denied",
 						SessionID:    sessionID,
-						Provider:     provider.Name(),
+						Provider:     prov.Name(),
 						Success:      false,
 						ErrorMessage: "user denied authorization",
 						Timestamp:    time.Now(),
@@ -566,19 +593,19 @@ func (b *Broker) pollDeviceAuthorization(sessionID string, provider *github.Prov
 			}
 
 			// Token obtained — fetch identity (retry up to 3x for transient errors).
-			var identity *github.Identity
+			var identity *provider.Identity
 			for attempt := 1; attempt <= 3; attempt++ {
-				identity, err = provider.GetIdentity(b.ctx, token)
+				identity, err = prov.GetIdentity(b.ctx, token)
 				if err == nil {
 					break
 				}
 				if !isTransientError(err) || attempt == 3 {
 					log.Error().Err(err).Int("attempt", attempt).
-						Str("session_id", sessionID).Msg("Failed to get GitHub identity")
+						Str("session_id", sessionID).Msg("Failed to resolve provider identity")
 					b.auditLogger.LogAuthEvent(security.AuditEvent{
 						EventType:    "authentication_failed",
 						SessionID:    sessionID,
-						Provider:     provider.Name(),
+						Provider:     prov.Name(),
 						Success:      false,
 						ErrorMessage: err.Error(),
 						Timestamp:    time.Now(),
@@ -611,13 +638,13 @@ func (b *Broker) pollDeviceAuthorization(sessionID string, provider *github.Prov
 					if !isTransientError(err) || attempt == 3 {
 						log.Error().Err(err).Int("attempt", attempt).
 							Str("session_id", sessionID).
-							Str("github_login", identity.Login).
+							Str("provider_login", identity.Login).
 							Msg("Identity mapping failed")
 						b.auditLogger.LogAuthEvent(security.AuditEvent{
 							EventType:    "authentication_failed",
 							UserID:       identity.Login,
 							SessionID:    sessionID,
-							Provider:     provider.Name(),
+							Provider:     prov.Name(),
 							Success:      false,
 							ErrorMessage: err.Error(),
 							Timestamp:    time.Now(),
@@ -646,18 +673,18 @@ func (b *Broker) pollDeviceAuthorization(sessionID string, provider *github.Prov
 						Str("session_id", sessionID).
 						Str("requested_user", current.RequestedLocalUser).
 						Str("mapped_user", mapResult.LocalUser).
-						Str("github_login", identity.Login).
+						Str("provider_login", identity.Login).
 						Msg("Mapped local user does not match requested login; denying")
 					b.auditLogger.LogAuthEvent(security.AuditEvent{
 						EventType:    "authentication_denied",
 						UserID:       current.RequestedLocalUser,
 						SessionID:    sessionID,
-						Provider:     provider.Name(),
+						Provider:     prov.Name(),
 						Success:      false,
 						ErrorMessage: "mapped local user does not match requested login",
 						Timestamp:    time.Now(),
 						Metadata: map[string]interface{}{
-							"github_login":   identity.Login,
+							"provider_login": identity.Login,
 							"requested_user": current.RequestedLocalUser,
 							"mapped_user":    mapResult.LocalUser,
 						},
@@ -695,7 +722,7 @@ func (b *Broker) pollDeviceAuthorization(sessionID string, provider *github.Prov
 
 				// Update the session snapshot and write it back under the mutex.
 				current.LocalUser = mapResult.LocalUser
-				current.GitHubLogin = identity.Login
+				current.ProviderLogin = identity.Login
 				current.Email = identity.Email
 				current.Groups = mapResult.Groups
 				current.TokenFingerprint = token.Fingerprint
@@ -714,20 +741,21 @@ func (b *Broker) pollDeviceAuthorization(sessionID string, provider *github.Prov
 					Email:      identity.Email,
 					Groups:     mapResult.Groups,
 					SessionID:  sessionID,
-					Provider:   provider.Name(),
+					Provider:   prov.Name(),
 					AuthMethod: "github_device_flow",
 					Success:    true,
 					Timestamp:  time.Now(),
 					Metadata: map[string]interface{}{
-						"github_login": identity.Login,
-						"github_orgs":  identity.Orgs,
+						"provider_login":   identity.Login,
+						"provider_subject": identity.Subject,
+						"claims":           identity.Claims,
 					},
 				})
 
 				log.Info().
 					Str("session_id", sessionID).
 					Str("local_user", mapResult.LocalUser).
-					Str("github_login", identity.Login).
+					Str("provider_login", identity.Login).
 					Msg("Authentication successful")
 				return
 			} // end inner block
@@ -739,7 +767,7 @@ func (b *Broker) pollDeviceAuthorization(sessionID string, provider *github.Prov
 // access-control refusal (not in the required org or team) is a denial; an
 // unreachable API is an error.
 func identityFailureStatus(err error) string {
-	if errors.Is(err, github.ErrAccessForbidden) {
+	if errors.Is(err, provider.ErrAccessForbidden) {
 		return StatusDenied
 	}
 	return StatusError
@@ -899,14 +927,30 @@ func (b *Broker) setSession(session *Session) {
 	b.sessions[session.ID] = session
 }
 
-// providerByName returns the first provider whose Name() matches name, or nil.
-func (b *Broker) providerByName(name string) *github.Provider {
-	for _, p := range b.providers {
-		if p.Name() == name {
-			return p
-		}
+// providerByName returns the provider with the given name, or nil.
+func (b *Broker) providerByName(name string) provider.Provider {
+	return b.byName[name]
+}
+
+// selectProvider resolves the provider a request asked for.
+//
+// An empty name means the first configured provider, which is the whole story on
+// a single-provider host and the documented default elsewhere. A name that is not
+// configured is an error rather than a silent fall back to the default: a client
+// that asked for a specific provider and got a different one would be
+// authenticated against an identity source nobody chose.
+func (b *Broker) selectProvider(name string) (provider.Provider, error) {
+	if len(b.providers) == 0 {
+		return nil, fmt.Errorf("no authentication provider is configured")
 	}
-	return nil
+	if name == "" {
+		return b.providers[0], nil
+	}
+	p, ok := b.byName[name]
+	if !ok {
+		return nil, fmt.Errorf("no provider named %q is configured", name)
+	}
+	return p, nil
 }
 
 func (b *Broker) removeSession(sessionID string) {
@@ -935,9 +979,9 @@ func (b *Broker) successResponse(session *Session) *AuthResponse {
 		SessionID: session.ID,
 		ExpiresAt: session.ExpiresAt,
 		Metadata: map[string]string{
-			"provider":      session.Provider,
-			"github_login":  session.GitHubLogin,
-			"last_accessed": session.LastAccessed.Format(time.RFC3339),
+			"provider":       session.Provider,
+			"provider_login": session.ProviderLogin,
+			"last_accessed":  session.LastAccessed.Format(time.RFC3339),
 		},
 	}
 }

@@ -84,7 +84,25 @@ expect_prompted() {
 }
 
 expect_not_prompted() {
-    [ ! -s "$PROMPT_LOG" ] || fail "the module prompted even though it could not reach the broker"
+    [ ! -s "$PROMPT_LOG" ] || fail "the module prompted even though no device flow was started"
+}
+
+# set_module_args rewrites the oauth2_pam.so arguments in the sshd PAM stack, so
+# a case can exercise an argument the shipped stack does not use. sshd re-reads
+# /etc/pam.d/sshd for every session, so no restart is needed. Every case that
+# calls this must call restore_module_args before asserting, so a failure does
+# not leak a modified stack into the next case.
+PAM_SSHD=/etc/pam.d/sshd
+PAM_SSHD_BACKUP=/tmp/pam-sshd.orig
+
+set_module_args() {
+    cp "$PAM_SSHD" "$PAM_SSHD_BACKUP"
+    sed -i "s|^auth  *required  *oauth2_pam.so.*|auth     required   oauth2_pam.so $*|" "$PAM_SSHD"
+    log "pam stack: $(grep '^auth.*oauth2_pam.so' "$PAM_SSHD")"
+}
+
+restore_module_args() {
+    [ -f "$PAM_SSHD_BACKUP" ] && mv "$PAM_SSHD_BACKUP" "$PAM_SSHD"
 }
 
 # ---------------------------------------------------------------- cases
@@ -152,6 +170,40 @@ case_mapped_user_match() {
     curl -fsS "$CONTROL_URL/control/login?login=bob" >/dev/null
     AUTHORIZE_ON_PROMPT=1 attempt_login bob
     expect_login_ok bob
+}
+
+# provider= names which configured provider to authenticate against. The harness
+# broker configures exactly one, "fakegithub", so naming it must behave exactly
+# like omitting it: what this proves is that the name travels from the pam.d line
+# through the IPC request and is accepted, not that it changes the outcome.
+case_named_provider() {
+    control reset
+    set_module_args "socket=/var/run/oauth2-pam/broker.sock provider=fakegithub poll_interval=1 timeout=20 debug"
+    AUTHORIZE_ON_PROMPT=1 attempt_login alice
+    restore_module_args
+    expect_login_ok alice
+    expect_prompted
+}
+
+# A provider the broker does not have must be refused rather than silently
+# replaced by the default — the alternative is authenticating against an identity
+# source nobody chose. It must also be refused before any device flow starts, so
+# there is nothing to prompt for and nothing for the fake GitHub to see.
+case_unknown_provider_refused() {
+    control reset
+    set_module_args "socket=/var/run/oauth2-pam/broker.sock provider=nope poll_interval=1 timeout=20 debug"
+    AUTHORIZE_ON_PROMPT=1 attempt_login alice
+    restore_module_args
+    expect_login_refused
+    expect_not_prompted
+    if [ "$ELAPSED" -ge 18 ]; then
+        fail "took ${ELAPSED}s — an unconfigured provider should be refused immediately"
+    fi
+    local n
+    n=$(polls)
+    if [ "${n:-0}" -ne 0 ]; then
+        fail "the fake GitHub saw ${n} token polls; no device flow should have started"
+    fi
 }
 
 # The broker is stopped by the driver before this runs. The module must fail

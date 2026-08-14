@@ -58,8 +58,9 @@
 // module_options holds the parsed pam.d module arguments.
 struct module_options {
     const char *socket_path;
-    int poll_interval;   // seconds between check_session calls
-    int auth_timeout;    // seconds to wait for the user to authorize
+    const char *provider;  // configured provider name, or NULL for the default
+    int poll_interval;     // seconds between check_session calls
+    int auth_timeout;      // seconds to wait for the user to authorize
     int debug;
 };
 
@@ -85,11 +86,14 @@ int  get_user_info(pam_handle_t *pamh,
                    const char **service,
                    const char **rhost,
                    const char **tty);
+// send_auth_request sends the initial authenticate request. provider may be
+// NULL, which asks the broker for its default (first configured) provider.
 int  send_auth_request(int sock,
                        const char *username,
                        const char *service,
                        const char *rhost,
-                       const char *tty);
+                       const char *tty,
+                       const char *provider);
 int  send_check_session_request(int sock, const char *session_id);
 int  receive_auth_response(int sock, char *response, size_t response_size);
 int  validate_socket_path(const char *path);

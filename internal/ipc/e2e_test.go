@@ -12,6 +12,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/scttfrdmn/oauth2-pam/pkg/auth"
 	"github.com/scttfrdmn/oauth2-pam/pkg/config"
+	"github.com/scttfrdmn/oauth2-pam/pkg/provider"
 	"github.com/scttfrdmn/oauth2-pam/pkg/provider/github"
 )
 
@@ -56,11 +57,11 @@ func newHarness(t *testing.T, opts ...func(*config.Config)) *harness {
 		t.Fatalf("test config is invalid: %v", err)
 	}
 
-	provider, err := github.NewWithEndpoints(cfg.Providers[0], fake.endpoints())
+	prov, err := github.NewWithEndpoints(cfg.Providers[0], fake.endpoints())
 	if err != nil {
 		t.Fatalf("build provider: %v", err)
 	}
-	broker, err := auth.NewBrokerWithProviders(cfg, []*github.Provider{provider})
+	broker, err := auth.NewBrokerWithProviders(cfg, []provider.Provider{prov})
 	if err != nil {
 		t.Fatalf("build broker: %v", err)
 	}
@@ -258,8 +259,8 @@ func TestFullFlowAuthorizes(t *testing.T) {
 	if resp.SessionID != start.SessionID {
 		t.Errorf("session_id = %q, want %q", resp.SessionID, start.SessionID)
 	}
-	if resp.Metadata["github_login"] != "alice" {
-		t.Errorf("metadata.github_login = %q, want alice", resp.Metadata["github_login"])
+	if resp.Metadata["provider_login"] != "alice" {
+		t.Errorf("metadata.provider_login = %q, want alice", resp.Metadata["provider_login"])
 	}
 }
 

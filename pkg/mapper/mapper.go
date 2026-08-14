@@ -1,4 +1,4 @@
-// Package mapper translates a provider Identity into a local Unix user and
+// Package mapper translates a provider.Identity into a local Unix user and
 // group list using a three-tier chain:
 //
 //	Tier 1 — built-in config-file rules  (zero runtime deps)
@@ -24,7 +24,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/scttfrdmn/oauth2-pam/pkg/config"
 	"github.com/scttfrdmn/oauth2-pam/pkg/enrollment"
-	"github.com/scttfrdmn/oauth2-pam/pkg/provider/github"
+	"github.com/scttfrdmn/oauth2-pam/pkg/provider"
 )
 
 // ErrNoMapping is returned when no tier produces a mapping for the identity.
@@ -65,15 +65,16 @@ func New(cfg config.MapperConfig) *Chain {
 	}
 }
 
-// Map resolves the GitHub identity to a local Unix user.
+// Map resolves the authenticated identity to a local Unix user.
 // requestedLocalUser is the Unix username from the PAM auth request; it is
-// used by Tier 0 (enrollment) to verify a pre-enrolled (local, github) pair.
+// used by Tier 0 (enrollment) to verify a pre-enrolled (local user, provider
+// login) pair.
 // Pass "" to skip Tier 0 (e.g. in test-mapping dry runs).
 // The context is forwarded to Tier 2 (script) and Tier 3 (HTTP) calls.
-func (c *Chain) Map(ctx context.Context, id *github.Identity, requestedLocalUser string) (*Result, error) {
+func (c *Chain) Map(ctx context.Context, id *provider.Identity, requestedLocalUser string) (*Result, error) {
 	// Tier 0: enrollment file
 	if c.cfg.EnrollmentEnabled && c.cfg.EnrollmentFile != "" && requestedLocalUser != "" {
-		if result := mapViaEnrollment(c.cfg.EnrollmentFile, requestedLocalUser, id.Login); result != nil {
+		if result := mapViaEnrollment(c.cfg.EnrollmentFile, requestedLocalUser, id); result != nil {
 			log.Debug().
 				Str("login", id.Login).
 				Str("local_user", result.LocalUser).
@@ -141,19 +142,19 @@ func (c *Chain) Map(ctx context.Context, id *github.Identity, requestedLocalUser
 		}
 	}
 
-	return nil, fmt.Errorf("%w: login=%s orgs=%v teams=%v",
-		ErrNoMapping, id.Login, id.Orgs, id.Teams)
+	return nil, fmt.Errorf("%w: provider=%s login=%s claims=%v",
+		ErrNoMapping, id.Provider, id.Login, id.Claims)
 }
 
 // --- Tier 0: enrollment file ---
 
-func mapViaEnrollment(path, localUser, githubLogin string) *Result {
+func mapViaEnrollment(path, localUser string, id *provider.Identity) *Result {
 	store, err := enrollment.Load(path)
 	if err != nil {
 		log.Warn().Err(err).Str("path", path).Msg("mapper tier0: failed to load enrollment file")
 		return nil
 	}
-	rec := store.Find(localUser, githubLogin)
+	rec := store.Find(localUser, id.Login, id.Provider)
 	if rec == nil {
 		return nil
 	}
@@ -170,7 +171,7 @@ func mapViaEnrollment(path, localUser, githubLogin string) *Result {
 
 // --- Tier 1: config-file rules ---
 
-func mapViaRules(rules []config.MappingRule, id *github.Identity) (*Result, error) {
+func mapViaRules(rules []config.MappingRule, id *provider.Identity) (*Result, error) {
 	for _, rule := range rules {
 		if !ruleMatches(rule.Match, id) {
 			continue
@@ -196,21 +197,38 @@ func mapViaRules(rules []config.MappingRule, id *github.Identity) (*Result, erro
 }
 
 // ruleMatches returns true if all non-empty match criteria are satisfied.
-func ruleMatches(m config.MatchCriteria, id *github.Identity) bool {
-	if m.GitHubLogin != "" && !strings.EqualFold(m.GitHubLogin, id.Login) {
+//
+// The github_* keys are the GitHub spelling of neutral concepts and are kept
+// working exactly as before: github_login is the identity's login, github_org
+// and github_team are the "org" and "team" claims — which is what the GitHub
+// adapter fills, and what any other provider asserting organizations should
+// fill. A provider with a different vocabulary is matched with claims: instead,
+// so the rule engine needs no change to support one.
+func ruleMatches(m config.MatchCriteria, id *provider.Identity) bool {
+	login := m.Login
+	if login == "" {
+		login = m.GitHubLogin
+	}
+	if login != "" && !strings.EqualFold(login, id.Login) {
 		return false
 	}
-	if m.GitHubOrg != "" && !containsFold(id.Orgs, m.GitHubOrg) {
+	if m.GitHubOrg != "" && !id.HasClaim(provider.ClaimOrg, m.GitHubOrg) {
 		return false
 	}
-	if m.GitHubTeam != "" && !containsFold(id.Teams, m.GitHubTeam) {
+	if m.GitHubTeam != "" && !id.HasClaim(provider.ClaimTeam, m.GitHubTeam) {
 		return false
+	}
+	// All named claims must match (AND), consistent with the rest of a rule.
+	for name, want := range m.Claims {
+		if want != "" && !id.HasClaim(name, want) {
+			return false
+		}
 	}
 	return true
 }
 
 // expandLocalUser replaces supported placeholder variables in tmplStr with
-// values from the GitHub identity. Supports both Go-template style (for
+// values from the identity. Supports both Go-template style (for
 // backwards compatibility) and brace-style placeholders:
 //
 //	{{ .Login }}, {{.Login}}, {login}
@@ -218,8 +236,8 @@ func ruleMatches(m config.MatchCriteria, id *github.Identity) bool {
 //	{{ .Name  }}, {{.Name }}, {name}
 //
 // Any remaining "{{" after substitution is rejected to prevent template
-// injection via GitHub-controlled identity fields.
-func expandLocalUser(tmplStr string, id *github.Identity) (string, error) {
+// injection via provider-controlled identity fields.
+func expandLocalUser(tmplStr string, id *provider.Identity) (string, error) {
 	if !strings.ContainsAny(tmplStr, "{") {
 		return tmplStr, nil
 	}
@@ -243,27 +261,51 @@ func expandLocalUser(tmplStr string, id *github.Identity) (string, error) {
 
 // --- Tier 2: external script ---
 
-// scriptInput is the JSON sent to the external script on stdin.
+// scriptInput is the JSON sent to the external script on stdin, and posted to
+// the HTTP mapping service.
+//
+// orgs and teams are the "org" and "team" claims, kept as their own fields
+// because that is the payload the documented Tier 2/3 contract already has and
+// scripts in the wild parse it. claims carries the same data plus anything else
+// the provider asserted, and is where a non-GitHub provider's vocabulary shows
+// up; new consumers should read it and ignore orgs/teams.
 type scriptInput struct {
-	Provider string   `json:"provider"`
-	Login    string   `json:"login"`
-	Name     string   `json:"name"`
-	Email    string   `json:"email"`
-	Orgs     []string `json:"orgs"`
-	Teams    []string `json:"teams"`
+	Provider string              `json:"provider"`
+	Type     string              `json:"type"`
+	Subject  string              `json:"subject,omitempty"`
+	Login    string              `json:"login"`
+	Name     string              `json:"name"`
+	Email    string              `json:"email"`
+	Orgs     []string            `json:"orgs"`
+	Teams    []string            `json:"teams"`
+	Claims   map[string][]string `json:"claims"`
 }
 
-func mapViaScript(ctx context.Context, scriptPath string, id *github.Identity) (*Result, error) {
-	input := scriptInput{
+// newScriptInput builds the Tier 2/3 payload from an identity.
+func newScriptInput(id *provider.Identity) scriptInput {
+	orgs := id.Claim(provider.ClaimOrg)
+	if orgs == nil {
+		orgs = []string{}
+	}
+	teams := id.Claim(provider.ClaimTeam)
+	if teams == nil {
+		teams = []string{}
+	}
+	return scriptInput{
 		Provider: id.Provider,
+		Type:     id.Type,
+		Subject:  id.Subject,
 		Login:    id.Login,
 		Name:     id.Name,
 		Email:    id.Email,
-		Orgs:     id.Orgs,
-		Teams:    id.Teams,
+		Orgs:     orgs,
+		Teams:    teams,
+		Claims:   id.Claims,
 	}
+}
 
-	inputJSON, err := json.Marshal(input)
+func mapViaScript(ctx context.Context, scriptPath string, id *provider.Identity) (*Result, error) {
+	inputJSON, err := json.Marshal(newScriptInput(id))
 	if err != nil {
 		return nil, fmt.Errorf("marshal input: %w", err)
 	}
@@ -287,15 +329,8 @@ func mapViaScript(ctx context.Context, scriptPath string, id *github.Identity) (
 
 // --- Tier 3: HTTP service ---
 
-func mapViaHTTP(ctx context.Context, client *http.Client, endpoint string, id *github.Identity) (*Result, error) {
-	payload, err := json.Marshal(scriptInput{
-		Provider: id.Provider,
-		Login:    id.Login,
-		Name:     id.Name,
-		Email:    id.Email,
-		Orgs:     id.Orgs,
-		Teams:    id.Teams,
-	})
+func mapViaHTTP(ctx context.Context, client *http.Client, endpoint string, id *provider.Identity) (*Result, error) {
+	payload, err := json.Marshal(newScriptInput(id))
 	if err != nil {
 		return nil, fmt.Errorf("marshal payload: %w", err)
 	}
@@ -340,13 +375,4 @@ func parseResult(data []byte) (*Result, error) {
 		return nil, nil // treat empty local_user as no mapping
 	}
 	return &result, nil
-}
-
-func containsFold(slice []string, s string) bool {
-	for _, v := range slice {
-		if strings.EqualFold(v, s) {
-			return true
-		}
-	}
-	return false
 }

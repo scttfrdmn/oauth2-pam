@@ -11,10 +11,15 @@ import (
 	"testing"
 	"time"
 
+	"encoding/json"
+	"io"
+	"reflect"
+	"strings"
+
 	"github.com/rs/zerolog"
 	"github.com/scttfrdmn/oauth2-pam/pkg/config"
 	"github.com/scttfrdmn/oauth2-pam/pkg/enrollment"
-	"github.com/scttfrdmn/oauth2-pam/pkg/provider/github"
+	"github.com/scttfrdmn/oauth2-pam/pkg/provider"
 )
 
 func TestMain(m *testing.M) {
@@ -22,15 +27,18 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func identity() *github.Identity {
-	return &github.Identity{
+func identity() *provider.Identity {
+	id := &provider.Identity{
 		Provider: "github",
+		Type:     "github",
+		Subject:  "1001",
 		Login:    "alice",
 		Name:     "Alice Example",
 		Email:    "alice@example.com",
-		Orgs:     []string{"acme"},
-		Teams:    []string{"acme/eng"},
 	}
+	id.AddClaim(provider.ClaimOrg, "acme")
+	id.AddClaim(provider.ClaimTeam, "acme/eng")
+	return id
 }
 
 func TestRuleMatching(t *testing.T) {
@@ -40,7 +48,7 @@ func TestRuleMatching(t *testing.T) {
 		want  bool
 	}{
 		{"empty criteria matches anything", config.MatchCriteria{}, true},
-		{"login match", config.MatchCriteria{GitHubLogin: "alice"}, true},
+		{"login match", config.MatchCriteria{Login: "alice"}, true},
 		{"login is case-insensitive", config.MatchCriteria{GitHubLogin: "ALICE"}, true},
 		{"login mismatch", config.MatchCriteria{GitHubLogin: "bob"}, false},
 		{"org match", config.MatchCriteria{GitHubOrg: "acme"}, true},
@@ -50,12 +58,45 @@ func TestRuleMatching(t *testing.T) {
 		{"team mismatch", config.MatchCriteria{GitHubTeam: "acme/ops"}, false},
 		{
 			"all criteria are ANDed: one mismatch fails the rule",
-			config.MatchCriteria{GitHubLogin: "alice", GitHubOrg: "acme", GitHubTeam: "acme/ops"},
+			config.MatchCriteria{Login: "alice", GitHubOrg: "acme", GitHubTeam: "acme/ops"},
 			false,
 		},
 		{
 			"all criteria satisfied",
-			config.MatchCriteria{GitHubLogin: "alice", GitHubOrg: "acme", GitHubTeam: "acme/eng"},
+			config.MatchCriteria{Login: "alice", GitHubOrg: "acme", GitHubTeam: "acme/eng"},
+			true,
+		},
+
+		// The neutral spelling: github_org and github_team are the GitHub names
+		// for the "org" and "team" claims, so a rule written either way means
+		// the same thing.
+		{"claim org match", config.MatchCriteria{Claims: map[string]string{"org": "acme"}}, true},
+		{"claim org is case-insensitive", config.MatchCriteria{Claims: map[string]string{"org": "ACME"}}, true},
+		{"claim org mismatch", config.MatchCriteria{Claims: map[string]string{"org": "other"}}, false},
+		{"claim team match", config.MatchCriteria{Claims: map[string]string{"team": "acme/eng"}}, true},
+		{
+			"claims are ANDed with each other",
+			config.MatchCriteria{Claims: map[string]string{"org": "acme", "team": "acme/ops"}},
+			false,
+		},
+		{
+			"claims are ANDed with the github_* keys",
+			config.MatchCriteria{GitHubOrg: "acme", Claims: map[string]string{"team": "acme/ops"}},
+			false,
+		},
+		{
+			"a claim the identity does not assert never matches",
+			config.MatchCriteria{Claims: map[string]string{"group": "platform-team"}},
+			false,
+		},
+		{
+			"an empty claim value is not a requirement",
+			config.MatchCriteria{Claims: map[string]string{"org": ""}},
+			true,
+		},
+		{
+			"login takes precedence over github_login",
+			config.MatchCriteria{Login: "alice", GitHubLogin: "bob"},
 			true,
 		},
 	}
@@ -195,9 +236,9 @@ func writeEnrollment(t *testing.T, recs ...enrollment.Record) string {
 
 func TestEnrollmentTierRunsBeforeRules(t *testing.T) {
 	path := writeEnrollment(t, enrollment.Record{
-		LocalUser:   "alice",
-		GitHubLogin: "alice",
-		Groups:      []string{"enrolled"},
+		LocalUser: "alice",
+		Login:     "alice",
+		Groups:    []string{"enrolled"},
 	})
 
 	c := New(config.MapperConfig{
@@ -218,7 +259,7 @@ func TestEnrollmentTierRunsBeforeRules(t *testing.T) {
 }
 
 func TestEnrollmentTierSkippedWithoutRequestedUser(t *testing.T) {
-	path := writeEnrollment(t, enrollment.Record{LocalUser: "alice", GitHubLogin: "alice"})
+	path := writeEnrollment(t, enrollment.Record{LocalUser: "alice", Login: "alice"})
 
 	c := New(config.MapperConfig{
 		EnrollmentEnabled: true,
@@ -242,7 +283,7 @@ func TestEnrollmentTierSkippedWithoutRequestedUser(t *testing.T) {
 // must not authorize bob's GitHub account logging in as alice, nor alice's
 // GitHub account logging in as bob.
 func TestEnrollmentRequiresBothHalvesOfThePair(t *testing.T) {
-	path := writeEnrollment(t, enrollment.Record{LocalUser: "alice", GitHubLogin: "alice"})
+	path := writeEnrollment(t, enrollment.Record{LocalUser: "alice", Login: "alice"})
 	c := New(config.MapperConfig{EnrollmentEnabled: true, EnrollmentFile: path})
 
 	id := identity()
@@ -257,7 +298,7 @@ func TestEnrollmentRequiresBothHalvesOfThePair(t *testing.T) {
 }
 
 func TestEnrollmentWithInvalidUsernameIsSkipped(t *testing.T) {
-	path := writeEnrollment(t, enrollment.Record{LocalUser: "root;evil", GitHubLogin: "alice"})
+	path := writeEnrollment(t, enrollment.Record{LocalUser: "root;evil", Login: "alice"})
 	c := New(config.MapperConfig{EnrollmentEnabled: true, EnrollmentFile: path})
 
 	if _, err := c.Map(context.Background(), identity(), "root;evil"); !errors.Is(err, ErrNoMapping) {
@@ -469,5 +510,131 @@ func TestNoTiersConfigured(t *testing.T) {
 	c := New(config.MapperConfig{})
 	if _, err := c.Map(context.Background(), identity(), "alice"); !errors.Is(err, ErrNoMapping) {
 		t.Errorf("err = %v, want ErrNoMapping", err)
+	}
+}
+
+// TestNeutralClaimsMapAProviderWithNoOrgs is the mapper half of the provider
+// interface: an identity asserting only flat "group" claims — the shape an OIDC
+// provider returns, with no orgs or teams at all — maps through a rule that
+// names the claim, with no GitHub vocabulary involved.
+func TestNeutralClaimsMapAProviderWithNoOrgs(t *testing.T) {
+	id := &provider.Identity{
+		Provider: "corp-sso",
+		Type:     "oidc",
+		Subject:  "8f14e45f",
+		Login:    "a.example",
+	}
+	id.AddClaim(provider.ClaimGroup, "platform-team", "staff")
+
+	c := New(config.MapperConfig{Rules: []config.MappingRule{
+		{Match: config.MatchCriteria{Claims: map[string]string{"group": "contractors"}}, LocalUser: "restricted"},
+		{Match: config.MatchCriteria{Claims: map[string]string{"group": "platform-team"}}, LocalUser: "platformuser"},
+	}})
+
+	res, err := c.Map(context.Background(), id, "")
+	if err != nil {
+		t.Fatalf("Map: %v", err)
+	}
+	if res.LocalUser != "platformuser" {
+		t.Errorf("LocalUser = %q, want platformuser", res.LocalUser)
+	}
+
+	// {{ .Login }} is not usable for such a provider: this login is not a valid
+	// Unix username, and the mapper refuses rather than producing one that no
+	// account can have. A provider whose logins are email addresses needs an
+	// explicit local_user, or Tier 2/3.
+	c = New(config.MapperConfig{Rules: []config.MappingRule{
+		{Match: config.MatchCriteria{}, LocalUser: "{{ .Login }}"},
+	}})
+	if _, err := c.Map(context.Background(), id, ""); err == nil {
+		t.Error("Map accepted {{ .Login }} expanding to an invalid Unix username")
+	}
+}
+
+// The error for an unmapped identity has to say what the identity actually
+// carried, or an operator debugging a failed login has nothing to compare their
+// rules against.
+func TestNoMappingErrorNamesTheProviderAndClaims(t *testing.T) {
+	c := New(config.MapperConfig{Rules: []config.MappingRule{
+		{Match: config.MatchCriteria{Login: "bob"}, LocalUser: "bob"},
+	}})
+
+	_, err := c.Map(context.Background(), identity(), "")
+	if err == nil {
+		t.Fatal("Map succeeded for an identity no rule matches")
+	}
+	for _, want := range []string{"github", "alice", "acme/eng"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to mention %q", err, want)
+		}
+	}
+}
+
+// TestTierPayloadCarriesClaimsAndKeepsOrgsAndTeams pins the Tier 2/3 contract.
+// claims is the provider-neutral form a new consumer should read; orgs and teams
+// stay as the GitHub-shaped view of the same data because scripts in the wild
+// parse them, and dropping them would break those scripts silently.
+func TestTierPayloadCarriesClaimsAndKeepsOrgsAndTeams(t *testing.T) {
+	var body []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ = io.ReadAll(r.Body)
+		_, _ = w.Write([]byte(`{"local_user":"httpuser"}`))
+	}))
+	defer srv.Close()
+
+	c := New(config.MapperConfig{HTTPEndpoint: srv.URL, HTTPTimeout: 5 * time.Second})
+	if _, err := c.Map(context.Background(), identity(), ""); err != nil {
+		t.Fatalf("Map: %v", err)
+	}
+
+	var got struct {
+		Provider string              `json:"provider"`
+		Type     string              `json:"type"`
+		Subject  string              `json:"subject"`
+		Login    string              `json:"login"`
+		Orgs     []string            `json:"orgs"`
+		Teams    []string            `json:"teams"`
+		Claims   map[string][]string `json:"claims"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("unmarshal payload %s: %v", body, err)
+	}
+
+	if got.Provider != "github" || got.Type != "github" || got.Subject != "1001" || got.Login != "alice" {
+		t.Errorf("payload identity = %+v, want provider/type github, subject 1001, login alice", got)
+	}
+	if len(got.Orgs) != 1 || got.Orgs[0] != "acme" {
+		t.Errorf("orgs = %v, want [acme]", got.Orgs)
+	}
+	if len(got.Teams) != 1 || got.Teams[0] != "acme/eng" {
+		t.Errorf("teams = %v, want [acme/eng]", got.Teams)
+	}
+	if want := []string{"acme"}; !reflect.DeepEqual(got.Claims["org"], want) {
+		t.Errorf("claims.org = %v, want %v", got.Claims["org"], want)
+	}
+	if want := []string{"acme/eng"}; !reflect.DeepEqual(got.Claims["team"], want) {
+		t.Errorf("claims.team = %v, want %v", got.Claims["team"], want)
+	}
+}
+
+// An identity with no memberships must still send orgs and teams as empty
+// arrays, not null: a script doing `jq -r '.orgs[]'` on null errors out, where
+// on [] it produces nothing.
+func TestTierPayloadUsesEmptyArraysNotNull(t *testing.T) {
+	var body []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	id := &provider.Identity{Provider: "corp-sso", Type: "oidc", Login: "alice"}
+	c := New(config.MapperConfig{HTTPEndpoint: srv.URL, HTTPTimeout: 5 * time.Second})
+	if _, err := c.Map(context.Background(), id, ""); !errors.Is(err, ErrNoMapping) {
+		t.Fatalf("err = %v, want ErrNoMapping", err)
+	}
+
+	if !strings.Contains(string(body), `"orgs":[]`) || !strings.Contains(string(body), `"teams":[]`) {
+		t.Errorf("payload = %s, want empty arrays for orgs and teams", body)
 	}
 }

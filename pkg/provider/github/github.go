@@ -1,9 +1,11 @@
-// Package github implements an OAuth2 provider adapter for GitHub.
+// Package github implements pkg/provider's Provider interface for GitHub, and
+// for GitHub Enterprise Server.
 //
-// Authentication uses the OAuth2 Device Authorization Grant (RFC 8628).
-// After the user authorizes, the adapter fetches the GitHub user profile,
-// org membership, and team membership to build an Identity that the mapper
-// can use to determine the local Unix user.
+// Authentication uses the OAuth2 Device Authorization Grant (RFC 8628). After
+// the user authorizes, the adapter fetches the GitHub user profile, org
+// membership, and team membership, and returns them as a provider.Identity whose
+// claims are provider.ClaimOrg and provider.ClaimTeam. Everything GitHub-shaped
+// stops at this package's boundary.
 package github
 
 import (
@@ -13,12 +15,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
 	"github.com/scttfrdmn/oauth2-pam/pkg/config"
+	"github.com/scttfrdmn/oauth2-pam/pkg/provider"
 )
 
 // Endpoints locates the GitHub instance to talk to. The zero value is not
@@ -82,53 +86,13 @@ func (e Endpoints) validate() (map[string]struct{}, error) {
 	return hosts, nil
 }
 
-// Provider is a GitHub OAuth2 provider that supports Device Flow auth.
+// Provider is a GitHub OAuth2 provider that supports Device Flow auth. It
+// implements provider.Provider.
 type Provider struct {
 	name       string
 	cfg        config.ProviderConfig
 	endpoints  Endpoints
 	httpClient *http.Client
-}
-
-// DeviceFlow holds the in-progress device authorization state.
-type DeviceFlow struct {
-	DeviceCode      string
-	UserCode        string
-	DeviceURL       string
-	ExpiresAt       time.Time
-	PollingInterval int
-}
-
-// Identity is the authenticated GitHub identity returned after a successful
-// device flow. It carries enough information for the mapper to decide the
-// local Unix user.
-type Identity struct {
-	// Provider is always "github"
-	Provider string
-
-	// Login is the GitHub username (e.g. "scttfrdmn")
-	Login string
-
-	// Name is the display name from the GitHub profile
-	Name string
-
-	// Email is the primary email (may be empty if the user has hidden it)
-	Email string
-
-	// Orgs is the list of GitHub organization slugs the user belongs to
-	Orgs []string
-
-	// Teams is the list of teams the user belongs to, in "org/team-slug" format
-	Teams []string
-}
-
-// Token wraps an OAuth2 access token.
-type Token struct {
-	AccessToken string
-	TokenType   string
-	Scope       string
-	ExpiresAt   time.Time
-	Fingerprint string
 }
 
 // deviceAuthResponse is the JSON response from the device authorization endpoint.
@@ -217,13 +181,16 @@ func NewWithEndpoints(cfg config.ProviderConfig, endpoints Endpoints) (*Provider
 	}, nil
 }
 
-// Name returns the provider name.
+// Name returns the operator's name for this provider.
 func (p *Provider) Name() string { return p.name }
+
+// Type returns "github".
+func (p *Provider) Type() string { return "github" }
 
 // StartDeviceFlow initiates a GitHub Device Authorization Grant.
 // The returned DeviceFlow contains the user code and verification URL to
 // display to the user.
-func (p *Provider) StartDeviceFlow(ctx context.Context) (*DeviceFlow, error) {
+func (p *Provider) StartDeviceFlow(ctx context.Context) (*provider.DeviceFlow, error) {
 	data := url.Values{}
 	data.Set("client_id", p.cfg.ClientID)
 	data.Set("scope", "read:org read:user user:email")
@@ -260,7 +227,7 @@ func (p *Provider) StartDeviceFlow(ctx context.Context) (*DeviceFlow, error) {
 		interval = 5
 	}
 
-	df := &DeviceFlow{
+	df := &provider.DeviceFlow{
 		DeviceCode:      dar.DeviceCode,
 		UserCode:        dar.UserCode,
 		DeviceURL:       verifyURL,
@@ -282,7 +249,7 @@ func (p *Provider) StartDeviceFlow(ctx context.Context) (*DeviceFlow, error) {
 //
 // The caller should check whether the error is ErrAuthorizationPending and
 // retry after PollingInterval seconds; any other error is fatal.
-func (p *Provider) PollDeviceAuthorization(ctx context.Context, deviceCode string) (*Token, error) {
+func (p *Provider) PollDeviceAuthorization(ctx context.Context, deviceCode string) (*provider.Token, error) {
 	data := url.Values{}
 	data.Set("client_id", p.cfg.ClientID)
 	data.Set("client_secret", p.cfg.ClientSecret)
@@ -310,13 +277,13 @@ func (p *Provider) PollDeviceAuthorization(ctx context.Context, deviceCode strin
 	if tr.Error != "" {
 		switch tr.Error {
 		case "authorization_pending":
-			return nil, ErrAuthorizationPending
+			return nil, provider.ErrAuthorizationPending
 		case "slow_down":
-			return nil, ErrSlowDown
+			return nil, provider.ErrSlowDown
 		case "expired_token":
-			return nil, ErrExpiredToken
+			return nil, provider.ErrExpiredToken
 		case "access_denied":
-			return nil, ErrAccessDenied
+			return nil, provider.ErrAccessDenied
 		default:
 			return nil, fmt.Errorf("github poll: %s: %s", tr.Error, tr.ErrorDescription)
 		}
@@ -326,7 +293,7 @@ func (p *Provider) PollDeviceAuthorization(ctx context.Context, deviceCode strin
 		return nil, fmt.Errorf("github poll: no access token in response")
 	}
 
-	token := &Token{
+	token := &provider.Token{
 		AccessToken: tr.AccessToken,
 		TokenType:   tr.TokenType,
 		Scope:       tr.Scope,
@@ -354,7 +321,7 @@ func (p *Provider) PollDeviceAuthorization(ctx context.Context, deviceCode strin
 // GetIdentity fetches the user profile, org membership, and team membership
 // for the authenticated token and returns an Identity. The three API calls
 // are made concurrently.
-func (p *Provider) GetIdentity(ctx context.Context, token *Token) (*Identity, error) {
+func (p *Provider) GetIdentity(ctx context.Context, token *provider.Token) (*provider.Identity, error) {
 	// /user must succeed — it provides the login needed for all subsequent work.
 	user, err := p.getUser(ctx, token.AccessToken)
 	if err != nil {
@@ -389,14 +356,18 @@ func (p *Provider) GetIdentity(ctx context.Context, token *Token) (*Identity, er
 		teams = []string{}
 	}
 
-	id := &Identity{
-		Provider: "github",
-		Login:    user.Login,
-		Name:     user.Name,
-		Email:    user.Email,
-		Orgs:     orgs,
-		Teams:    teams,
+	id := &provider.Identity{
+		Provider: p.name,
+		Type:     p.Type(),
+		// GitHub's numeric user ID survives a rename; the login does not, so an
+		// audit trail should key on this.
+		Subject: strconv.FormatInt(user.ID, 10),
+		Login:   user.Login,
+		Name:    user.Name,
+		Email:   user.Email,
 	}
+	id.AddClaim(provider.ClaimOrg, orgs...)
+	id.AddClaim(provider.ClaimTeam, teams...)
 
 	// Enforce provider-level access controls if configured
 	if err := p.checkAccess(id); err != nil {
@@ -406,15 +377,15 @@ func (p *Provider) GetIdentity(ctx context.Context, token *Token) (*Identity, er
 	log.Debug().
 		Str("provider", p.name).
 		Str("login", id.Login).
-		Strs("orgs", id.Orgs).
-		Strs("teams", id.Teams).
+		Strs("orgs", id.Claim(provider.ClaimOrg)).
+		Strs("teams", id.Claim(provider.ClaimTeam)).
 		Msg("GitHub identity resolved")
 
 	return id, nil
 }
 
 // checkAccess enforces the provider-level allow/deny rules from config.
-func (p *Provider) checkAccess(id *Identity) error {
+func (p *Provider) checkAccess(id *provider.Identity) error {
 	gh := p.cfg.GitHub
 
 	// Explicit user allowlist bypasses org/team requirements
@@ -434,39 +405,27 @@ func (p *Provider) checkAccess(id *Identity) error {
 	// the login was not on it, and there is no org or team requirement left for
 	// it to satisfy instead.
 	if gh.RequireOrg == "" && len(gh.RequireTeams) == 0 {
-		return fmt.Errorf("%w: %s is not in allow_users", ErrAccessForbidden, id.Login)
+		return fmt.Errorf("%w: %s is not in allow_users", provider.ErrAccessForbidden, id.Login)
 	}
 
 	// Check required org
-	if gh.RequireOrg != "" {
-		found := false
-		for _, org := range id.Orgs {
-			if strings.EqualFold(org, gh.RequireOrg) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return fmt.Errorf("%w: %s is not a member of GitHub org %q", ErrAccessForbidden, id.Login, gh.RequireOrg)
-		}
+	if gh.RequireOrg != "" && !id.HasClaim(provider.ClaimOrg, gh.RequireOrg) {
+		return fmt.Errorf("%w: %s is not a member of GitHub org %q",
+			provider.ErrAccessForbidden, id.Login, gh.RequireOrg)
 	}
 
 	// Check required teams (at least one must match)
 	if len(gh.RequireTeams) > 0 {
 		found := false
 		for _, requiredTeam := range gh.RequireTeams {
-			for _, team := range id.Teams {
-				if strings.EqualFold(team, requiredTeam) {
-					found = true
-					break
-				}
-			}
-			if found {
+			if id.HasClaim(provider.ClaimTeam, requiredTeam) {
+				found = true
 				break
 			}
 		}
 		if !found {
-			return fmt.Errorf("%w: %s is not a member of any required team", ErrAccessForbidden, id.Login)
+			return fmt.Errorf("%w: %s is not a member of any required team",
+				provider.ErrAccessForbidden, id.Login)
 		}
 	}
 
@@ -577,24 +536,3 @@ func (p *Provider) RevokeAccessToken(ctx context.Context, accessToken string) er
 	}
 	return nil
 }
-
-// Sentinel errors returned by PollDeviceAuthorization
-
-// ErrAuthorizationPending means the user has not yet completed authorization.
-// The caller should wait PollingInterval seconds and retry.
-var ErrAuthorizationPending = fmt.Errorf("authorization_pending")
-
-// ErrSlowDown means the polling interval should be increased by 5 seconds.
-var ErrSlowDown = fmt.Errorf("slow_down")
-
-// ErrExpiredToken means the device code has expired and a new flow must be started.
-var ErrExpiredToken = fmt.Errorf("expired_token")
-
-// ErrAccessDenied means the user denied the authorization request.
-var ErrAccessDenied = fmt.Errorf("access_denied")
-
-// ErrAccessForbidden means the identity authenticated successfully but does not
-// satisfy the configured org/team/allowlist requirements. It wraps the
-// provider-level access-control refusals from checkAccess so callers can tell a
-// policy decision apart from an API outage.
-var ErrAccessForbidden = fmt.Errorf("access denied")

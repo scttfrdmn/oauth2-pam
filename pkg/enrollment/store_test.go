@@ -14,8 +14,8 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	enrolledAt := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
 
 	original := &Store{Enrollments: []Record{
-		{LocalUser: "alice", GitHubLogin: "alice-gh", EnrolledAt: enrolledAt, EnrolledBy: "root", Groups: []string{"devs", "wheel"}},
-		{LocalUser: "bob", GitHubLogin: "bob-gh", EnrolledAt: enrolledAt, EnrolledBy: "root"},
+		{LocalUser: "alice", Login: "alice-gh", EnrolledAt: enrolledAt, EnrolledBy: "root", Groups: []string{"devs", "wheel"}},
+		{LocalUser: "bob", Login: "bob-gh", EnrolledAt: enrolledAt, EnrolledBy: "root"},
 	}}
 
 	if err := original.Save(path); err != nil {
@@ -31,7 +31,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 
 	got := loaded.Enrollments[0]
-	if got.LocalUser != "alice" || got.GitHubLogin != "alice-gh" || got.EnrolledBy != "root" {
+	if got.LocalUser != "alice" || got.Login != "alice-gh" || got.EnrolledBy != "root" {
 		t.Errorf("record = %+v", got)
 	}
 	if !got.EnrolledAt.Equal(enrolledAt) {
@@ -70,7 +70,7 @@ func TestLoadMalformedFile(t *testing.T) {
 // phish at the right person.
 func TestSaveIsNotWorldReadable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "enrolled-users.yaml")
-	store := &Store{Enrollments: []Record{{LocalUser: "alice", GitHubLogin: "alice-gh"}}}
+	store := &Store{Enrollments: []Record{{LocalUser: "alice", Login: "alice-gh"}}}
 
 	if err := store.Save(path); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -102,7 +102,7 @@ func TestSaveCreatesParentDirectory(t *testing.T) {
 func TestSaveLeavesNoTempFiles(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "enrolled-users.yaml")
-	store := &Store{Enrollments: []Record{{LocalUser: "alice", GitHubLogin: "alice-gh"}}}
+	store := &Store{Enrollments: []Record{{LocalUser: "alice", Login: "alice-gh"}}}
 
 	if err := store.Save(path); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -120,36 +120,36 @@ func TestSaveLeavesNoTempFiles(t *testing.T) {
 }
 
 func TestFindRequiresBothFields(t *testing.T) {
-	store := &Store{Enrollments: []Record{{LocalUser: "alice", GitHubLogin: "alice-gh"}}}
+	store := &Store{Enrollments: []Record{{LocalUser: "alice", Login: "alice-gh"}}}
 
-	if store.Find("alice", "alice-gh") == nil {
+	if store.Find("alice", "alice-gh", "") == nil {
 		t.Error("Find missed an exact match")
 	}
 	// Case-insensitive on both halves: Unix names are lowercase by convention
 	// but GitHub logins are displayed with mixed case.
-	if store.Find("ALICE", "Alice-GH") == nil {
+	if store.Find("ALICE", "Alice-GH", "") == nil {
 		t.Error("Find is case-sensitive; it should not be")
 	}
-	if store.Find("alice", "mallory-gh") != nil {
+	if store.Find("alice", "mallory-gh", "") != nil {
 		t.Error("Find matched the wrong GitHub login")
 	}
-	if store.Find("bob", "alice-gh") != nil {
+	if store.Find("bob", "alice-gh", "") != nil {
 		t.Error("Find matched the wrong local user")
 	}
-	if store.Find("", "") != nil {
+	if store.Find("", "", "") != nil {
 		t.Error("Find matched on empty input")
 	}
 }
 
 func TestFindByLocalUser(t *testing.T) {
-	store := &Store{Enrollments: []Record{{LocalUser: "alice", GitHubLogin: "alice-gh"}}}
+	store := &Store{Enrollments: []Record{{LocalUser: "alice", Login: "alice-gh"}}}
 
 	rec := store.FindByLocalUser("alice")
 	if rec == nil {
 		t.Fatal("FindByLocalUser missed an enrolled user")
 	}
-	if rec.GitHubLogin != "alice-gh" {
-		t.Errorf("GitHubLogin = %q", rec.GitHubLogin)
+	if rec.Login != "alice-gh" {
+		t.Errorf("Login = %q", rec.Login)
 	}
 	if store.FindByLocalUser("bob") != nil {
 		t.Error("FindByLocalUser matched an unenrolled user")
@@ -161,11 +161,11 @@ func TestFindByLocalUser(t *testing.T) {
 func TestAddRejectsDuplicateLocalUser(t *testing.T) {
 	store := &Store{}
 
-	if err := store.Add(Record{LocalUser: "alice", GitHubLogin: "alice-gh"}); err != nil {
+	if err := store.Add(Record{LocalUser: "alice", Login: "alice-gh"}); err != nil {
 		t.Fatalf("first Add: %v", err)
 	}
 
-	err := store.Add(Record{LocalUser: "alice", GitHubLogin: "mallory-gh"})
+	err := store.Add(Record{LocalUser: "alice", Login: "mallory-gh"})
 	if err == nil {
 		t.Fatal("Add silently re-enrolled an existing local user under a different GitHub account")
 	}
@@ -182,19 +182,19 @@ func TestAddRejectsDuplicateLocalUser(t *testing.T) {
 
 func TestAddDuplicateIsCaseInsensitive(t *testing.T) {
 	store := &Store{}
-	if err := store.Add(Record{LocalUser: "alice", GitHubLogin: "alice-gh"}); err != nil {
+	if err := store.Add(Record{LocalUser: "alice", Login: "alice-gh"}); err != nil {
 		t.Fatalf("first Add: %v", err)
 	}
-	if err := store.Add(Record{LocalUser: "ALICE", GitHubLogin: "mallory-gh"}); err == nil {
+	if err := store.Add(Record{LocalUser: "ALICE", Login: "mallory-gh"}); err == nil {
 		t.Error("Add accepted a duplicate that differed only in case")
 	}
 }
 
 func TestRemove(t *testing.T) {
 	store := &Store{Enrollments: []Record{
-		{LocalUser: "alice", GitHubLogin: "alice-gh"},
-		{LocalUser: "bob", GitHubLogin: "bob-gh"},
-		{LocalUser: "carol", GitHubLogin: "carol-gh"},
+		{LocalUser: "alice", Login: "alice-gh"},
+		{LocalUser: "bob", Login: "bob-gh"},
+		{LocalUser: "carol", Login: "carol-gh"},
 	}}
 
 	if !store.Remove("bob") {
@@ -217,15 +217,15 @@ func TestRemove(t *testing.T) {
 }
 
 func TestRemoveThenAddAllowsReEnrollment(t *testing.T) {
-	store := &Store{Enrollments: []Record{{LocalUser: "alice", GitHubLogin: "alice-gh"}}}
+	store := &Store{Enrollments: []Record{{LocalUser: "alice", Login: "alice-gh"}}}
 
 	if !store.Remove("alice") {
 		t.Fatal("Remove failed")
 	}
-	if err := store.Add(Record{LocalUser: "alice", GitHubLogin: "alice-new-gh"}); err != nil {
+	if err := store.Add(Record{LocalUser: "alice", Login: "alice-new-gh"}); err != nil {
 		t.Fatalf("re-enrollment after Remove: %v", err)
 	}
-	if rec := store.FindByLocalUser("alice"); rec == nil || rec.GitHubLogin != "alice-new-gh" {
+	if rec := store.FindByLocalUser("alice"); rec == nil || rec.Login != "alice-new-gh" {
 		t.Errorf("record = %+v, want the new GitHub login", rec)
 	}
 }
@@ -245,8 +245,8 @@ func TestConcurrentSaves(t *testing.T) {
 		go func(n int) {
 			defer wg.Done()
 			store := &Store{Enrollments: []Record{
-				{LocalUser: "alice", GitHubLogin: "alice-gh"},
-				{LocalUser: "bob", GitHubLogin: "bob-gh"},
+				{LocalUser: "alice", Login: "alice-gh"},
+				{LocalUser: "bob", Login: "bob-gh"},
 			}}
 			if err := store.Save(path); err != nil {
 				errs <- err
@@ -266,5 +266,117 @@ func TestConcurrentSaves(t *testing.T) {
 	}
 	if len(loaded.Enrollments) != 2 {
 		t.Errorf("got %d records, want 2 (the file was torn)", len(loaded.Enrollments))
+	}
+}
+
+// TestLegacyGitHubLoginKeyIsAccepted covers upgrades: an enrollment file written
+// before providers were an abstraction spells the login github_login, and those
+// users must not all be locked out by an upgrade.
+func TestLegacyGitHubLoginKeyIsAccepted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "enrolled-users.yaml")
+	legacy := `enrollments:
+  - local_user: alice
+    github_login: alice-gh
+    enrolled_at: 2025-01-01T00:00:00Z
+    enrolled_by: root
+    groups: [devs]
+`
+	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	rec := store.FindByLocalUser("alice")
+	if rec == nil {
+		t.Fatal("legacy record not found")
+	}
+	if rec.Login != "alice-gh" {
+		t.Errorf("Login = %q, want alice-gh from github_login", rec.Login)
+	}
+	if len(rec.Groups) != 1 || rec.Groups[0] != "devs" {
+		t.Errorf("Groups = %v, want [devs]", rec.Groups)
+	}
+
+	// Saving migrates the file to the current spelling, and the legacy key is
+	// gone rather than written back alongside it.
+	if err := store.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "github_login") {
+		t.Errorf("saved file still contains github_login:\n%s", data)
+	}
+	if !strings.Contains(string(data), "login: alice-gh") {
+		t.Errorf("saved file does not contain login: alice-gh:\n%s", data)
+	}
+}
+
+// A file setting both spellings to different values is a hand-edit, and guessing
+// which one was meant would hand the local account to one of two different
+// provider identities. Refuse to load it.
+func TestConflictingLoginKeysAreRejected(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "enrolled-users.yaml")
+	conflicting := `enrollments:
+  - local_user: alice
+    login: alice
+    github_login: mallory
+`
+	if err := os.WriteFile(path, []byte(conflicting), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load accepted a record with two disagreeing logins")
+	}
+
+	// The same value under both keys is redundant but unambiguous, so it loads.
+	agreeing := `enrollments:
+  - local_user: alice
+    login: alice-gh
+    github_login: ALICE-GH
+`
+	if err := os.WriteFile(path, []byte(agreeing), 0600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load rejected two agreeing logins: %v", err)
+	}
+	if rec := store.FindByLocalUser("alice"); rec == nil || rec.Login != "alice-gh" {
+		t.Errorf("record = %+v, want Login alice-gh", rec)
+	}
+}
+
+// TestFindIsScopedToTheProvider is the reason Record carries a provider name: on
+// a host with two providers, "alice" at the one she did not enroll with must not
+// inherit her local account.
+func TestFindIsScopedToTheProvider(t *testing.T) {
+	store := &Store{Enrollments: []Record{
+		{LocalUser: "alice", Login: "alice", Provider: "corp-github"},
+		{LocalUser: "bob", Login: "bob"}, // no provider: written before they were named
+	}}
+
+	if store.Find("alice", "alice", "corp-github") == nil {
+		t.Error("the enrolling provider did not match")
+	}
+	if store.Find("alice", "alice", "public-github") != nil {
+		t.Error("an enrollment for one provider matched a login at another")
+	}
+	if store.Find("alice", "alice", "") != nil {
+		t.Error("a provider-scoped enrollment matched a request naming no provider")
+	}
+	// A record with no provider matches any, which is what an existing file
+	// means and what a single-provider host wants.
+	if store.Find("bob", "bob", "public-github") == nil {
+		t.Error("an unscoped enrollment did not match a named provider")
+	}
+	if store.Find("bob", "bob", "") == nil {
+		t.Error("an unscoped enrollment did not match an unnamed provider")
 	}
 }

@@ -124,7 +124,7 @@ static int send_json(int sock, json_object *req) {
 }
 
 int send_auth_request(int sock, const char *username, const char *service,
-                      const char *rhost, const char *tty) {
+                      const char *rhost, const char *tty, const char *provider) {
     json_object *req      = json_object_new_object();
     json_object *metadata = json_object_new_object();
     const char *login_type = "ssh";
@@ -149,6 +149,12 @@ int send_auth_request(int sock, const char *username, const char *service,
     json_object_object_add(req, "login_type",  json_object_new_string(login_type));
     json_object_object_add(req, "target_host", json_object_new_string(rhost));
     json_object_object_add(req, "metadata",    metadata);
+    /* Omitted rather than sent empty when no provider= argument is given: the
+       broker reads an absent field as "your default", and an empty string means
+       the same, but omitting it keeps the request identical to what an older
+       module sends. */
+    if (provider != NULL && provider[0] != '\0')
+        json_object_object_add(req, "provider", json_object_new_string(provider));
 
     int rc = send_json(sock, req);
     json_object_put(req);
@@ -317,11 +323,14 @@ int parse_broker_response(const char *json_text, struct broker_response **out) {
 
 /* parse_arguments reads the module arguments from the pam.d line:
      socket=/path         broker socket (must be under /var/run/oauth2-pam/)
+     provider=name        which configured provider to authenticate against;
+                          omit for the broker's default (first configured)
      poll_interval=N      seconds between check_session calls
      timeout=N            seconds to wait for the user to authorize
      debug                log at LOG_DEBUG                                  */
 static void parse_arguments(int argc, const char **argv, struct module_options *opts) {
     opts->socket_path   = DEFAULT_SOCKET_PATH;
+    opts->provider      = NULL;
     opts->poll_interval = DEFAULT_POLL_INTERVAL;
     opts->auth_timeout  = DEFAULT_AUTH_TIMEOUT;
     opts->debug         = 0;
@@ -331,6 +340,8 @@ static void parse_arguments(int argc, const char **argv, struct module_options *
             opts->debug = 1;
         } else if (strncmp(argv[i], "socket=", 7) == 0) {
             opts->socket_path = argv[i] + 7;
+        } else if (strncmp(argv[i], "provider=", 9) == 0) {
+            opts->provider = argv[i] + 9;
         } else if (strncmp(argv[i], "poll_interval=", 14) == 0) {
             int v = atoi(argv[i] + 14);
             if (v >= MIN_POLL_INTERVAL && v <= MAX_POLL_INTERVAL) opts->poll_interval = v;
@@ -406,11 +417,12 @@ struct auth_ctx {
     const char *service;
     const char *rhost;
     const char *tty;
+    const char *provider;
 };
 
 static int send_auth_cb(int sock, void *ctx) {
     struct auth_ctx *c = (struct auth_ctx *)ctx;
-    return send_auth_request(sock, c->username, c->service, c->rhost, c->tty);
+    return send_auth_request(sock, c->username, c->service, c->rhost, c->tty, c->provider);
 }
 
 static int send_check_cb(int sock, void *ctx) {
@@ -540,7 +552,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
     log_pam_message(LOG_INFO, "Authenticating user: %s via device flow", username);
 
     /* Phase 1: start the device flow. */
-    struct auth_ctx actx = { username, service, rhost, tty };
+    struct auth_ctx actx = { username, service, rhost, tty, opts.provider };
     if (broker_roundtrip(&opts, send_auth_cb, &actx, &r) != 0) {
         return PAM_AUTHINFO_UNAVAIL;
     }

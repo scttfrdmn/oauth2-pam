@@ -20,6 +20,8 @@ DEFAULT_CASES=(
     denied_by_github
     mapped_user_mismatch
     mapped_user_match
+    named_provider
+    unknown_provider_refused
 )
 
 say() { printf '\n==> %s\n' "$*"; }
