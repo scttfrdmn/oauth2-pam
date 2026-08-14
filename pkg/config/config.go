@@ -42,6 +42,16 @@ var SupportedProviderTypes = []string{"github"}
 // mode is discovering it during an incident, when the records are wanted.
 var SupportedAuditOutputTypes = []string{"stdout", "file", "syslog"}
 
+// SupportedLogLevels lists the values server.log_level may take. They are
+// zerolog's own names, because cmd/broker hands the value to zerolog.ParseLevel.
+//
+// Validate checks against it so that a misspelled level is a startup error
+// naming the four that exist. zerolog would otherwise reject it after the
+// broker had already logged its startup lines, and "trace" — which it accepts,
+// and which this project does not use — would quietly turn on a level nothing
+// documents.
+var SupportedLogLevels = []string{"debug", "info", "warn", "error"}
+
 // Config represents the complete configuration for the oauth2-pam broker
 type Config struct {
 	Server         ServerConfig         `mapstructure:"server"`
@@ -59,7 +69,13 @@ type Config struct {
 // but was ignored was worse than no setting at all.
 type ServerConfig struct {
 	SocketPath string `mapstructure:"socket_path"`
-	LogLevel   string `mapstructure:"log_level"`
+
+	// LogLevel is one of SupportedLogLevels. cmd/broker applies it once the config
+	// is read, and --log-level overrides it when that flag is actually given — for
+	// the length of one debugging run, without editing the file. It was parsed and
+	// read by nothing until v0.4.0, so the broker logged at the flag's default
+	// whatever this said.
+	LogLevel string `mapstructure:"log_level"`
 
 	// ReadTimeout bounds how long the broker waits for a complete request
 	// from a connected client; WriteTimeout bounds sending the response.
@@ -239,10 +255,15 @@ type RateLimiting struct {
 	MaxConcurrentAuths   int `mapstructure:"max_concurrent_auths"`
 }
 
-// AuditConfig contains audit logging configuration
+// AuditConfig contains audit logging configuration.
+//
+// There is deliberately no format field. It was parsed, defaulted to "json", and
+// read by nothing: pkg/security marshals every record as JSON whatever it said,
+// so `format: text` was accepted, ignored, and believed. One format is the honest
+// number of formats this broker has, and a key that can only hold the value it
+// already has is a choice that does not exist.
 type AuditConfig struct {
 	Enabled bool          `mapstructure:"enabled"`
-	Format  string        `mapstructure:"format"`
 	Outputs []AuditOutput `mapstructure:"outputs"`
 	Events  []string      `mapstructure:"events"`
 }
@@ -352,7 +373,6 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("mapper.min_uid", 1000)
 
 	v.SetDefault("audit.enabled", true)
-	v.SetDefault("audit.format", "json")
 	v.SetDefault("audit.events", KnownAuditEvents)
 }
 
@@ -360,6 +380,17 @@ func setDefaults(v *viper.Viper) {
 func (c *Config) Validate() error {
 	if c.Server.SocketPath == "" {
 		return fmt.Errorf("server.socket_path is required")
+	}
+
+	// Empty means "unset": LoadConfig always supplies the default, so an empty
+	// value is a Config built in code, which keeps the level cmd/broker's flag
+	// chose rather than being an error. A non-empty one is a promise to honour, and
+	// this setting spent three releases being read, ignored, and believed — an
+	// operator who sets info to keep debug out of syslog, or debug during an
+	// incident, changed nothing.
+	if c.Server.LogLevel != "" && !isSupportedLogLevel(c.Server.LogLevel) {
+		return fmt.Errorf("server.log_level %q is not supported (supported: %s)",
+			c.Server.LogLevel, strings.Join(SupportedLogLevels, ", "))
 	}
 
 	if len(c.Providers) == 0 {
@@ -502,6 +533,15 @@ func isSupportedProviderType(t string) bool {
 func isSupportedAuditOutputType(t string) bool {
 	for _, s := range SupportedAuditOutputTypes {
 		if s == t {
+			return true
+		}
+	}
+	return false
+}
+
+func isSupportedLogLevel(l string) bool {
+	for _, s := range SupportedLogLevels {
+		if s == l {
 			return true
 		}
 	}

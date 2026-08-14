@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/scttfrdmn/oauth2-pam/pkg/security/keys"
 )
 
@@ -38,7 +39,7 @@ func validConfig() *Config {
 			MaxTokenAge:        24 * time.Hour,
 			RateLimiting:       RateLimiting{MaxRequestsPerMinute: 60, MaxConcurrentAuths: 10},
 		},
-		Audit: AuditConfig{Enabled: true, Format: "json", Events: KnownAuditEvents},
+		Audit: AuditConfig{Enabled: true, Events: KnownAuditEvents},
 	}
 }
 
@@ -60,6 +61,14 @@ func TestValidate(t *testing.T) {
 		wantErr string // substring; empty means the config must be accepted
 	}{
 		{"no socket path", func(c *Config) { c.Server.SocketPath = "" }, "socket_path"},
+
+		// The level was read by nothing until v0.4.0, so nothing rejected a value
+		// either: `log_level: verbose` was accepted, ignored, and believed.
+		{"misspelled log level", func(c *Config) { c.Server.LogLevel = "verbose" }, "log_level"},
+		{"zerolog's trace level is not one of ours", func(c *Config) { c.Server.LogLevel = "trace" }, "log_level"},
+		{"unset log level is left to the flag", func(c *Config) { c.Server.LogLevel = "" }, ""},
+		{"debug log level", func(c *Config) { c.Server.LogLevel = "debug" }, ""},
+		{"error log level", func(c *Config) { c.Server.LogLevel = "error" }, ""},
 		{"no providers", func(c *Config) { c.Providers = nil }, "at least one provider"},
 		{"provider without name", func(c *Config) { c.Providers[0].Name = "" }, "name is required"},
 		{"provider without type", func(c *Config) { c.Providers[0].Type = "" }, "type is required"},
@@ -177,6 +186,18 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+// TestSupportedLogLevelsAreZerologLevels pins the allowlist to the parser that
+// applies it: cmd/broker hands server.log_level to zerolog.ParseLevel, so a level
+// Validate accepts and zerolog rejects would be a broker that dies immediately
+// after passing validation.
+func TestSupportedLogLevelsAreZerologLevels(t *testing.T) {
+	for _, l := range SupportedLogLevels {
+		if _, err := zerolog.ParseLevel(l); err != nil {
+			t.Errorf("SupportedLogLevels contains %q, which zerolog rejects: %v", l, err)
+		}
+	}
+}
+
 // TestKnownAuditEventsAreAllValid guards the defaults against the mistake this
 // list was introduced to fix: shipping an allowlist that Validate itself would
 // reject, or that omits events the broker emits.
@@ -244,6 +265,11 @@ func TestLoadConfig(t *testing.T) {
 
 	if cfg.Server.SocketPath != "/tmp/oauth2-pam-test.sock" {
 		t.Errorf("socket_path = %q", cfg.Server.SocketPath)
+	}
+	// The level the file asks for has to reach the caller: cmd/broker applies it,
+	// and for three releases nothing did.
+	if cfg.Server.LogLevel != "debug" {
+		t.Errorf("log_level = %q, want the configured %q", cfg.Server.LogLevel, "debug")
 	}
 	if cfg.Server.ReadTimeout != 10*time.Second {
 		t.Errorf("read_timeout = %s, want 10s", cfg.Server.ReadTimeout)
@@ -323,6 +349,9 @@ func TestLoadConfigRejectsUnknownKeys(t *testing.T) {
 			sampleYAML + "  outputs:\n    - type: file\n      path: /tmp/a.log\n      url: https://siem.example.com/ingest\n",
 			"url",
 		},
+		// audit.format went the same way: parsed, defaulted to json, and read by
+		// nothing, while every record was JSON regardless.
+		{"removed audit format field", sampleYAML + "  format: json\n", "format"},
 	}
 
 	for _, tc := range tests {

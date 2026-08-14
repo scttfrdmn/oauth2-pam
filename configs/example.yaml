@@ -3,7 +3,10 @@
 
 server:
   socket_path: /var/run/oauth2-pam/broker.sock
-  log_level: info                          # debug | info | warn | error
+  # debug | info | warn | error. Anything else is a startup error. The broker's
+  # --log-level flag overrides this when it is given, so a debugging run does not
+  # need this file edited; with no flag, this is what applies.
+  log_level: info
 
   # Deadlines applied to each IPC connection. Raise read_timeout if a slow
   # identity-mapping service makes the PAM module's calls time out.
@@ -292,8 +295,11 @@ security:
 
 audit:
   enabled: true
-  format: json
 
+  # There is no format key. Records are JSON, always: the old one was parsed,
+  # defaulted to json, and read by nothing, so `format: text` was accepted and
+  # ignored. It is now rejected instead.
+  #
   # type is one of file, stdout or syslog. An unrecognised one is a startup
   # error: it used to fall back to stdout, so `type: fille` gave a broker that
   # started cleanly and wrote its audit trail somewhere nobody was watching.
