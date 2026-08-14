@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/scttfrdmn/oauth2-pam/actions/workflows/ci.yml/badge.svg)](https://github.com/scttfrdmn/oauth2-pam/actions/workflows/ci.yml)
 [![Security](https://github.com/scttfrdmn/oauth2-pam/actions/workflows/security.yml/badge.svg)](https://github.com/scttfrdmn/oauth2-pam/actions/workflows/security.yml)
-[![version](https://img.shields.io/badge/version-0.2.0-blue)](https://github.com/scttfrdmn/oauth2-pam/releases)
+[![version](https://img.shields.io/badge/version-0.3.0-blue)](https://github.com/scttfrdmn/oauth2-pam/releases)
 
 A Linux PAM module that authenticates users via OAuth2 Device Flow, with GitHub as the primary provider. Users authenticate by visiting a URL on their phone and approving the request — no passwords, no SSH key distribution.
 
