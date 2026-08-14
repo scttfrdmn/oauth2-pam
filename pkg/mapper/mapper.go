@@ -102,7 +102,13 @@ type Result struct {
 	// LocalUser is the Unix username
 	LocalUser string `json:"local_user"`
 
-	// Groups is the list of supplementary Unix groups to add the user to
+	// Groups is the list of supplementary Unix groups the mapper says this
+	// identity should have.
+	//
+	// Advisory only, as of v0.3.0: it travels to the PAM module in the broker's
+	// reply and the module discards it. Nothing here calls setgroups(2). See
+	// issue #39 for what applying it would require — chiefly a guard against a
+	// mapper handing out wheel or docker, which is a root grant.
 	Groups []string `json:"groups"`
 }
 
@@ -138,6 +144,16 @@ func New(cfg config.MapperConfig) *Chain {
 		allowSystem[strings.ToLower(name)] = true
 	}
 
+	// groups: in a rule is accepted, transported, and then discarded by the PAM
+	// module. Say so at startup rather than letting an administrator write an
+	// access-control rule that relies on it: the quiet version of this is someone
+	// believing a group grant is in force when nothing ever applied it.
+	if named := groupsNamedInRules(cfg.Rules); len(named) > 0 {
+		log.Warn().
+			Strs("groups", named).
+			Msg("mapper: rule groups are advisory and are not applied to the session (issue #39)")
+	}
+
 	return &Chain{
 		cfg:         cfg,
 		minUID:      minUID,
@@ -153,6 +169,25 @@ func New(cfg config.MapperConfig) *Chain {
 			},
 		},
 	}
+}
+
+// groupsNamedInRules returns the distinct group names any tier-1 rule declares,
+// in the order they first appear. Only rules: the enrollment file is edited
+// while the broker runs, and tiers 2 and 3 are not readable from here, so the
+// startup warning covers the case that is statically knowable and the docs cover
+// the rest.
+func groupsNamedInRules(rules []config.MappingRule) []string {
+	seen := make(map[string]bool)
+	var named []string
+	for _, r := range rules {
+		for _, g := range r.Groups {
+			if g != "" && !seen[g] {
+				seen[g] = true
+				named = append(named, g)
+			}
+		}
+	}
+	return named
 }
 
 // Map resolves the authenticated identity to a local Unix user.

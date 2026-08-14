@@ -22,6 +22,7 @@ DEFAULT_CASES=(
     mapped_user_match
     system_account_name_refused
     below_uid_floor_refused
+    mapped_groups_not_applied
     named_provider
     unknown_provider_refused
 )
@@ -50,9 +51,36 @@ dump_logs() {
     "${COMPOSE[@]}" logs --no-color --tail 40 client
 }
 
+# A case that asserts a negative needs its positive half established first, and
+# sometimes that lives on the server side where cases.sh cannot reach. Define
+# precheck_<case> here and run_case will require it to pass; a failing precheck
+# fails the case rather than skipping it, because a check that quietly stops
+# checking is the thing this harness exists to prevent.
+#
+# mapped_groups_not_applied asserts that the session does not carry the mapped
+# group. That is only evidence if the broker's mapper produced one, so ask the
+# broker — in its own container, against its own config — before believing the
+# client side.
+precheck_mapped_groups_not_applied() {
+    local out
+    out=$("${COMPOSE[@]}" exec -T broker \
+            oauth2-pam-admin --config /etc/oauth2-pam/broker.yaml \
+            test-mapping --login alice --org acme 2>&1)
+    printf '%s\n' "$out" | sed 's/^/      admin| /'
+    if ! printf '%s' "$out" | grep -q '"devs"'; then
+        printf '    FAIL: the broker mapped alice with no groups, so the case below would be vacuous\n'
+        return 1
+    fi
+}
+
 run_case() {
     local name="$1"
     say "case: ${name}"
+    if declare -F "precheck_${name}" >/dev/null && ! "precheck_${name}"; then
+        FAILED+=("$name")
+        dump_logs
+        return
+    fi
     if "${COMPOSE[@]}" exec -T client /opt/tests/cases.sh "$name"; then
         PASSED+=("$name")
     else

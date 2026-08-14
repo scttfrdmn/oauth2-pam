@@ -319,6 +319,22 @@ And four more in the broker's own defaults:
 
 ### Changed
 
+- **Mapper `groups` stay advisory, and are no longer advisory *quietly*.** The
+  broker computes supplementary groups, records them in the session and the audit
+  trail, and sends them to the PAM module, which discards them — nothing here
+  calls `setgroups(2)`, so `groups: [sudo]` has never granted sudo. That was
+  documented and unverified; it is now measured from both ends.
+  `internal/ipc/e2e_test.go` asserts the groups reach the wire, and the container
+  case `mapped_groups_not_applied` drives a real `ssh` login and asserts `id -Gn`
+  in the resulting session does not contain them — with the group present in
+  `/etc/group` and the broker's own mapping checked first, so the negative cannot
+  pass because the group was missing or was never mapped. `mapper.New` now logs a
+  warning at startup naming any groups a rule declares, so a config relying on
+  them says so in the log rather than doing nothing in silence. Applying them
+  needs a guard against a mapper granting `wheel` or `docker`, which is tracked
+  separately. ([#12](https://github.com/scttfrdmn/oauth2-pam/issues/12),
+  [#39](https://github.com/scttfrdmn/oauth2-pam/issues/39))
+
 - **`audit.outputs[].type: syslog` now writes to syslog.** It used to hand the
   record to the broker's own logger with the configured facility attached as a
   JSON field, which under systemd meant the journal and elsewhere meant wherever

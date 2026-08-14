@@ -847,7 +847,11 @@ PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh, int flags,
     (void)pamh; (void)flags;
     parse_arguments(argc, argv, &opts);
     /* No credentials to establish: the broker holds the OAuth2 token, and the
-       mapper's supplementary groups are advisory (see issue #12). */
+       mapper's supplementary groups are advisory — the reply carries them and
+       this module never parses them, so no setgroups(2) happens here. The
+       container case mapped_groups_not_applied asserts that from the outside.
+       Applying them needs a guard against a mapper granting wheel or docker;
+       see issue #39. */
     return PAM_SUCCESS;
 }
 

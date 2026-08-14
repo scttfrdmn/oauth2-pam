@@ -29,6 +29,10 @@ polls()   { curl -fsS "$CONTROL_URL/control/state" | jq -r '.polls'; }
 # attempt_login runs one ssh login as $1 and records its exit status and
 # duration. AUTHORIZE_ON_PROMPT is passed through to askpass.sh, which is what
 # makes approval happen *after* the prompt rather than before the flow starts.
+#
+# The remote command is single-quoted on purpose (shellcheck says SC2016 about
+# it): it has to reach sshd unexpanded, because it reports the identity and the
+# supplementary groups of the session PAM produced, not of this shell.
 attempt_login() {
     local user="$1" start end
     : >"$PROMPT_LOG"
@@ -48,7 +52,7 @@ attempt_login() {
             -o PubkeyAuthentication=no \
             -o NumberOfPasswordPrompts=1 \
             -o ConnectTimeout=10 \
-            "${user}@127.0.0.1" 'echo LOGIN_OK:$(id -un)' >"$SSH_LOG" 2>&1
+            "${user}@127.0.0.1" 'echo LOGIN_OK:$(id -un) GROUPS:$(id -Gn | tr " " ",")' >"$SSH_LOG" 2>&1
     LOGIN_RC=$?
     end=$(date +%s)
     ELAPSED=$((end - start))
@@ -73,6 +77,23 @@ expect_login_refused() {
     if grep -q 'LOGIN_OK' "$SSH_LOG"; then
         fail "a command ran on the remote host — the login was not refused"
     fi
+}
+
+# expect_session_groups_exclude asserts a group is absent from the session's
+# supplementary groups, read from `id -Gn` inside the login itself rather than
+# from anything the module reported about itself.
+expect_session_groups_exclude() {
+    local group="$1" got
+    got=$(grep -o 'GROUPS:[^ ]*' "$SSH_LOG" | head -1)
+    got="${got#GROUPS:}"
+    if [ -z "$got" ]; then
+        fail "the session reported no group list, so nothing was measured"
+        return
+    fi
+    log "session groups: ${got}"
+    case ",${got}," in
+        *",${group},"*) fail "the session has supplementary group ${group}; mapped groups are documented as advisory" ;;
+    esac
 }
 
 expect_prompt_contains() {
@@ -197,6 +218,32 @@ case_below_uid_floor_refused() {
     AUTHORIZE_ON_PROMPT=1 attempt_login pgsvc
     expect_login_refused
     expect_prompted
+}
+
+# Mapper groups are advisory: the broker computes them and puts them in the reply,
+# and the PAM module discards them. This case pins that, so the statement in the
+# README is a measurement rather than a belief — if someone wires up setgroups(2)
+# (issue #39), this case fails and has to be inverted deliberately.
+#
+# The two halves of the claim are checked in different places, on purpose. That the
+# broker really produced groups is checked by the driver before this runs (see
+# precheck_mapped_groups_not_applied in run-tests.sh) and by
+# internal/ipc/e2e_test.go; that the session does not have them is checked here.
+# Without the first half this case would pass just as well if the groups had never
+# been mapped at all.
+case_mapped_groups_not_applied() {
+    control reset
+    if ! getent group devs >/dev/null; then
+        fail "group devs does not exist in this container; the assertion below would be vacuous"
+        return
+    fi
+    if id -nG alice | tr ' ' '\n' | grep -qx devs; then
+        fail "alice is already a member of devs in /etc/group; this case cannot tell PAM's doing from the image's"
+        return
+    fi
+    AUTHORIZE_ON_PROMPT=1 attempt_login alice
+    expect_login_ok alice
+    expect_session_groups_exclude devs
 }
 
 # provider= names which configured provider to authenticate against. The harness

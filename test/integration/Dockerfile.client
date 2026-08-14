@@ -55,10 +55,14 @@ RUN dir="$(dirname "$(dpkg -L libpam-modules | grep -m1 '/pam_permit\.so$')")" \
 # shell, so a case that refuses them cannot be passing because the login was
 # impossible anyway. The UIDs must match Dockerfile.broker, which is where the
 # floor is actually evaluated.
+# devs is the group the mapper rule declares. It exists, and alice is *not* in
+# it, which is what makes mapped_groups_not_applied evidence: if the group were
+# missing, a session without it would prove nothing.
 RUN useradd --create-home --shell /bin/bash --password '*' --uid 1001 alice \
  && useradd --create-home --shell /bin/bash --password '*' --uid 1002 bob \
  && useradd --create-home --shell /bin/bash --password '*' --uid 400  pgsvc \
  && useradd --create-home --shell /bin/bash --password '*' --uid 1500 postgres \
+ && groupadd --gid 4200 devs \
  && mkdir -p /run/sshd
 
 COPY test/integration/pam-sshd /etc/pam.d/sshd

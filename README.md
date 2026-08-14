@@ -316,7 +316,9 @@ All `match` fields within a rule are ANDed, and matching is case-insensitive. `l
 | `login` | The identity's username at the provider. Same as `github_login`, and wins if both are set |
 | `claims: {name: value}` | The named claim must carry that value. GitHub asserts `org` and `team`; other providers assert e.g. `group` or `role`. Every named claim must match |
 
-`groups` is **advisory today**: the broker records it in the session and the audit trail, but the PAM module does not apply supplementary groups to the login. Manage group membership with the usual system tools. See [#12](https://github.com/scttfrdmn/oauth2-pam/issues/12).
+`groups` is **advisory**: the broker records it in the session and the audit trail and sends it to the PAM module, which discards it. Nothing here calls `setgroups(2)`, so `groups: [sudo]` grants no sudo. Manage group membership with the usual system tools.
+
+That is measured, not asserted. `internal/ipc/e2e_test.go` checks the groups reach the wire, and the container case `mapped_groups_not_applied` logs in over real `ssh` and checks `id -Gn` in the resulting session does not contain them; the broker's own mapping is checked first so the negative cannot pass vacuously. `mapper.New` also logs a warning at startup naming any groups a rule declares, so a config relying on them is not silently ignored. Applying them needs a guard against a mapper handing out `wheel` or `docker` — see [#39](https://github.com/scttfrdmn/oauth2-pam/issues/39).
 
 ### External script (Tier 2)
 
@@ -446,7 +448,7 @@ oauth2-pam/
 
 - **GitHub is the only provider shipped.** The broker, mapper, and audit trail work in provider-neutral terms (`pkg/provider`), and a new provider means implementing that interface and adding one line to `pkg/provider/registry` — but GitHub, including GitHub Enterprise Server via `github.base_url`, is the only implementation in the tree today.
 - **The local Unix account must already exist**, and the mapping must resolve to the account being logged into.
-- **Supplementary `groups` from the mapper are not applied** to the session ([#12](https://github.com/scttfrdmn/oauth2-pam/issues/12)).
+- **Supplementary `groups` from the mapper are not applied** to the session. The broker sends them, the module discards them, and the container harness asserts as much on every run; the broker warns at startup if a rule declares any ([#39](https://github.com/scttfrdmn/oauth2-pam/issues/39)).
 - **The login requires an interactive terminal**, because the user has to acknowledge the prompt. `scp`, `rsync`, and non-interactive `ssh` cannot complete this flow; keep a key-based or password path available for automation.
 - **No test talks to real GitHub.** Every layer below that is exercised in CI on every pull request and every push to `main`: the broker end to end against a fake GitHub (`internal/ipc`), the C bridge's own boundaries (`test/cbridge`), real `ssh` logins through a real `sshd` with `oauth2_pam.so` in its PAM stack against a real broker (`test/integration`), and mutation checks that require both C suites to fail when the defects they guard are put back. What none of them prove is behaviour against the live device endpoint — its actual `slow_down` and rate-limit responses, and a real interactive terminal — so treat a first deployment as the thing that verifies that.
 

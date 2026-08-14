@@ -189,13 +189,17 @@ mapper:
     #     github_login: octocat
     #   local_user: octocat
 
-  # `groups:` is parsed and reported but NOT applied — this module authenticates,
-  # it does not manage group membership, and nothing here adds a user to a Unix
-  # group. A rule saying `groups: [sudo]` grants no sudo. Manage privilege with
-  # the host's own groups (or your configuration management), not here. The
-  # shipped example deliberately no longer includes a `sudo` line, so that the day
-  # groups do get applied nobody is surprised by one.
-  # See https://github.com/scttfrdmn/oauth2-pam/issues/12
+  # `groups:` is parsed, reported, and sent to the PAM module, which discards it —
+  # this module authenticates, it does not manage group membership, and nothing
+  # here calls setgroups(2). A rule saying `groups: [sudo]` grants no sudo. Manage
+  # privilege with the host's own groups (or your configuration management), not
+  # here. The shipped example deliberately no longer includes a `sudo` line, so
+  # that the day groups do get applied nobody is surprised by one.
+  #
+  # The broker logs a warning at startup naming any groups a rule declares, so
+  # this is not silently ignored, and the container harness asserts on every run
+  # that a real ssh session does not carry them.
+  # See https://github.com/scttfrdmn/oauth2-pam/issues/39
 
   # --- Tier 2: external script (optional) ---
   # The script receives an Identity JSON object on stdin and must write

@@ -32,6 +32,11 @@ mapper:
     - match:
         github_org: acme
       local_user: "{{ .Login }}"
+      # Advisory, and the harness proves it: the broker puts these on the wire and
+      # the PAM module discards them, which mapped_groups_not_applied asserts by
+      # checking id -Gn in the resulting session. devs exists in both containers,
+      # so a session without it is the module's decision and not a missing group.
+      groups: ["devs"]
 
 authentication:
   token_lifetime: 1h

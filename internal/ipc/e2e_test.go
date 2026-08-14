@@ -262,6 +262,16 @@ func TestFullFlowAuthorizes(t *testing.T) {
 	if resp.Metadata["provider_login"] != "alice" {
 		t.Errorf("metadata.provider_login = %q, want alice", resp.Metadata["provider_login"])
 	}
+
+	// The mapper rule in this harness declares groups: [devs], and the broker
+	// puts them on the wire. This is the positive half of "mapped groups are
+	// advisory" (issue #39): the value is computed and transmitted here, and the
+	// container case mapped_groups_not_applied asserts the PAM module discards
+	// it. Without this assertion that case would also pass if the groups had
+	// never left the broker, which is a different bug wearing the same result.
+	if len(resp.Groups) != 1 || resp.Groups[0] != "devs" {
+		t.Errorf("groups = %v, want [devs] on the wire", resp.Groups)
+	}
 }
 
 // TestMappedUserMustMatchRequestedLogin covers the second half of the bypass:
