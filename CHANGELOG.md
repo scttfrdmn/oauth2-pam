@@ -7,6 +7,219 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+A third adversarial review round, on a tree that had already survived two. It found
+27 things, which is the argument for keeping the rounds going rather than declaring
+the code reviewed: three of them were fail-**open** reads of the field that decides a
+login, and none of the three were reachable by the previous rounds' methods.
+
+**Upgrade notes.** `broker.yaml` must be mode 0600 regardless of where the client
+secret lives — the check used to apply only when the secret was inline, which left
+the file holding the token-encryption key unchecked in every deployment that did the
+right thing with its secret. A deployment relying on the old behaviour will refuse to
+start until it is chmodded; the error names the file and the command. A negative
+`mapper.min_uid` is also now rejected rather than silently disabling the UID floor.
+
+### Fixed
+
+- **`"success":"false"` read as true in the C module.** `json_object_get_boolean`
+  coerces: any non-empty string and any non-zero number is true. So the one field the
+  module consults to decide whether a login succeeded accepted a *string* `"false"`
+  as a grant. The field is now type-checked against `json_type_boolean` strictly, and
+  anything else is a parse failure rather than a value. The careful version of this
+  read was already sitting four lines below it, on `poll_interval` — which is the
+  useful lesson: the same file got it right where the stakes were lower.
+  ([#60](https://github.com/scttfrdmn/oauth2-pam/issues/60))
+
+- **A per-syscall receive timeout is not a per-message one.** `SO_RCVTIMEO` bounds
+  each `recv()`, so a broker drip-feeding one byte at a time reset the clock on every
+  byte and could hold a login open far past the deadline the module believed it had
+  set. The budget is now read off the socket once and decremented across the whole
+  transfer, so it bounds the message.
+  ([#57](https://github.com/scttfrdmn/oauth2-pam/issues/57))
+
+- **The device-flow poll had no deadline.** It ran on a cancel-only context, so
+  nothing but the client hanging up ended it.
+  ([#55](https://github.com/scttfrdmn/oauth2-pam/issues/55))
+
+- **An expired session could still be activated.** The compare-and-swap that
+  activates a session tested its status and creation time but never `ExpiresAt` — so
+  it succeeded on an already-expired session, and the mutation that followed rewrote
+  the expiry into the future. Expiry is now part of the CAS.
+  ([#55](https://github.com/scttfrdmn/oauth2-pam/issues/55))
+
+- **The concurrent-session cap could be overshot by any number of simultaneous
+  logins.** Sessions were counted under a read lock, the lock released, and the new
+  session inserted afterwards — so N calls arriving together all read the same count
+  and all inserted. Counting and insertion now happen under one write lock, via a
+  placeholder reservation.
+  ([#59](https://github.com/scttfrdmn/oauth2-pam/issues/59))
+
+- **A deadline-aborted provider call was retried as transient.**
+  `context.DeadlineExceeded` satisfies `net.Error`, so the classifier that decides
+  what is worth retrying could not tell "the network is flaky" from "we ran out of
+  time", and retried the second as if it were the first.
+  ([#79](https://github.com/scttfrdmn/oauth2-pam/issues/79))
+
+- **The QR code was on the wire twice, and a long provider URL overflowed the
+  client's buffer.** The art was serialized inside `instructions` and again in
+  `qr_code`, which made the real github.com baseline 4.9 KB rather than the "2–3 KiB"
+  this project had documented — and a 300-byte `verification_uri` reached 17.6 KB,
+  past the module's 16 KiB `MAX_RESPONSE_SIZE`, where `strncpy` truncates in silence
+  and the client is left with an object it cannot parse. The art is now serialized
+  once, the URL it is drawn from is bounded at 200 bytes, and the broker holds itself
+  to the same 16 KiB cap it expects of a client, substituting `RESPONSE_TOO_LARGE`
+  rather than writing a reply that cannot be read. Worth recording that the size
+  ceiling depends on the *encoder's mode*: an uppercase-and-digits URL gets
+  alphanumeric mode with a much larger capacity, so a 3 KB URL still encodes, and a
+  byte-mode-only reading of the limits understates the dangerous band by a kilobyte.
+  ([#56](https://github.com/scttfrdmn/oauth2-pam/issues/56))
+
+- **Checking a path is not checking the bytes read from it.** Secret loading did
+  `os.Stat` and then `os.ReadFile` — two resolutions of the same name, with a window
+  between them. It now opens with `O_NOFOLLOW` and stats the *file descriptor*, so the
+  permissions checked belong to the bytes returned.
+  ([#58](https://github.com/scttfrdmn/oauth2-pam/issues/58))
+
+- **A file-mode check is defeated by a writable directory.** Anyone who can write the
+  containing directory can rename a compliant file out and a hostile one in, whatever
+  the mode on the original. The directory is now checked too, with the sticky-bit case
+  exempted and the reason stated where the exemption is made.
+  ([#58](https://github.com/scttfrdmn/oauth2-pam/issues/58))
+
+- **Two of three secret sources skipped the config-file permission check.** Only the
+  inline branch checked `broker.yaml` itself, so a deployment that moved its client
+  secret into a file or the environment — the recommended practice — lost the check on
+  the file that still holds the token-encryption key. It is now unconditional.
+  ([#58](https://github.com/scttfrdmn/oauth2-pam/issues/58))
+
+- **An empty GitHub `login` was a wildcard.** An enrollment lookup for `""` matched,
+  which is the wrong answer to a malformed API response. Refused in `Store.Find`,
+  `Store.Add`, the mapper, and the enroll CLI.
+  ([#80](https://github.com/scttfrdmn/oauth2-pam/issues/80))
+
+- **The `audit.events` allowlist filtered before the critical-event check.** The
+  events that exist specifically to be undroppable were dropped by any allowlist that
+  did not happen to name them. The critical check now runs first.
+  ([#69](https://github.com/scttfrdmn/oauth2-pam/issues/69))
+
+- **`CheckRedirect` compared only the hostname**, while the pagination code in the
+  same package pinned scheme, host and port. Both now pin `scheme://hostname`, so a
+  redirect cannot downgrade the transport.
+  ([#63](https://github.com/scttfrdmn/oauth2-pam/issues/63))
+
+- **Nothing bounded a provider's pagination.** `per_page` is a request, not a
+  guarantee, and no code checked that a server honoured it — so 20 pages inside a 1 MB
+  per-response limit was hundreds of thousands of retained org and team entries. The
+  bound is now on entries, not pages.
+  ([#62](https://github.com/scttfrdmn/oauth2-pam/issues/62))
+
+- **`user_agent` and `device_id` were unbounded and unvalidated,** and `metadata` was
+  checked for NUL bytes and nothing else. Every request field now goes through one
+  table with an explicit limit, so adding a field without bounding it takes a
+  deliberate omission rather than an oversight.
+  ([#67](https://github.com/scttfrdmn/oauth2-pam/issues/67))
+
+- **An over-cap request body was reported as "unexpected EOF",** which tells a client
+  its serialization is broken when the actual problem is size — and a client told that
+  will not go looking at how much it sent.
+  ([#67](https://github.com/scttfrdmn/oauth2-pam/issues/67))
+
+- **A git tag interpolated into a `run:` block is shell injection.** Release workflow
+  steps built commands with `${{ steps.vars.outputs.* }}` derived from the pushed tag;
+  those values now arrive via `env:` and are quoted.
+  ([#70](https://github.com/scttfrdmn/oauth2-pam/issues/70))
+
+- **The installer passed the generated token-encryption key in argv,** where
+  `/proc/<pid>/cmdline` is world-readable for the life of the process — so every local
+  account could read the key of a broker being installed. It is now fed to
+  `sed -i -f -` over a pipe.
+  ([#77](https://github.com/scttfrdmn/oauth2-pam/issues/77))
+
+- **The symbol check in the installer matched a substring,** so it could report
+  entry points present that were not, and it silently skipped itself when `nm` was
+  absent. One shared `scripts/verify-pam-symbols.sh` now does it per symbol, and four
+  divergent copies of that loop are gone.
+  ([#76](https://github.com/scttfrdmn/oauth2-pam/issues/76))
+
+- **The admin client reported a pending device flow as a successful test.** `TestAuth`
+  switched on the wrong field; it now requires the `check_session` result to have
+  actually succeeded, and it sends and checks `protocol_version` like every other
+  client of this contract.
+  ([#83](https://github.com/scttfrdmn/oauth2-pam/issues/83))
+
+- **The integration harness could not start the broker after the permission fix.**
+  Its `broker.yaml` was `COPY`ed and landed 0644, so all 11 cases failed at "the
+  broker never created its socket". Found by running the harness against the collapsed
+  tree — no single remediation branch could have seen it. The fix is a `chmod` in
+  `Dockerfile.broker`, which is exactly what an operator now has to do, and that is
+  the point of having a harness.
+
+### Changed
+
+- **The C module is compiled with hardening flags**: stack protector, RELRO with
+  `BIND_NOW`, and `_FORTIFY_SOURCE=2`. Level 2 rather than 3 deliberately — 3 needs
+  gcc 12 with glibc 2.35, and on older enterprise distributions `features.h` emits a
+  `#warning` that `-Werror` turns into a failed build. `-fcf-protection` is omitted
+  for the same class of reason: it is x86-only and breaks the aarch64 build. Verified
+  empirically on both architectures: `readelf` reports `SYMBOLIC BIND_NOW`, a
+  `GNU_RELRO` segment and `__stack_chk_fail` after the change, and neither RELRO nor
+  any `_chk` symbol before it.
+  ([#64](https://github.com/scttfrdmn/oauth2-pam/issues/64))
+
+- **`Token.Fingerprint` is a real fingerprint** — `hex(sha256(token)[:16])` — rather
+  than an elided slice of the token itself. A prefix of a credential in a log is a
+  prefix of a credential.
+  ([#82](https://github.com/scttfrdmn/oauth2-pam/issues/82))
+
+- **A zoned IPv6 literal is handled rather than rejected.** `fe80::1%eth0` fits the
+  field's 45-byte bound and is the one address shape a well-meaning validator breaks,
+  because `inet_pton` and `net.ParseIP` both fail on the zone. The zone is now split
+  off and validated separately.
+  ([#61](https://github.com/scttfrdmn/oauth2-pam/issues/61))
+
+- **`log-level` and `audit.format` were parsed and ignored.** `log-level` is now
+  honoured and validated against the levels that exist; `audit.format` is deleted
+  rather than kept as a field that does nothing. `server.*_timeout` is capped at five
+  minutes, since a longer one cannot help a login that lives inside sshd's
+  `LoginGraceTime`.
+  ([#72](https://github.com/scttfrdmn/oauth2-pam/issues/72),
+  [#73](https://github.com/scttfrdmn/oauth2-pam/issues/73))
+
+- **A negative `mapper.min_uid` is rejected.** It used to disable the UID floor, which
+  was documented as a feature; a config that silently turns off the check keeping
+  system accounts unmappable is not a feature worth keeping.
+  ([#81](https://github.com/scttfrdmn/oauth2-pam/issues/81))
+
+- **`error_message` no longer carries provider-chosen text to the client.** Provider
+  strings reaching a prompt that root draws before authentication is the defect class
+  this project already fixed once; the same rule now applies to the error field.
+  ([#74](https://github.com/scttfrdmn/oauth2-pam/issues/74))
+
+- **The specification's claim that an over-size request is "refused before it is
+  decoded" was corrected rather than implemented.** No implementation of this framing
+  can honour it, and none did: a request is a bare JSON object with no length prefix,
+  so nothing announces its size in advance and a receiver learns a body is too long
+  only by reaching the cap while reading it. What the cap guarantees is the
+  allocation, not the ordering — and version 1 now says which of the two failed,
+  because a body truncated at the cap looks to a parser like malformed input.
+  ([#67](https://github.com/scttfrdmn/oauth2-pam/issues/67))
+
+### Added
+
+- **`AuditLogger.LogAuthEventErr`**, so a path that is about to grant access can fail
+  the login when the audit record cannot be written. An unlogged successful
+  authentication is the outcome an audit log exists to prevent.
+  ([#69](https://github.com/scttfrdmn/oauth2-pam/issues/69))
+
+- **A mutation-tested C suite.** `test/cbridge` grew from the transport and
+  audit-field mutations it started with to 16, and the suite that runs against them
+  now catches `authorized_for` → `return 1` — a mutation that makes the module accept
+  any user the broker authorized for anyone else, and which was green in every suite
+  this project had before this round. A mutation check only covers what its tests
+  actually call, which is why the count matters less than what the new ones exercise.
+  A hung run is now a failure rather than a hang.
+  ([#57](https://github.com/scttfrdmn/oauth2-pam/issues/57))
+
 ## [0.3.0] - 2026-08-14
 
 0.2.0 made authentication work. This release is about being able to trust it:
