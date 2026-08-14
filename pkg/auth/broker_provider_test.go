@@ -47,6 +47,11 @@ type fakeProvider struct {
 	// flow to finish after its own deadline.
 	identityGate   chan struct{}
 	identityCtxErr error
+
+	// startDelay is how long StartDeviceFlow takes to answer. A real one is an
+	// HTTPS round trip, and a test that wants concurrent Authenticate calls to
+	// actually overlap has to make it cost something.
+	startDelay time.Duration
 }
 
 func newFakeProvider(name string) *fakeProvider {
@@ -71,7 +76,12 @@ func (f *fakeProvider) StartDeviceFlow(context.Context) (*provider.DeviceFlow, e
 	f.flows++
 	code := fmt.Sprintf("device-code-%s-%d", f.name, f.flows)
 	lifetime := f.codeLifetime
+	delay := f.startDelay
 	f.mu.Unlock()
+
+	if delay > 0 {
+		time.Sleep(delay)
+	}
 
 	return &provider.DeviceFlow{
 		DeviceCode:      code,

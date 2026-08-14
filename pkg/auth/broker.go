@@ -299,44 +299,37 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 		return errorResponse("NO_PROVIDER", err.Error()), nil
 	}
 
-	// Enforce the per-user limit on *established* sessions. Pending flows are
-	// counted separately below: an abandoned SSH attempt must not consume a
-	// session slot.
-	if max := b.config.Authentication.MaxConcurrentSessions; max > 0 {
-		if b.countUserSessions(req.UserID) >= max {
-			return &AuthResponse{
-				Success:      false,
-				Status:       StatusDenied,
-				ErrorCode:    "SESSION_LIMIT_REACHED",
-				ErrorMessage: "Maximum concurrent sessions reached",
-			}, nil
-		}
+	// Generate a cryptographically random session ID server-side.
+	// The PAM client's req.SessionID is intentionally ignored to prevent
+	// session fixation attacks.
+	sessionID, err := generateSessionID()
+	if err != nil {
+		return nil, fmt.Errorf("generate session ID: %w", err)
 	}
 
-	// Global cap on device flows awaiting authorization. Each one holds a
-	// goroutine polling the provider, so this bounds the work a burst of login
-	// attempts can create broker-wide.
-	//
-	// Checked before eviction, not after. The other order made the cap
-	// unreachable for a single username: eviction keeps that user's pending count
-	// at maxPendingFlowsPerUser, so countPendingFlows never climbed toward the
-	// global limit however many requests arrived. Verified before the fix: a cap
-	// of 10 accepted 30 requests.
-	if max := b.config.Security.RateLimiting.MaxConcurrentAuths; max > 0 {
-		if n := b.countPendingFlows(); n >= max {
-			log.Warn().Int("pending", n).Int("max", max).
-				Msg("Concurrent device flow limit reached; rejecting authentication")
-			return errorResponse("AUTH_LIMIT_REACHED",
-				"Too many authentications in progress; try again shortly"), nil
-		}
+	// Take a slot before talking to the provider: the caps are enforced and the
+	// entry inserted under one write lock, so concurrent requests count each
+	// other. ExpiresAt is provisional until the provider has answered.
+	if refusal := b.reserveSession(&Session{
+		ID:                 sessionID,
+		RequestedLocalUser: req.UserID,
+		Provider:           prov.Name(),
+		CreatedAt:          time.Now(),
+		ExpiresAt:          time.Now().Add(reservationLifetime),
+		LastAccessed:       time.Now(),
+		SourceIP:           req.SourceIP,
+		Status:             StatusPending,
+		IsActive:           false,
+		Metadata:           req.Metadata,
+	}); refusal != nil {
+		return refusal, nil
 	}
-
-	// Bound in-flight device flows for this user, evicting the oldest.
-	b.evictExcessPendingFlows(req.UserID)
 
 	// Start device flow
 	deviceFlow, err := prov.StartDeviceFlow(b.ctx)
 	if err != nil {
+		// Release the reservation: a flow that never started holds no slot.
+		b.removeSession(sessionID)
 		b.auditLogger.LogAuthEvent(security.AuditEvent{
 			EventType:    "device_flow_failed",
 			UserID:       req.UserID,
@@ -376,33 +369,17 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 		qrCode = ""
 	}
 
-	// Generate a cryptographically random session ID server-side.
-	// The PAM client's req.SessionID is intentionally ignored to prevent
-	// session fixation attacks.
-	sessionID, err := generateSessionID()
-	if err != nil {
-		return nil, fmt.Errorf("generate session ID: %w", err)
-	}
-
 	// The flow lives until the user approves it, but no longer than the broker is
 	// willing to wait — see AuthenticationConfig.DeviceFlowTimeout for why the
 	// provider's own expiry is the wrong bound.
 	expiresAt := b.deviceFlowDeadline(deviceFlow)
 
-	// Create a pending session
-	session := &Session{
-		ID:                 sessionID,
-		RequestedLocalUser: req.UserID,
-		Provider:           prov.Name(),
-		CreatedAt:          time.Now(),
-		ExpiresAt:          expiresAt,
-		LastAccessed:       time.Now(),
-		SourceIP:           req.SourceIP,
-		Status:             StatusPending,
-		IsActive:           false,
-		Metadata:           req.Metadata,
+	if !b.armFlowDeadline(sessionID, expiresAt) {
+		log.Info().Str("session_id", sessionID).Str("user_id", req.UserID).
+			Msg("Reservation was evicted while the provider was starting the device flow")
+		return errorResponse("AUTH_LIMIT_REACHED",
+			"Too many authentications in progress; try again shortly"), nil
 	}
-	b.setSession(session)
 
 	// Poll in the background; update session when the device flow completes.
 	// The poller's context is cancelled the moment the session stops being
@@ -1222,16 +1199,112 @@ func (b *Broker) forgetPoll(sessionID string) {
 	delete(b.pollCancel, sessionID)
 }
 
-// countUserSessions returns the number of *established* sessions for userID.
+// reserveSession enforces the concurrency caps and inserts the pending entry
+// under a single write lock, returning nil if the slot was taken or the refusal
+// to send back if it was not.
+//
+// One lock, because the two counts and the insert are one decision. Authenticate
+// used to read them under RLock, release it, start the device flow, and only then
+// insert — so every request in flight decided against a session map that did not
+// yet contain any of the others. Measured: 40 concurrent calls against a cap of 3
+// produced 17 accepted sessions and 17 pending flows. The sequential test passed
+// throughout, because sequentially there is no window.
+//
+// The overshoot was bounded (by simultaneous Authenticate calls, roughly sshd's
+// MaxStartups) and safe in direction, since both counts are derived from the
+// session map rather than maintained alongside it and so cannot drift into a
+// persistent lockout. It is fixed anyway: a cap that a burst walks past is not a
+// cap, and the reservation is also what gives the eviction below a view of the
+// map that includes the request it is making room for.
+func (b *Broker) reserveSession(session *Session) *AuthResponse {
+	// Cancels for the flows evicted below are collected under the lock and invoked
+	// after it, for the reason evictExcessPendingFlows documents: cancel() must
+	// never be able to re-enter sessionMutex.
+	var cancels []context.CancelFunc
+
+	b.sessionMutex.Lock()
+
+	// The per-user limit on *established* sessions. Pending flows are counted
+	// separately, below: an abandoned SSH attempt must not consume a session slot.
+	if max := b.config.Authentication.MaxConcurrentSessions; max > 0 {
+		if b.countUserSessionsLocked(session.RequestedLocalUser) >= max {
+			b.sessionMutex.Unlock()
+			return &AuthResponse{
+				Success:      false,
+				Status:       StatusDenied,
+				ErrorCode:    "SESSION_LIMIT_REACHED",
+				ErrorMessage: "Maximum concurrent sessions reached",
+			}
+		}
+	}
+
+	// Global cap on device flows awaiting authorization. Each one holds a
+	// goroutine polling the provider, so this bounds the work a burst of login
+	// attempts can create broker-wide.
+	//
+	// Checked before eviction, not after. The other order made the cap
+	// unreachable for a single username: eviction keeps that user's pending count
+	// at maxPendingFlowsPerUser, so the pending count never climbed toward the
+	// global limit however many requests arrived. Verified before the fix: a cap
+	// of 10 accepted 30 requests.
+	if max := b.config.Security.RateLimiting.MaxConcurrentAuths; max > 0 {
+		if n := b.countPendingFlowsLocked(); n >= max {
+			b.sessionMutex.Unlock()
+			log.Warn().Int("pending", n).Int("max", max).
+				Msg("Concurrent device flow limit reached; rejecting authentication")
+			return errorResponse("AUTH_LIMIT_REACHED",
+				"Too many authentications in progress; try again shortly")
+		}
+	}
+
+	// Bound in-flight device flows for this user, evicting the oldest.
+	cancels = b.evictExcessPendingFlowsLocked(session.RequestedLocalUser)
+
+	b.sessions[session.ID] = session
+	b.sessionMutex.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+	return nil
+}
+
+// reservationLifetime is how long a reserved slot lives before the real
+// device-flow deadline replaces it. It only has to outlast one StartDeviceFlow
+// round trip; a provider that never answers then loses its slot to the cleanup
+// sweep rather than holding it against the caps for as long as the broker runs.
+const reservationLifetime = time.Minute
+
+// armFlowDeadline replaces a reservation's provisional expiry with the real
+// device-flow deadline, which is not known until the provider has answered.
+//
+// It returns false if the reservation is no longer there — this user's own newer
+// flows can evict it while the provider is answering — because re-inserting it
+// would put back a session eviction had deliberately dropped, and returning a
+// session ID that is not in the map would leave the client polling for something
+// that does not exist.
+func (b *Broker) armFlowDeadline(sessionID string, expiresAt time.Time) bool {
+	b.sessionMutex.Lock()
+	defer b.sessionMutex.Unlock()
+
+	s, ok := b.sessions[sessionID]
+	if !ok || s.IsActive || s.Status != StatusPending {
+		return false
+	}
+	s.ExpiresAt = expiresAt
+	return true
+}
+
+// countUserSessionsLocked returns the number of *established* sessions for
+// userID. Callers hold sessionMutex, so that the count and whatever is decided
+// on it are one atomic step; see reserveSession.
 //
 // Pending device flows are excluded deliberately. Counting them meant that
 // three abandoned SSH attempts (a user who closed the terminal without
 // visiting GitHub) exhausted max_concurrent_sessions and locked the account out
 // until the five-minute cleanup ticker ran. Pending state is bounded by
 // maxPendingFlowsPerUser instead.
-func (b *Broker) countUserSessions(userID string) int {
-	b.sessionMutex.RLock()
-	defer b.sessionMutex.RUnlock()
+func (b *Broker) countUserSessionsLocked(userID string) int {
 	count := 0
 	for _, s := range b.sessions {
 		if !s.IsActive {
@@ -1244,11 +1317,10 @@ func (b *Broker) countUserSessions(userID string) int {
 	return count
 }
 
-// countPendingFlows returns the number of device flows awaiting authorization
-// across all users.
-func (b *Broker) countPendingFlows() int {
-	b.sessionMutex.RLock()
-	defer b.sessionMutex.RUnlock()
+// countPendingFlowsLocked returns the number of device flows awaiting
+// authorization across all users, including slots reserved by an Authenticate
+// call that has not heard back from the provider yet. Callers hold sessionMutex.
+func (b *Broker) countPendingFlowsLocked() int {
 	count := 0
 	for _, s := range b.sessions {
 		if s.Status == StatusPending && !s.IsActive {
@@ -1307,18 +1379,18 @@ func (b *Broker) failSession(sessionID, status, message string) {
 		Msg("Session marked terminally failed")
 }
 
-// evictExcessPendingFlows drops the oldest pending flows for userID until at
-// most maxPendingFlowsPerUser-1 remain, leaving room for the flow about to
+// evictExcessPendingFlowsLocked drops the oldest pending flows for userID until
+// at most maxPendingFlowsPerUser-1 remain, leaving room for the flow about to
 // start. Evicting rather than rejecting means a user with several terminals
 // open always gets a usable prompt in the newest one.
-func (b *Broker) evictExcessPendingFlows(userID string) {
-	// Cancels are collected under the lock and invoked after it, so an evicted
-	// flow's goroutine stops talking to the provider. Without this, eviction
-	// deleted the session and left the poller running to the device code's
-	// expiry — untracked traffic against the provider's per-app rate limit.
+//
+// Callers hold sessionMutex and must call every returned cancel func once they
+// have released it, so an evicted flow's goroutine stops talking to the
+// provider. Without that, eviction deleted the session and left the poller
+// running to the device code's expiry — untracked traffic against the provider's
+// per-app rate limit — and calling cancel under the lock risks re-entering it.
+func (b *Broker) evictExcessPendingFlowsLocked(userID string) []context.CancelFunc {
 	var cancels []context.CancelFunc
-
-	b.sessionMutex.Lock()
 
 	var pending []*Session
 	for _, s := range b.sessions {
@@ -1327,8 +1399,7 @@ func (b *Broker) evictExcessPendingFlows(userID string) {
 		}
 	}
 	if len(pending) < maxPendingFlowsPerUser {
-		b.sessionMutex.Unlock()
-		return
+		return nil
 	}
 
 	sort.Slice(pending, func(i, j int) bool {
@@ -1345,11 +1416,7 @@ func (b *Broker) evictExcessPendingFlows(userID string) {
 			Str("user_id", userID).
 			Msg("Evicted oldest pending device flow")
 	}
-	b.sessionMutex.Unlock()
-
-	for _, cancel := range cancels {
-		cancel()
-	}
+	return cancels
 }
 
 // generateSessionID creates a 16-byte cryptographically random session ID.

@@ -3,6 +3,8 @@ package auth
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -47,6 +49,83 @@ func TestGlobalConcurrentAuthCapIsReachableForOneUser(t *testing.T) {
 	}
 	if refused != 5 {
 		t.Errorf("refused %d requests, want 5 — the cap was not reachable for one username", refused)
+	}
+}
+
+// TestConcurrentAuthenticateDoesNotOvershootTheAuthCap is the other half of the
+// cap, and the half a sequential test cannot see.
+//
+// The caps were read under RLock, the lock released, the device flow started, and
+// the session inserted only then — so every request in flight decided against a
+// session map containing none of the others. Measured before the fix: 40
+// concurrent calls against a cap of 3 accepted 17.
+//
+// One username per caller, so per-user eviction cannot hold the pending count
+// down and hide the overshoot the way it did in
+// TestGlobalConcurrentAuthCapIsReachableForOneUser. StartDeviceFlow is given a
+// delay because the window is exactly the provider round trip: with an instant
+// provider the calls barely overlap and the unfixed code can look correct.
+func TestConcurrentAuthenticateDoesNotOvershootTheAuthCap(t *testing.T) {
+	const (
+		limit   = 3
+		callers = 40
+	)
+
+	cfg := brokerConfig(t)
+	cfg.Security.RateLimiting.MaxConcurrentAuths = limit
+	fake := newFakeProvider("acme")
+	fake.startDelay = 20 * time.Millisecond
+	b := startBroker(t, cfg, fake)
+
+	var mu sync.Mutex
+	var accepted, refused int
+	var unexpected []string
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < callers; i++ {
+		user := fmt.Sprintf("user%02d", i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			resp, err := b.Authenticate(&AuthRequest{UserID: user, LoginType: "ssh"})
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err != nil:
+				unexpected = append(unexpected, err.Error())
+			case resp.ErrorCode == "":
+				accepted++
+			case resp.ErrorCode == "AUTH_LIMIT_REACHED":
+				refused++
+			default:
+				unexpected = append(unexpected, resp.ErrorCode)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if len(unexpected) > 0 {
+		t.Fatalf("unexpected outcomes: %v", unexpected)
+	}
+	if accepted != limit {
+		t.Errorf("%d of %d concurrent requests were accepted against a cap of %d", accepted, callers, limit)
+	}
+	if refused != callers-limit {
+		t.Errorf("%d requests were refused, want %d", refused, callers-limit)
+	}
+
+	// The reply count and the broker's own state have to agree: a request that was
+	// told yes holds a pending flow, and it is the flows that cost a goroutine and
+	// provider traffic.
+	b.sessionMutex.RLock()
+	pending := b.countPendingFlowsLocked()
+	b.sessionMutex.RUnlock()
+	if pending != accepted {
+		t.Errorf("%d pending flows for %d accepted requests; the count the cap is enforced on is not the state that resulted",
+			pending, accepted)
 	}
 }
 
