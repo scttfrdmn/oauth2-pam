@@ -126,6 +126,20 @@ restore_module_args() {
     [ -f "$PAM_SSHD_BACKUP" ] && mv "$PAM_SSHD_BACKUP" "$PAM_SSHD"
 }
 
+# write_pam_stack replaces the auth and account lines wholesale, for the one case
+# that needs the module absent from auth and present in account. restore_module_args
+# undoes it, since it restores the same backup file.
+write_pam_stack() {
+    cp "$PAM_SSHD" "$PAM_SSHD_BACKUP"
+    cat > "$PAM_SSHD" <<EOF
+auth     $1
+account  $2
+session  required   pam_permit.so
+password required   pam_deny.so
+EOF
+    log "pam stack: auth=$1 account=$2"
+}
+
 # ---------------------------------------------------------------- cases
 
 # The happy path. Approval happens while the module is blocked on the prompt, so
@@ -277,6 +291,40 @@ case_unknown_provider_refused() {
     n=$(polls)
     if [ "${n:-0}" -ne 0 ]; then
         fail "the fake GitHub saw ${n} token polls; no device flow should have started"
+    fi
+}
+
+# The account stage must not vouch for a login it did not authenticate.
+#
+# pam_sm_acct_mgmt answers from the session id the auth stage stored. Here something
+# else did the authenticating, so there is no stored id and the module knows nothing
+# about this login. The one answer it must never give is PAM_SUCCESS: a module that
+# approves an account it has no record of is fail-open, and it is fail-open in the
+# stacked configuration a real deployment is most likely to have — oauth2_pam.so for
+# account management alongside another factor for auth.
+#
+# It returns PAM_IGNORE, and with nothing else in the account stack to give a
+# definitive answer, Linux-PAM turns a wholly-ignored stack into PAM_PERM_DENIED. So
+# the login is refused. That is the correct outcome for *this* stack and it is not the
+# module claiming the user is bad — an operator who genuinely wants another module to
+# own account management writes that module into the stack, and its answer is the one
+# that counts.
+case_account_stage_ignores_a_login_it_did_not_authenticate() {
+    control reset
+    write_pam_stack "required   pam_permit.so" \
+                    "required   oauth2_pam.so socket=/var/run/oauth2-pam/broker.sock debug"
+    AUTHORIZE_ON_PROMPT=0 attempt_login alice
+    restore_module_args
+
+    expect_login_refused
+    expect_not_prompted
+
+    # No device flow was started, so this is the account stage refusing on its own
+    # and not an auth failure wearing its clothes.
+    local n
+    n=$(polls)
+    if [ "${n:-0}" -ne 0 ]; then
+        fail "the fake GitHub saw ${n} token polls; the auth stage was pam_permit"
     fi
 }
 

@@ -10,6 +10,13 @@
 # ever grows.
 auth     required   oauth2_pam.so socket=/var/run/oauth2-pam/broker.sock poll_interval=1 timeout=20 debug
 
-account  required   pam_permit.so
+# The account stage is the real module, not pam_permit, and that is load-bearing for
+# more than the account stage's own behaviour: pam_sm_acct_mgmt reads the session id
+# the auth stage stored via pam_set_data, and pam_set_data/pam_get_data refuse to run
+# outside a service module, so no unit test can reach that handoff. With this line,
+# every case below that expects a successful login also proves the handoff works —
+# if the id were never stored, or stored before the username was verified, or the
+# cleanup freed it too early, these logins would stop succeeding.
+account  required   oauth2_pam.so socket=/var/run/oauth2-pam/broker.sock debug
 session  required   pam_permit.so
 password required   pam_deny.so

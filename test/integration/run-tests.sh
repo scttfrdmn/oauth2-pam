@@ -25,6 +25,7 @@ DEFAULT_CASES=(
     mapped_groups_not_applied
     named_provider
     unknown_provider_refused
+    account_stage_ignores_a_login_it_did_not_authenticate
 )
 
 say() { printf '\n==> %s\n' "$*"; }
