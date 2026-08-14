@@ -25,6 +25,7 @@ import (
 
 	"github.com/scttfrdmn/oauth2-pam/pkg/config"
 	"github.com/scttfrdmn/oauth2-pam/pkg/enrollment"
+	"github.com/scttfrdmn/oauth2-pam/pkg/mapper"
 	"github.com/scttfrdmn/oauth2-pam/pkg/provider"
 	"github.com/scttfrdmn/oauth2-pam/pkg/provider/registry"
 )
@@ -160,9 +161,49 @@ func runRemove(localUser, enrollFile string) error {
 	return nil
 }
 
+// localUserGate returns the check a local username has to pass to be enrolled:
+// the mapper's, taken from the mapper configuration this host will authenticate
+// with, so the answer here is the answer the login will get. Because the config is
+// loaded (mapper.min_uid included) the full gate applies, not just the parts that
+// need no configuration.
+//
+// The error explains the rule rather than only refusing it, and says where the
+// rule comes from — an operator who is told "no" by a tool that is not the one
+// that will deny the login has no way to guess why.
+func localUserGate(cfg *config.Config) enrollment.LocalUserValidator {
+	chain := mapper.New(cfg.Mapper)
+	return func(localUser string) error {
+		if err := chain.ValidateLocalUser("enrollment", localUser); err != nil {
+			return fmt.Errorf("%w\n\n"+
+				"This is the same local-account gate the mapper applies to every tier at\n"+
+				"login, so %q could not authenticate even once enrolled. To be enrollable a\n"+
+				"local user must:\n"+
+				"  - be a valid Unix name: a lowercase letter or underscore, then lowercase\n"+
+				"    letters, digits, hyphens or underscores, at most 32 characters\n"+
+				"  - not be root, and not be a system or service account (if a real person on\n"+
+				"    this host has such a name, list it in mapper.allow_system_users; nothing\n"+
+				"    exempts root)\n"+
+				"  - have a UID at or above mapper.min_uid, when the account resolves here",
+				err, localUser)
+		}
+		return nil
+	}
+}
+
 // runEnroll runs the Device Flow, confirms the provider identity, and writes
 // the enrollment record.
 func runEnroll(localUser, providerName string, groups []string, enrollFile string, cfg *config.Config) error {
+	// The mapper's own local-account gate, applied here before anything else
+	// happens. mapper.Map already refuses tier 0 answers that do not pass it, so an
+	// enrollment naming root, a system account, or an account below
+	// mapper.min_uid can never authenticate; writing it would only turn a typo into
+	// a denied login days later. Checked before the device flow so the operator is
+	// not sent to a browser to authorize a record that will be rejected.
+	validateLocalUser := localUserGate(cfg)
+	if err := validateLocalUser(localUser); err != nil {
+		return err
+	}
+
 	// Verify the local Unix user exists before starting the device flow.
 	if _, err := user.Lookup(localUser); err != nil {
 		return fmt.Errorf("local user %q not found: %w", localUser, err)
@@ -232,7 +273,9 @@ func runEnroll(localUser, providerName string, groups []string, enrollFile strin
 		Groups:     groups,
 	}
 
-	if err := store.Add(rec); err != nil {
+	// The gate again, at the store: the check above is for the operator, this one
+	// is what a future writer of this file inherits.
+	if err := store.Add(rec, validateLocalUser); err != nil {
 		return fmt.Errorf("add enrollment: %w", err)
 	}
 
