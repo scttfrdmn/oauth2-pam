@@ -40,16 +40,10 @@ build-pam:
 	@mkdir -p $(BINARY_DIR)
 	CGO_ENABLED=1 go build -buildmode=c-shared $(GO_BUILD_FLAGS) -o $(BINARY_DIR)/$(PAM_MODULE) ./cmd/pam-module
 	@echo "Verifying PAM entry points are present..."
-	@if command -v nm >/dev/null 2>&1; then \
-		count=$$(nm -D --defined-only $(BINARY_DIR)/$(PAM_MODULE) 2>/dev/null | grep -c ' pam_sm_'); \
-		if [ "$$count" -lt 6 ]; then \
-			echo "ERROR: $(PAM_MODULE) exports $$count pam_sm_* symbols, expected 6."; \
-			echo "  PAM cannot load a module without entry points. Is the C file"; \
-			echo "  still part of the cmd/pam-module package?"; \
-			exit 1; \
-		fi; \
-		echo "  $$count pam_sm_* entry points present"; \
-	fi
+	@# Per symbol, and a build host without nm fails here rather than passing
+	@# quietly. The same script runs in release.yml and in the installer, so a
+	@# module that gets past one of them gets past all three for the same reason.
+	@scripts/verify-pam-symbols.sh $(BINARY_DIR)/$(PAM_MODULE)
 
 ## Build the PAM module in a Linux container (works from macOS)
 docker-build-pam:

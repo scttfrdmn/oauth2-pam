@@ -118,6 +118,8 @@ Three gaps worth stating plainly rather than leaving to be inferred:
   place a check is unconditionally binding is a release: `release.yml` runs the
   whole of `ci.yml` on the tagged commit and publishes nothing if it fails.
 
-The `nm` entry-point check in `make build` and in the container harness build is
-not a scanner but belongs in the same list: it is what stops a release shipping a
-module PAM cannot load.
+The `nm` entry-point check is not a scanner but belongs in the same list: it is
+what stops a release shipping a module PAM cannot load. It is one script,
+`scripts/verify-pam-symbols.sh`, run by `make build`, by the release workflow, and
+by the installer in the release archive before it copies anything — per symbol,
+and a host without `nm` fails it rather than skipping it.

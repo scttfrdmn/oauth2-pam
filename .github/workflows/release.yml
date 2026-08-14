@@ -126,14 +126,12 @@ jobs:
       # these symbols and nothing noticed for a month; the sister project is
       # still shipping one (oidc-pam#140). A release that publishes a module PAM
       # cannot load is worse than no release, because the artifact looks official.
+      #
+      # The loop that used to live here is now scripts/verify-pam-symbols.sh, so
+      # `make build`, this job and the installer the archive ships all ask the same
+      # question of the same artifact.
       - name: Verify the PAM entry points made it into the artifact
-        run: |
-          for sym in pam_sm_authenticate pam_sm_setcred pam_sm_acct_mgmt \
-                     pam_sm_open_session pam_sm_close_session pam_sm_chauthtok; do
-            nm -D --defined-only bin/oauth2_pam.so | grep -q " T $sym\$" \
-              || { echo "::error::MISSING ENTRY POINT: $sym"; exit 1; }
-          done
-          echo "All six pam_sm_* entry points present."
+        run: scripts/verify-pam-symbols.sh bin/oauth2_pam.so
 
       - name: Create archive
         env:
@@ -147,6 +145,9 @@ jobs:
           cp -r configs "$DIR/configs"
           cp README.md CHANGELOG.md SECURITY.md LICENSE "$DIR/"
           install -m 0755 scripts/install-release.sh "$DIR/install.sh"
+          # install.sh runs the same entry-point check this job just ran, so the
+          # helper has to travel with it.
+          install -m 0755 scripts/verify-pam-symbols.sh "$DIR/verify-pam-symbols.sh"
           tar czf "$DIR.tar.gz" "$DIR"
           sha256sum "$DIR.tar.gz" > "$DIR.tar.gz.sha256"
 

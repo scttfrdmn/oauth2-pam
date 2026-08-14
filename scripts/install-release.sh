@@ -13,6 +13,11 @@ CONFDIR="${CONFDIR:-/etc/oauth2-pam}"
 
 die() { echo "install: $*" >&2; exit 1; }
 
+# Where this script's helpers sit: the top level of the unpacked archive, next to
+# install.sh, and scripts/ in a source checkout. Both are "the directory this
+# script is in".
+HERE=$(dirname "$0")
+
 [ "$(id -u)" -eq 0 ] || die "must run as root (try: sudo ./install.sh)"
 [ "$(uname -s)" = "Linux" ] || die "the PAM module is Linux-only"
 
@@ -22,10 +27,14 @@ done
 
 # The module must export its entry points. A .so without them loads as nothing:
 # PAM logs an error and the auth line behaves as though the module were absent.
-if command -v nm >/dev/null 2>&1; then
-    count=$(nm -D --defined-only oauth2_pam.so 2>/dev/null | grep -c ' pam_sm_' || true)
-    [ "$count" -ge 6 ] || die "oauth2_pam.so exports $count pam_sm_* symbols, expected 6 — do not install this artifact"
-fi
+#
+# The same script the release workflow and `make build` run, and it fails when nm
+# is absent instead of skipping: this is the last check between an operator and an
+# artifact PAM cannot load, and it used to be the loosest of the three.
+[ -f "$HERE/verify-pam-symbols.sh" ] \
+    || die "verify-pam-symbols.sh is missing — unpack the whole archive and run install.sh from it"
+"$HERE/verify-pam-symbols.sh" oauth2_pam.so \
+    || die "do not install this artifact"
 
 # /lib/security is right on RHEL and wrong on Debian/Ubuntu multiarch. Ask the
 # package manager where the system's own modules live rather than guessing.
