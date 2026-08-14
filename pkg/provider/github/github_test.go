@@ -202,11 +202,52 @@ func TestRedirectsToOtherHostsAreRefused(t *testing.T) {
 	if err == nil {
 		t.Fatal("GetIdentity followed a cross-host redirect")
 	}
-	if !strings.Contains(err.Error(), "unconfigured host") {
+	if !strings.Contains(err.Error(), "unconfigured origin") {
 		t.Errorf("err = %v, want the redirect to be refused by name", err)
 	}
 	if elsewhereHit.Load() {
 		t.Error("the bearer token was sent to a host outside the configured endpoints")
+	}
+}
+
+// TestRedirectDowngradingToHTTPIsRefused: the host is not the whole of an
+// origin. net/http decides whether to keep the Authorization header by comparing
+// hostnames only, so an https→http redirect back to the same host carries the
+// live access token in cleartext to whoever is on the path. Pinning the hostname
+// alone let that through, while nextPageURL had pinned scheme and host all along.
+func TestRedirectDowngradingToHTTPIsRefused(t *testing.T) {
+	var cleartextHit atomic.Bool
+	cleartext := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cleartextHit.Store(true)
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("the access token was sent over plain http: %q", got)
+		}
+		_, _ = w.Write([]byte(`{"login":"attacker"}`))
+	}))
+	defer cleartext.Close()
+
+	// Both servers listen on 127.0.0.1, so the scheme is the only thing that
+	// differs between the configured endpoint and the redirect target — which is
+	// exactly the case a hostname comparison cannot see.
+	secure := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, cleartext.URL+"/user", http.StatusFound)
+	}))
+	defer secure.Close()
+
+	p := providerFor(t, secure.URL)
+	// The test server's certificate is signed by nothing in the trust store, so
+	// borrowing its client is the only way to drive a real https→http hop.
+	p.httpClient.Transport = secure.Client().Transport
+
+	_, err := p.getUser(context.Background(), realisticToken)
+	if err == nil {
+		t.Fatal("getUser followed a redirect that downgraded to http")
+	}
+	if !strings.Contains(err.Error(), "unconfigured origin") {
+		t.Errorf("err = %v, want the redirect to be refused for its origin", err)
+	}
+	if cleartextHit.Load() {
+		t.Error("the request was replayed over cleartext http")
 	}
 }
 

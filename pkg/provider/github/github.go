@@ -63,9 +63,9 @@ func EnterpriseEndpoints(baseURL string) Endpoints {
 }
 
 // validate checks that every endpoint is set and parses, and returns the set of
-// hostnames redirects may target.
+// origins redirects may target.
 func (e Endpoints) validate() (map[string]struct{}, error) {
-	hosts := make(map[string]struct{}, 3)
+	origins := make(map[string]struct{}, 3)
 	for name, raw := range map[string]string{
 		"device_auth": e.DeviceAuth,
 		"token":       e.Token,
@@ -81,9 +81,16 @@ func (e Endpoints) validate() (map[string]struct{}, error) {
 		if u.Host == "" {
 			return nil, fmt.Errorf("github endpoints: %s must be absolute (got %q)", name, raw)
 		}
-		hosts[u.Hostname()] = struct{}{}
+		origins[redirectOrigin(u)] = struct{}{}
 	}
-	return hosts, nil
+	return origins, nil
+}
+
+// redirectOrigin is the key an endpoint and a redirect target are compared by:
+// scheme and hostname, without the port. The scheme is part of it because
+// dropping it permits a downgrade — see CheckRedirect in NewWithEndpoints.
+func redirectOrigin(u *url.URL) string {
+	return u.Scheme + "://" + u.Hostname()
 }
 
 // Provider is a GitHub OAuth2 provider that supports Device Flow auth. It
@@ -156,7 +163,7 @@ func NewWithEndpoints(cfg config.ProviderConfig, endpoints Endpoints) (*Provider
 		return nil, fmt.Errorf("github provider: client_secret is required")
 	}
 
-	allowedHosts, err := endpoints.validate()
+	allowedOrigins, err := endpoints.validate()
 	if err != nil {
 		return nil, err
 	}
@@ -167,13 +174,22 @@ func NewWithEndpoints(cfg config.ProviderConfig, endpoints Endpoints) (*Provider
 		endpoints: endpoints,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
-			// Only follow redirects back to a host we were configured to talk
+			// Only follow redirects back to an origin we were configured to talk
 			// to. A redirect anywhere else indicates a misconfiguration or a
 			// MITM attempt, and would leak the bearer token if followed.
+			//
+			// The scheme is half of that origin, and comparing hostnames alone
+			// was the hole: net/http's own shouldCopyHeaderOnRedirect compares
+			// hostnames and ignores the scheme, so an https→http redirect to the
+			// same host kept the Authorization header and put a live access token
+			// on the wire in cleartext. nextPageURL pins scheme and host for the
+			// pagination cursor, which is the same threat by another route; the
+			// two disagreeing is what made this a bug rather than a style
+			// difference.
 			CheckRedirect: func(req *http.Request, _ []*http.Request) error {
-				h := req.URL.Hostname()
-				if _, ok := allowedHosts[h]; !ok {
-					return fmt.Errorf("redirect to unconfigured host %q rejected", h)
+				origin := redirectOrigin(req.URL)
+				if _, ok := allowedOrigins[origin]; !ok {
+					return fmt.Errorf("redirect to unconfigured origin %q rejected", origin)
 				}
 				return nil
 			},
