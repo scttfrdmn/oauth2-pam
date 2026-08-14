@@ -266,15 +266,16 @@ func (o *boundaryOutput) setDelay(d time.Duration) {
 	o.delay = d
 }
 
-func (o *boundaryOutput) quiet() bool {
+func (o *boundaryOutput) quiet() bool { return o.inFlightNow() == 0 }
+
+func (o *boundaryOutput) inFlightNow() int {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	return o.inFlight == 0
+	return o.inFlight
 }
 
 // TestAWriteReturningAsItsDeadlineFiresDoesNotWedgeTheStalledFlag.
 //
-// The stalled flag is set by the deadline and cleared by the write that overran it.
 // A write that returns in the same instant its deadline fires used to be declared
 // stalled *after* it had cleared the flag — and a refused write spawns no goroutine
 // to clear it, so the flag stayed set and every record after it was refused for the
@@ -282,8 +283,18 @@ func (o *boundaryOutput) quiet() bool {
 // out of one write that was a few microseconds late.
 //
 // The interleaving cannot be forced from outside, so this aims a few hundred writes
-// at the boundary and then asserts the invariant on a quiescent logger, where the
-// answer is not a matter of timing: with no write outstanding, nothing is stalled.
+// at the boundary and then asserts that the stalled state goes away by itself. What
+// it must distinguish is a state that is briefly true from one that is permanently
+// true, and the difference is not visible at any single instant: a write that has
+// returned from the sink still holds writeMu until its deferred teardown runs, and
+// through that window — nanoseconds, and there whatever the mechanism — the logger is
+// correctly still busy with it.
+//
+// So the probe is the logger's own predicate polled to a deadline, not the sink's
+// in-flight count read once. Reading the sink was the earlier version of this test,
+// and it was wrong in the direction that matters: it made a real fix look broken
+// while the interleaving it was written for went on being possible for 40 runs at a
+// time. The wedge this guards against does not clear in two seconds, or ever.
 func TestAWriteReturningAsItsDeadlineFiresDoesNotWedgeTheStalledFlag(t *testing.T) {
 	const timeout = 2 * time.Millisecond
 
@@ -301,17 +312,18 @@ func TestAWriteReturningAsItsDeadlineFiresDoesNotWedgeTheStalledFlag(t *testing.
 
 	sink.setDelay(0)
 	deadline := time.Now().Add(2 * time.Second)
-	for !sink.quiet() {
+	for al.sinksStalled() {
 		if time.Now().After(deadline) {
-			t.Fatal("a write was still outstanding two seconds after the last one was issued")
+			t.Fatal("the sinks are healthy and idle and the logger still considers them stalled, " +
+				"two seconds after the last write was issued; every later record will be " +
+				"refused for the life of the process")
 		}
 		time.Sleep(time.Millisecond)
 	}
-
-	if al.stalled.Load() {
-		t.Error("no write is outstanding and the logger still considers its sinks stalled; " +
-			"every later record will be refused for the life of the process")
+	if !sink.quiet() {
+		t.Errorf("the logger reports its sinks unstalled while %d writes are still in flight", sink.inFlightNow())
 	}
+
 	if err := al.LogAuthEventErr(criticalEvent()); err != nil {
 		t.Errorf("a record offered to an idle, healthy sink was refused: %v", err)
 	}

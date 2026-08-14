@@ -57,6 +57,29 @@ oauth2_pam.so` on its own denies the publickey break-glass path.
 
 ### Fixed
 
+- **The stalled-sink flag could still wedge fail-closed forever, and did so on CI one
+  push after the round that thought it had fixed it.** An audit write runs on its own
+  goroutine with the deadline enforced by the caller, so two paths can observe the
+  same write and a compare-and-set on `settled` decides which one reports it. That CAS
+  orders the *report*; it does not order the two stores to the `stalled` flag. With the
+  deadline path descheduled between winning the CAS and storing `true`, the write's own
+  deferred `Store(false)` lands first — and the flag ends up set with nothing
+  outstanding. Nothing clears it after that, because a refused write returns without
+  spawning a goroutine, so every audit record for the life of the process is refused;
+  and since an access decision that cannot be recorded is refused, the broker grants no
+  logins at all while its sinks are perfectly healthy. Round five narrowed this window
+  and its comment argued it was closed. The argument was wrong in a way that a bool
+  cannot be made right: the deadline path cannot clear the flag, because the write is by
+  definition still running when it gives up, and the write cannot clear it either. So
+  the state is no longer a verdict about a write but a pointer to the write, carrying
+  its own completion signal, and `sinksStalled` asks it — recording a write that has
+  already finished is then harmless, and the invariant holds by construction rather
+  than by two stores landing in the right order. The test that caught this needed about
+  forty runs to do it, because it sampled the flag once at an instant when a returned
+  write legitimately still holds `writeMu`; polled to a deadline instead, it fails on
+  the first run against the old mechanism.
+  ([#100](https://github.com/scttfrdmn/oauth2-pam/issues/100))
+
 - **The sink that reports a failed `fsync` was read as having written nothing, which
   is the one case the correction above exists for.** #91 computes "may the record have
   landed" by counting sinks whose `Write` returned nil. `fileOutput.Write` is a
