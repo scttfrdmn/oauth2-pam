@@ -54,10 +54,11 @@ type AuditLogger struct {
 	// caller's goroutine (see criticalAuditEvents) while the dispatcher may be
 	// writing a queued one, and Stop closes the sinks underneath both.
 	writeMu sync.Mutex
-	// stalled records that a write overran auditWriteTimeout and has not come back.
-	// While it is set, writeEvent refuses immediately rather than queueing behind a
-	// mutex held by a goroutine stuck in an fsync. See writeEvent.
-	stalled atomic.Bool
+	// stalledOn names the write that overran auditWriteTimeout and has not come
+	// back, or is nil if none has. While it is set and that write is still running,
+	// writeEvent refuses immediately rather than queueing behind a mutex held by a
+	// goroutine stuck in an fsync. See sinksStalled and writeEvent.
+	stalledOn atomic.Pointer[writeToken]
 	// testWriteTimeout overrides auditWriteTimeout. Only tests set it — a stalled
 	// sink is otherwise untestable in reasonable time, since the honest version of
 	// the test has to wait out the deadline.
@@ -400,9 +401,58 @@ func RecordMayHaveLanded(err error) bool {
 // to clear it, the flag stayed set and every later record was refused for the life
 // of the process. Fail-closed forever is still a broker that grants no logins.
 //
+// Winning settled decides who reports, and that is all it decides: it does not
+// order the two stores to stalled, which is how the paragraph above described a
+// bug it had only narrowed rather than closed. The state is no longer a flag at
+// all — see sinksStalled for why a flag could not be made correct here.
+//
 // A stalled sink still blocks Stop, which takes writeMu to close the outputs. That
 // is not new — a caller stuck in Sync held the same mutex before this change — and
 // it is a shutdown that hangs rather than a login that is silently unrecorded.
+// writeToken is one audit write's completion signal. The goroutine performing the
+// write closes finished when it is back, whatever the outcome was and whoever
+// reported it.
+type writeToken struct{ finished chan struct{} }
+
+// sinksStalled reports whether a write has overrun its deadline and not yet come
+// back, which is the condition for refusing a record rather than queueing behind a
+// mutex nobody is going to release soon.
+//
+// The state is a pointer to the overrunning write's own completion signal rather
+// than a bool, because a bool has to be cleared by somebody and neither candidate
+// can do it correctly. The deadline path cannot: the write is by definition still
+// running when it gives up. The write that eventually returns cannot either, and
+// this is the part two review rounds got wrong — its store and the deadline path's
+// store are unordered, so it could clear the flag microseconds before the deadline
+// path set it, leaving the flag set with nothing outstanding and no goroutine left
+// to clear it, because a refused write spawns none. Every record after that was
+// refused for the life of the process: a broker that grants no logins at all, out
+// of one write that was a few microseconds late. Round five narrowed that window
+// and called it closed; it took about forty runs of
+// TestAWriteReturningAsItsDeadlineFiresDoesNotWedgeTheStalledFlag to reappear, and
+// it reappeared on a CI runner rather than here.
+//
+// Asking the write itself has no such window. Recording a write that has already
+// finished is harmless, because the recorded thing carries its own answer: the next
+// caller looks, sees it is back, and retires it. The invariant the test states —
+// with no write outstanding, nothing is stalled — holds by construction rather than
+// by two stores landing in the right order.
+func (al *AuditLogger) sinksStalled() bool {
+	tok := al.stalledOn.Load()
+	if tok == nil {
+		return false
+	}
+	select {
+	case <-tok.finished:
+		// Back. Retire it, but only if nothing newer has taken its place since the
+		// load — otherwise this would clear a genuinely stalled write's record.
+		al.stalledOn.CompareAndSwap(tok, nil)
+		return false
+	default:
+		return true
+	}
+}
+
 func (al *AuditLogger) writeEvent(event AuditEvent) error {
 	data, err := json.Marshal(event)
 	if err != nil {
@@ -410,7 +460,7 @@ func (al *AuditLogger) writeEvent(event AuditEvent) error {
 		return fmt.Errorf("marshal audit event %s: %w", event.EventType, err)
 	}
 
-	if al.stalled.Load() {
+	if al.sinksStalled() {
 		log.Error().Str("event_type", event.EventType).
 			Msg("Audit sinks are not draining; refusing the record rather than waiting on them")
 		return &WriteError{
@@ -423,14 +473,16 @@ func (al *AuditLogger) writeEvent(event AuditEvent) error {
 	// settled decides which of the two paths below owns this write's outcome: the
 	// goroutine that returns, or the deadline that gives up on it. Exactly one.
 	var settled atomic.Bool
+	tok := &writeToken{finished: make(chan struct{})}
 	go func() {
 		al.writeMu.Lock()
 		defer func() {
-			// settled before stalled, and both before the unlock: claiming the outcome
-			// first is what stops the deadline path from setting a flag that this
-			// goroutine has already gone past clearing.
+			// The only thing this goroutine has to say about the stalled state: it is
+			// back. Whether anybody had given up on it in the meantime is not its
+			// business, and not asking is what removes the ordering problem — see
+			// sinksStalled.
+			close(tok.finished)
 			settled.Store(true)
-			al.stalled.Store(false)
 			al.writeMu.Unlock()
 		}()
 
@@ -475,7 +527,10 @@ func (al *AuditLogger) writeEvent(event AuditEvent) error {
 			// one, and the send on done has either happened or is about to.
 			return <-done
 		}
-		al.stalled.Store(true)
+		// Recording the write rather than a verdict about it. Doing this for a write
+		// that has in fact just finished is harmless: the next caller asks the write
+		// whether it is back, and it says yes.
+		al.stalledOn.Store(tok)
 		log.Error().Str("event_type", event.EventType).Dur("timeout", al.writeTimeout()).
 			Msg("Audit write exceeded its deadline; treating the record as unwritten")
 		return &WriteError{

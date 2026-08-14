@@ -152,8 +152,9 @@ func TestOnceTheSinksHaveStalledLaterRecordsFailImmediately(t *testing.T) {
 }
 
 // TestASinkThatComesBackClearsTheStall is the other half: a mount that recovers
-// must not leave the audit trail permanently refused. The flag is cleared by
-// whichever write eventually returns, so the next record is written normally.
+// must not leave the audit trail permanently refused. The stalled state names the
+// write that overran, so it stops being true as soon as that write comes back and
+// the next record is written normally.
 func TestASinkThatComesBackClearsTheStall(t *testing.T) {
 	al, sink := stalledLogger(t, 100*time.Millisecond)
 
@@ -164,10 +165,10 @@ func TestASinkThatComesBackClearsTheStall(t *testing.T) {
 	sink.unblock()
 
 	deadline := time.Now().Add(5 * time.Second)
-	for al.stalled.Load() && time.Now().Before(deadline) {
+	for al.sinksStalled() && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if al.stalled.Load() {
+	if al.sinksStalled() {
 		t.Fatal("the sink returned but the logger is still refusing records")
 	}
 

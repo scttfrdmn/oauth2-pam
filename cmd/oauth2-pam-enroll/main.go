@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"os/user"
@@ -23,6 +24,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 
+	"github.com/scttfrdmn/oauth2-pam/pkg/auth"
 	"github.com/scttfrdmn/oauth2-pam/pkg/config"
 	"github.com/scttfrdmn/oauth2-pam/pkg/enrollment"
 	"github.com/scttfrdmn/oauth2-pam/pkg/mapper"
@@ -240,10 +242,7 @@ func runEnroll(localUser, providerName string, groups []string, enrollFile strin
 		return fmt.Errorf("start device flow: %w", err)
 	}
 
-	fmt.Printf("\nTo enroll %q, authorize this application at %s:\n\n", localUser, prov.Name())
-	fmt.Printf("  Visit:      %s\n", flow.DeviceURL)
-	fmt.Printf("  User Code:  %s\n\n", flow.UserCode)
-	fmt.Printf("Waiting for authorization (expires in %s)...\n", time.Until(flow.ExpiresAt).Round(time.Second))
+	printDeviceInstructions(os.Stdout, localUser, prov.Name(), flow)
 
 	token, err := pollUntilAuthorized(ctx, prov, flow)
 	if err != nil {
@@ -310,6 +309,39 @@ func runEnroll(localUser, providerName string, groups []string, enrollFile strin
 		fmt.Printf("Groups: %s\n", strings.Join(groups, ", "))
 	}
 	return nil
+}
+
+// printDeviceInstructions writes the "go here, type this" block for a started
+// device flow.
+//
+// The two provider-chosen strings are sanitized for the same reason the broker
+// sanitizes them at broker.go:386 — #102. For a configured GitHub Enterprise
+// base_url it is the operator of that server who picks verification_uri and
+// user_code, and printed raw they can home the cursor, clear the screen and draw
+// a convincing prompt. The terminal they would draw it on here is a root shell
+// that was very likely just given a sudo password, and because this command never
+// reads stdin, anything typed at a fake prompt is left in the tty queue for the
+// invoking shell to run.
+//
+// prov.Name() needs none of this: it is providers[].name out of a root-owned
+// config file, not something the provider said. localUser is printed with %q and
+// has already been through the mapper's name gate.
+//
+// A function taking an io.Writer rather than four Printf calls in runEnroll,
+// because runEnroll needs a config, a real local account and a reachable provider
+// to reach its first print — which is how these two lines came to be the only
+// place in the tree where provider bytes reached a terminal unfiltered.
+// The write errors are discarded, which errcheck exempts for Printf and not for
+// Fprintf. There is nothing to do with a stdout that will not take bytes: the
+// operator cannot be told, since telling them is the write that just failed, and
+// failing the enrollment over it would refuse a device flow the provider has
+// already started.
+func printDeviceInstructions(w io.Writer, localUser, providerName string, flow *provider.DeviceFlow) {
+	_, _ = fmt.Fprintf(w, "\nTo enroll %q, authorize this application at %s:\n\n", localUser, providerName)
+	_, _ = fmt.Fprintf(w, "  Visit:      %s\n", auth.SanitizePromptValue(flow.DeviceURL))
+	_, _ = fmt.Fprintf(w, "  User Code:  %s\n\n", auth.SanitizePromptValue(flow.UserCode))
+	_, _ = fmt.Fprintf(w, "Waiting for authorization (expires in %s)...\n",
+		time.Until(flow.ExpiresAt).Round(time.Second))
 }
 
 // selectProviderConfig picks the providers[] entry to enroll against: the named

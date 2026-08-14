@@ -38,6 +38,15 @@ recommended stack omitted the `account` line that a whole round's work depends o
 Three of the five were found by reading a comment against the code it describes, which
 is now a habit worth keeping and, where possible, a check.
 
+A seventh round found one, and it is the counting error the previous six rounds were
+structurally unable to make: every one of them asked whether the mitigation was
+correct, and none asked how many callers were using it. `SanitizePromptValue` was
+written in round three for the pre-auth PAM terminal, is thoroughly tested, and had
+four call sites — all in `pkg/auth`. The fifth place a provider-chosen string reaches
+a terminal is `oauth2-pam-enroll`, which does not import `pkg/auth` and so inherited
+none of it. A test of a function cannot notice a caller that does not call it, and
+neither can a reviewer who starts from the function.
+
 **Upgrade notes.** `broker.yaml` must be mode 0600 regardless of where the client
 secret lives — the check used to apply only when the secret was inline, which left
 the file holding the token-encryption key unchecked in every deployment that did the
@@ -56,6 +65,45 @@ revocation; read the warning next to it first, because `account required
 oauth2_pam.so` on its own denies the publickey break-glass path.
 
 ### Fixed
+
+- **`oauth2-pam-enroll` drew the provider's `verification_uri` and `user_code` on a
+  root terminal without filtering them.** The broker sanitizes those two strings
+  before they reach a pre-auth tty, for a reason it states at length: with a GitHub
+  Enterprise `base_url` configured, that server picks both, so its operator picks what
+  every host configured against it draws on screen. `oauth2-pam-enroll` gets the same
+  two strings from the same `StartDeviceFlow` call and printed them with a bare `%s` —
+  it does not import `pkg/auth`, so it inherited nothing. The terminal here is worse,
+  not better: an operator runs this under `sudo`, so the escapes land on a root shell
+  moments after a real sudo password was typed into it, and because the command never
+  reads stdin, anything typed at a fake prompt is left in the tty queue for the
+  invoking shell to run as a command. Both values now go through
+  `SanitizePromptValue`, and the print is a function taking an `io.Writer` so that a
+  test can assert on what reaches the terminal — `runEnroll` needs a config, a real
+  local account and a reachable provider before it prints anything, which is how these
+  two lines came to be the last unfiltered path in the tree.
+
+- **The stalled-sink flag could still wedge fail-closed forever, and did so on CI one
+  push after the round that thought it had fixed it.** An audit write runs on its own
+  goroutine with the deadline enforced by the caller, so two paths can observe the
+  same write and a compare-and-set on `settled` decides which one reports it. That CAS
+  orders the *report*; it does not order the two stores to the `stalled` flag. With the
+  deadline path descheduled between winning the CAS and storing `true`, the write's own
+  deferred `Store(false)` lands first — and the flag ends up set with nothing
+  outstanding. Nothing clears it after that, because a refused write returns without
+  spawning a goroutine, so every audit record for the life of the process is refused;
+  and since an access decision that cannot be recorded is refused, the broker grants no
+  logins at all while its sinks are perfectly healthy. Round five narrowed this window
+  and its comment argued it was closed. The argument was wrong in a way that a bool
+  cannot be made right: the deadline path cannot clear the flag, because the write is by
+  definition still running when it gives up, and the write cannot clear it either. So
+  the state is no longer a verdict about a write but a pointer to the write, carrying
+  its own completion signal, and `sinksStalled` asks it — recording a write that has
+  already finished is then harmless, and the invariant holds by construction rather
+  than by two stores landing in the right order. The test that caught this needed about
+  forty runs to do it, because it sampled the flag once at an instant when a returned
+  write legitimately still holds `writeMu`; polled to a deadline instead, it fails on
+  the first run against the old mechanism.
+  ([#100](https://github.com/scttfrdmn/oauth2-pam/issues/100))
 
 - **The sink that reports a failed `fsync` was read as having written nothing, which
   is the one case the correction above exists for.** #91 computes "may the record have

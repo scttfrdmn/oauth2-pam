@@ -533,12 +533,16 @@ func (c *Config) Validate() error {
 	// built in code rather than loaded from a file gets the floor rather than an
 	// error.
 	//
-	// A negative value turns the floor off entirely — pkg/mapper's check is
-	// `minUID >= 0 && uid < minUID` — leaving only the system-account name
+	// A negative value would mean "no floor", leaving only the system-account name
 	// denylist, which on an LDAP/SSSD host a broker built without cgo cannot even
 	// resolve names against. That is not a setting worth having: a site with real
 	// accounts below 1000 says so by naming the lowest UID it means to allow, and
 	// nothing else needs the floor gone.
+	//
+	// Two independent guards, so neither has to be the only one: this refusal, and
+	// mapper.New clamping a non-positive value to the default. Which is why
+	// mapper's own check is an unconditional `uid < c.minUID` — by the time it runs,
+	// minUID cannot be negative by either route.
 	if c.Mapper.MinUID < 0 {
 		return fmt.Errorf("mapper.min_uid must not be negative (got %d): a negative value disables "+
 			"the UID floor for every tier; to allow accounts below 1000, set the lowest UID you "+

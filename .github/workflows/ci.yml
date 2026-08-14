@@ -87,7 +87,7 @@ jobs:
       - name: C bridge tests
         run: sudo env NATIVE=1 test/cbridge/run.sh
 
-      # And the check on that check: reintroduce each of the six fixed defects in
+      # And the check on that check: reintroduce each fixed defect in turn in
       # a copy of the source and assert the suite fails. Without this, SECURITY.md
       # claiming the tests are mutation-verified is a claim about a run nobody can
       # see. Same sudo/NATIVE reasoning as above — the mutated suite has to be
