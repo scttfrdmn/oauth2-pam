@@ -17,6 +17,7 @@
 #include "../../cmd/pam-module/cgo_bridge_linux.c"
 
 #include <assert.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -623,6 +624,36 @@ static void test_parse_arguments(void) {
 
 int main(void) {
     printf("cbridge tests\n");
+
+    /* Pin SIGPIPE to its default disposition, because a signal disposition is
+       inherited across exec() and this suite's protection against a missing
+       MSG_NOSIGNAL depends entirely on it.
+
+       With SIGPIPE ignored, send() to a closed peer returns EPIPE instead of
+       killing the process, so send_json reports the failure either way and
+       test_send_json_survives_a_closed_peer passes with or without
+       MSG_NOSIGNAL. That is not a hypothetical: the mutation check ran green on
+       macOS under Docker (default disposition) and simultaneously MISSED the
+       mutation on the GitHub Linux runner, whose process tree ignores SIGPIPE.
+       For a while the suite reported that it was pinning this defect down while
+       pinning nothing.
+
+       Resetting it here is also the faithful thing to do rather than merely the
+       convenient one: in production this code runs inside sshd's pre-auth child,
+       a process whose SIGPIPE disposition the module does not choose and cannot
+       rely on. Testing under the disposition that kills is testing the case that
+       matters. */
+    if (signal(SIGPIPE, SIG_DFL) == SIG_ERR) {
+        printf("FATAL: could not reset SIGPIPE to SIG_DFL: %s\n", strerror(errno));
+        return 1;
+    }
+    /* And confirm it took, so this cannot quietly stop working. */
+    {
+        struct sigaction sa;
+        CHECK(sigaction(SIGPIPE, NULL, &sa) == 0, "could not read back SIGPIPE disposition");
+        CHECK(sa.sa_handler == SIG_DFL,
+              "SIGPIPE is not SIG_DFL; a missing MSG_NOSIGNAL would go undetected");
+    }
 
     test_validate_socket_path();
     test_receive_ordinary_response();
