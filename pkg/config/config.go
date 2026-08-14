@@ -44,6 +44,17 @@ var SupportedProviderTypes = []string{"github"}
 // mode is discovering it during an incident, when the records are wanted.
 var SupportedAuditOutputTypes = []string{"stdout", "file", "syslog"}
 
+// maxServerTimeout bounds server.read_timeout and server.write_timeout.
+//
+// Only negative values were rejected, so `read_timeout: 24h` validated cleanly —
+// and each of the IPC server's bounded handler slots is held for as long as its
+// read takes, which turns a handful of idle half-written requests into a stall
+// that outlasts the day. Nothing legitimate needs more than this either: every
+// caller is a PAM module inside sshd's pre-auth child with a timeout of its own
+// (90s by default), so a deadline beyond a couple of minutes can only be waited
+// out by a login nobody is still waiting for.
+const maxServerTimeout = 5 * time.Minute
+
 // SupportedLogLevels lists the values server.log_level may take. They are
 // zerolog's own names, because cmd/broker hands the value to zerolog.ParseLevel.
 //
@@ -463,8 +474,18 @@ func (c *Config) Validate() error {
 	if c.Server.ReadTimeout < 0 {
 		return fmt.Errorf("server.read_timeout must not be negative")
 	}
+	if c.Server.ReadTimeout > maxServerTimeout {
+		return fmt.Errorf("server.read_timeout (%s) must not exceed %s: it is the deadline on one "+
+			"connection, and a connection holds one of the server's handler slots for as long as it "+
+			"lasts", c.Server.ReadTimeout, maxServerTimeout)
+	}
 	if c.Server.WriteTimeout < 0 {
 		return fmt.Errorf("server.write_timeout must not be negative")
+	}
+	if c.Server.WriteTimeout > maxServerTimeout {
+		return fmt.Errorf("server.write_timeout (%s) must not exceed %s: it is the deadline on one "+
+			"connection, and a connection holds one of the server's handler slots for as long as it "+
+			"lasts", c.Server.WriteTimeout, maxServerTimeout)
 	}
 	if c.Security.RateLimiting.MaxConcurrentAuths < 0 {
 		return fmt.Errorf("security.rate_limiting.max_concurrent_auths must be non-negative (0 = unlimited)")

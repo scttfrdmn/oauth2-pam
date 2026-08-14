@@ -9,7 +9,10 @@ server:
   log_level: info
 
   # Deadlines applied to each IPC connection. Raise read_timeout if a slow
-  # identity-mapping service makes the PAM module's calls time out.
+  # identity-mapping service makes the PAM module's calls time out. Both are
+  # capped at 5 minutes: a connection holds one of the server's handler slots for
+  # as long as its deadline allows, and no login the module is still waiting for
+  # lasts that long anyway (its own default timeout is 90s).
   read_timeout: 30s
   write_timeout: 30s
 

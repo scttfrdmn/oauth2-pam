@@ -122,6 +122,14 @@ func TestValidate(t *testing.T) {
 
 		{"negative read timeout", func(c *Config) { c.Server.ReadTimeout = -time.Second }, "read_timeout"},
 		{"negative write timeout", func(c *Config) { c.Server.WriteTimeout = -time.Second }, "write_timeout"},
+		// Only negatives were rejected, so 24h validated cleanly and made a handful
+		// of idle half-written requests into a stall that outlasted the day: a
+		// connection holds one of the server's bounded handler slots for as long as
+		// its read deadline allows.
+		{"read timeout beyond the ceiling", func(c *Config) { c.Server.ReadTimeout = 24 * time.Hour }, "read_timeout"},
+		{"write timeout beyond the ceiling", func(c *Config) { c.Server.WriteTimeout = 24 * time.Hour }, "write_timeout"},
+		{"read timeout at the ceiling", func(c *Config) { c.Server.ReadTimeout = maxServerTimeout }, ""},
+		{"a raised but sane read timeout", func(c *Config) { c.Server.ReadTimeout = 2 * time.Minute }, ""},
 		{"negative concurrent auth limit", func(c *Config) { c.Security.RateLimiting.MaxConcurrentAuths = -1 }, "max_concurrent_auths"},
 
 		// A typo in the allowlist would silently discard an entire class of
