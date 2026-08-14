@@ -443,6 +443,15 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 
 // CheckSession returns the current state of a session. This is the call the
 // PAM module polls while the user completes the device flow.
+//
+// Every bound RefreshSession refuses on, this must refuse on too:
+// docs/wire-protocol.md requires the two verbs to agree, and a client that only
+// ever polls check_session — which is every in-tree client, as nothing sends
+// refresh_session — would otherwise be told "authorized" for a session the
+// broker itself would not extend. It used to consult neither
+// security.max_token_age nor the token store; both cases were measured as
+// check_session answering authorized/success=true against refresh_session
+// answering expired/SESSION_EXPIRED for the same session ID.
 func (b *Broker) CheckSession(sessionID string) (*AuthResponse, error) {
 	session := b.getSession(sessionID)
 	if session == nil {
@@ -468,8 +477,10 @@ func (b *Broker) CheckSession(sessionID string) (*AuthResponse, error) {
 		}, nil
 	}
 
+	now := time.Now()
+
 	if !session.IsActive {
-		if session.ExpiresAt.Before(time.Now()) {
+		if session.ExpiresAt.Before(now) {
 			// Device code lifetime elapsed without the poller noticing yet.
 			b.failSession(sessionID, StatusExpired, "Device authorization expired")
 			return &AuthResponse{
@@ -489,7 +500,7 @@ func (b *Broker) CheckSession(sessionID string) (*AuthResponse, error) {
 		}, nil
 	}
 
-	if session.ExpiresAt.Before(time.Now()) {
+	if session.ExpiresAt.Before(now) {
 		b.removeSession(sessionID)
 		return &AuthResponse{
 			Success:      false,
@@ -497,6 +508,38 @@ func (b *Broker) CheckSession(sessionID string) (*AuthResponse, error) {
 			ErrorCode:    "SESSION_EXPIRED",
 			ErrorMessage: "Session has expired",
 		}, nil
+	}
+
+	// The absolute age ceiling. Revoked rather than merely refused, exactly as
+	// RefreshSession does it: the ceiling is a security control, so the token goes
+	// with the session.
+	if b.pastMaxTokenAge(session, now) {
+		log.Info().
+			Str("session_id", sessionID).
+			Str("local_user", session.LocalUser).
+			Dur("age", now.Sub(session.CreatedAt)).
+			Dur("max_token_age", b.config.Security.MaxTokenAge).
+			Msg("Session reached security.max_token_age; revoking instead of reporting it authorized")
+		if err := b.RevokeSession(sessionID); err != nil {
+			log.Warn().Err(err).Str("session_id", sessionID).
+				Msg("Failed to revoke a session past max_token_age")
+		}
+		return expiredSessionResponse(sessionID,
+			"Session has reached the maximum permitted age"), nil
+	}
+
+	// A session is what authorizes the use of a credential, so a session that has
+	// outlived its token is a shell and must not be reported as authorized.
+	//
+	// This is reachable without anyone calling refresh_session: the token manager
+	// drops a token when the *token record's* expiry passes, and a refresh extends
+	// the session's expiry without extending the record's, so after one refresh the
+	// token can be gone while the session stays live for up to token_lifetime.
+	if session.TokenID != "" && !b.tokenManager.Has(session.TokenID) {
+		log.Warn().Str("session_id", sessionID).Str("local_user", session.LocalUser).
+			Msg("Authorized session has no usable token; reporting it expired")
+		b.removeSession(sessionID)
+		return expiredSessionResponse(sessionID, "Session credentials are no longer valid"), nil
 	}
 
 	return b.successResponse(session), nil
@@ -578,21 +621,23 @@ func (b *Broker) RefreshSession(sessionID string) (*AuthResponse, error) {
 			"Session has reached the maximum permitted age"), nil
 	}
 
-	// The token is what the session authorizes the use of. If it no longer
-	// resolves it has been revoked or has aged out of the store, and the session
-	// is a shell that must not be reported as authorized — let alone extended.
+	// The token is what the session authorizes the use of. If it is no longer in
+	// the store it has been revoked or has aged out, and the session is a shell
+	// that must not be reported as authorized — let alone extended.
 	//
 	// This is deliberately a second, independent check on the same fact the
 	// compare-and-set below establishes: it is the one that catches a session
 	// that was resurrected, or was never torn down properly, by some path other
 	// than the window between the read above and the write below.
-	if session.TokenID != "" {
-		if _, err := b.tokenManager.GetDecryptedAccessToken(session.TokenID); err != nil {
-			log.Warn().Err(err).Str("session_id", sessionID).
-				Msg("Authorized session has no usable token; refusing to refresh")
-			b.removeSession(sessionID)
-			return expiredSessionResponse(sessionID, "Session credentials are no longer valid"), nil
-		}
+	//
+	// TokenManager.Has rather than GetDecryptedAccessToken: the question is
+	// whether the credential exists, and answering it by decrypting put a
+	// plaintext access token in the heap, once per refresh, only to discard it.
+	if session.TokenID != "" && !b.tokenManager.Has(session.TokenID) {
+		log.Warn().Str("session_id", sessionID).
+			Msg("Authorized session has no usable token; refusing to refresh")
+		b.removeSession(sessionID)
+		return expiredSessionResponse(sessionID, "Session credentials are no longer valid"), nil
 	}
 
 	if time.Until(session.ExpiresAt) > b.config.Authentication.RefreshThreshold {
@@ -601,7 +646,7 @@ func (b *Broker) RefreshSession(sessionID string) (*AuthResponse, error) {
 
 	// Extend the session lifetime, but only if it is still the same authorized
 	// session that was read above.
-	expiresAt := now.Add(b.config.Authentication.TokenLifetime)
+	expiresAt := b.extendedExpiry(session, now)
 	if !b.extendSession(sessionID, session.CreatedAt, func(s *Session) {
 		s.ExpiresAt = expiresAt
 		s.LastAccessed = now
@@ -1106,6 +1151,25 @@ func (b *Broker) pastMaxTokenAge(s *Session, now time.Time) bool {
 		return false
 	}
 	return now.Sub(s.CreatedAt) > max
+}
+
+// extendedExpiry is how far a refresh may push a session's expiry: one
+// authentication.token_lifetime from now, or the security.max_token_age ceiling
+// measured from CreatedAt, whichever comes first.
+//
+// Refusing a refresh at the ceiling is not enough on its own. A refresh granted a
+// moment before it hands out authorization that reaches past it — measured at 59
+// minutes past — and nothing revisits that until the five-minute cleanup sweep,
+// so the ceiling was routinely overshot by a session that never asked to be
+// extended twice.
+func (b *Broker) extendedExpiry(s *Session, now time.Time) time.Time {
+	expiresAt := now.Add(b.config.Authentication.TokenLifetime)
+	if max := b.config.Security.MaxTokenAge; max > 0 {
+		if ceiling := s.CreatedAt.Add(max); ceiling.Before(expiresAt) {
+			return ceiling
+		}
+	}
+	return expiresAt
 }
 
 // baseContext is the parent for per-session polling contexts. Start records the
