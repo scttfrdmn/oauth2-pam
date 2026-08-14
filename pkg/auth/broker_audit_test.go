@@ -77,13 +77,22 @@ func (s *recordingSink) lastOfType(eventType string) *security.AuditEvent {
 // starts and stops.
 func brokerWithAuditSink(t *testing.T, cfg *config.Config, sink security.AuditOutput, providers ...provider.Provider) *Broker {
 	t.Helper()
+	return brokerWithAuditSinks(t, cfg, []security.AuditOutput{sink}, providers...)
+}
+
+// brokerWithAuditSinks is brokerWithAuditSink for the configurations where the
+// number of sinks is the point. audit.outputs is a list, and a write that one sink
+// refuses and another accepts is a different fact from a write nothing accepted —
+// see #91 and broker_audit_correction_test.go.
+func brokerWithAuditSinks(t *testing.T, cfg *config.Config, sinks []security.AuditOutput, providers ...provider.Provider) *Broker {
+	t.Helper()
 	cfg.Audit = config.AuditConfig{Enabled: true}
 
 	b, err := NewBrokerWithProviders(cfg, providers)
 	if err != nil {
 		t.Fatalf("NewBrokerWithProviders: %v", err)
 	}
-	logger, err := security.NewAuditLoggerWithOutputs(cfg.Audit, sink)
+	logger, err := security.NewAuditLoggerWithOutputs(cfg.Audit, sinks...)
 	if err != nil {
 		t.Fatalf("NewAuditLoggerWithOutputs: %v", err)
 	}

@@ -12,6 +12,20 @@ A third adversarial review round, on a tree that had already survived two. It fo
 the code reviewed: three of them were fail-**open** reads of the field that decides a
 login, and none of the three were reachable by the previous rounds' methods.
 
+A fourth round then found three more, and the shape of them says something about
+where the remaining defects live: all three are places where two fixes from
+*different* rounds were each correct alone and wrong together. The audit write that
+must fail a login met a sink that never returns; the 16 KiB reply cap met a mapper
+whose own comment endorsed a group list several times that size.
+
+A fifth round found two, and both were in the fourth round's own fixes — which is
+the more useful result. A fix lands with fresh reasoning and no adversary yet; the
+round after it is the first time anything reads it looking for the case it missed.
+Both misses are of one kind: a guarantee stated in the units it was convenient to
+measure rather than the units it is enforced in. "The record was not written" was
+read as "no sink has the record", and a byte budget was counted before the escaping
+that decides what the bytes are.
+
 **Upgrade notes.** `broker.yaml` must be mode 0600 regardless of where the client
 secret lives — the check used to apply only when the secret was inline, which left
 the file holding the token-encryption key unchecked in every deployment that did the
@@ -20,6 +34,90 @@ start until it is chmodded; the error names the file and the command. A negative
 `mapper.min_uid` is also now rejected rather than silently disabling the UID floor.
 
 ### Fixed
+
+- **A refused login could leave an uncorrected `authentication_success` in the
+  trail.** #87 made a failed audit write refuse the login, and read that failure as
+  "no sink has this record". It never meant that. Every sink is attempted whatever
+  the earlier ones did — deliberately, so a broken file output does not cost the
+  record on syslog — so an ordinary two-sink `audit.outputs` with a full audit
+  filesystem returned an error while syslog held the record; and a write that
+  overran its deadline is still running, with `fileOutput.Write` having written the
+  bytes before it reached the `fsync` it is stuck in, which is the #87 scenario
+  itself. Since `failSession` writes no record of its own, the trail's last word on
+  the session was an `authentication_success` indistinguishable from a real grant —
+  during a disk-full incident, a burst of successful authentications at the moment
+  nobody could log in. `LogAuthEventErr` now returns a `*security.WriteError` that
+  says whether the record may have landed, and the broker corrects the ones that may
+  have with the same compensating `session_revoked` a withdrawn grant gets. The
+  correction is best effort and says so: if the sinks have stalled it is refused for
+  the same reason, logged at `error`. Also on this path: the stalled flag could be
+  set by a write that had already cleared it — leaving every later record refused
+  for the life of the process — and the stdout sink discarded `fmt.Println`'s error,
+  which made the whole guarantee vacuous on the default configuration, where stdout
+  is the only sink and under systemd is a journal socket.
+  ([#91](https://github.com/scttfrdmn/oauth2-pam/issues/91))
+
+- **The reply budget was counted before the escaping that decides the byte count.**
+  #88's bounds are enforced in `pkg/auth` and detected in `internal/ipc`, on either
+  side of a `json.Marshal` — and Go's encoder writes `&`, `<`, `>` and U+2028/9 as
+  six-byte `\uXXXX` escapes with HTML escaping on, which is the default and is not
+  disabled anywhere in the tree. #88 stripped control characters for exactly this
+  reason and then concluded that expansion was capped at 2x. So a mapper on tier 2
+  or 3 answering with 32 group names of 96 ampersands measured 3072 bytes against
+  the group budget and serialized to 18432 — past the entire 16 KiB reply cap on the
+  group list alone, with #88's eight-hour lockout behind it. The budgets are now
+  charged in encoded bytes, so a maximal authorized reply measures about 4 KB
+  whatever its characters are, and one test in each package serializes a group list
+  that the bounds *accept* — neither of #88's own tests did, which is how this got
+  through. ([#92](https://github.com/scttfrdmn/oauth2-pam/issues/92))
+
+- **An audit sink that stalled turned the fail-closed audit guarantee into its
+  opposite.** A login is now refused when its audit record cannot be written — but
+  "the sink returned an error" and "the sink never returned" are different failures,
+  and only the first was handled. `fileOutput.Write` ends in an `fsync`, which blocks
+  indefinitely on a hard NFS mount that has become unreachable, and the syslog sink
+  blocks the same way on a `/dev/log` whose peer has stopped reading. A caller that
+  never gets an answer never refuses anything, so an unreachable log server granted
+  logins and recorded none of them. Audit writes now run under a five-second deadline
+  (not configurable: an operator who could raise it would be choosing to wait longer
+  before finding out their audit trail has stopped), and once one write has overrun,
+  later ones fail immediately rather than each queueing behind an `fsync` nothing can
+  abort. Separately, the `authentication_success` record is now written *before* the
+  session is activated rather than after, so no grant exists until the record is in
+  front of a sink: the old order granted first and withdrew on a write failure, and
+  both PAM stages are sub-millisecond socket round trips, so a `check_session`
+  landing in that window got a shell the withdrawal could not take back. A
+  compare-and-set refusal after the record is written now emits a compensating
+  `session_revoked`, so the trail's last word on that session is not a login that
+  never took effect. ([#87](https://github.com/scttfrdmn/oauth2-pam/issues/87))
+
+- **An authorized reply could exceed the reply cap, stranding the session behind
+  it.** `email`, `groups` and `provider_login` are all in every authorized reply and
+  none of the three was bounded: the first two come from the provider, and `groups`
+  arrives through a mapper tier whose own limit is 1 MB — with a comment endorsing "a
+  user in a thousand groups". Over 16 KiB, `writeResponse` substitutes
+  `RESPONSE_TOO_LARGE`, which the module maps to a terminal `PAM_AUTHINFO_UNAVAIL`;
+  the residue is the real defect, because the session stays authorized and active,
+  counts toward `max_concurrent_sessions` (10) and holds a live token for
+  `token_lifetime` (8h) — so ten attempts locked a user out for eight hours behind
+  ten authorized sessions no client could resolve. The fields are now bounded where
+  they are composed, control characters stripped (JSON escaping is not
+  size-preserving: one control character becomes six bytes), and an over-budget group
+  list is dropped whole with `metadata.groups_omitted` set rather than silently
+  truncated to look complete. The cap is back to being a backstop.
+  ([#88](https://github.com/scttfrdmn/oauth2-pam/issues/88))
+
+- **An `authentication_failed` record named an account chosen by the person being
+  refused.** The mapping-failure branch built its record with `UserID:
+  identity.Login` — the provider's login, in the field every other event uses for the
+  local Unix account. Anyone with a provider account, needing no local account and no
+  org membership, could rename themselves to `root` and make the broker write an
+  unfilterable record attributing the failure there; a SIEM rule counting failures
+  per `user_id` would attribute them there too. Its sibling failed the other way: the
+  identity-refusal branch — "not in the required org or team", the most common real
+  refusal — recorded no `user_id` at all. Both now name the requested local account,
+  with the provider's login in `metadata.provider_login` where its neighbours already
+  put it. ([#89](https://github.com/scttfrdmn/oauth2-pam/issues/89))
 
 - **`"success":"false"` read as true in the C module.** `json_object_get_boolean`
   coerces: any non-empty string and any non-zero number is true. So the one field the

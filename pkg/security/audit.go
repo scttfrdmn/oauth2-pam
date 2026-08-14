@@ -3,6 +3,7 @@ package security
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -52,12 +53,20 @@ type AuditLogger struct {
 	// writeMu serializes writes to the outputs. Critical events are written on the
 	// caller's goroutine (see criticalAuditEvents) while the dispatcher may be
 	// writing a queued one, and Stop closes the sinks underneath both.
-	writeMu       sync.Mutex
-	eventChan     chan AuditEvent
-	stopChan      chan struct{}
-	wg            sync.WaitGroup
-	droppedCount  atomic.Uint64
-	filteredCount atomic.Uint64
+	writeMu sync.Mutex
+	// stalled records that a write overran auditWriteTimeout and has not come back.
+	// While it is set, writeEvent refuses immediately rather than queueing behind a
+	// mutex held by a goroutine stuck in an fsync. See writeEvent.
+	stalled atomic.Bool
+	// testWriteTimeout overrides auditWriteTimeout. Only tests set it — a stalled
+	// sink is otherwise untestable in reasonable time, since the honest version of
+	// the test has to wait out the deadline.
+	testWriteTimeout time.Duration
+	eventChan        chan AuditEvent
+	stopChan         chan struct{}
+	wg               sync.WaitGroup
+	droppedCount     atomic.Uint64
+	filteredCount    atomic.Uint64
 }
 
 // FilteredEvents returns the number of events not written because their type
@@ -278,6 +287,47 @@ func (al *AuditLogger) processEvents(ctx context.Context) {
 	}
 }
 
+// WriteError is a failed audit write, and reports whether the record may
+// nevertheless be sitting at a sink.
+//
+// The distinction is the whole point of the type (#91). A caller that refuses an
+// access decision because the record could not be written needs to know which of
+// two different facts it has been told. "No sink has this record" needs nothing
+// further: the trail says nothing, and nothing happened. "Some sink may have this
+// record" is the opposite — a reader will find an authentication_success
+// byte-identical to a real grant, describing a login that was refused — and the
+// caller has to correct it.
+//
+// Two ways the second arises, neither exotic. Every sink is attempted whatever the
+// earlier ones did (see writeEvent), so one broken output among several returns an
+// error while the healthy ones hold the record. And a write that overran its
+// deadline is still running: fileOutput.Write is a write followed by an fsync, so
+// on the degraded-disk case that motivated the deadline the bytes are in the file,
+// and visible to anything tailing it, well before the deadline fires.
+type WriteError struct {
+	EventType string
+	// MayHaveLanded reports that at least one sink accepted the record, or that a
+	// write still in progress may yet accept it. False means the record reached
+	// nothing: every sink refused it, or none was attempted.
+	MayHaveLanded bool
+	Err           error
+}
+
+func (e *WriteError) Error() string {
+	return fmt.Sprintf("write audit event %s: %v", e.EventType, e.Err)
+}
+
+func (e *WriteError) Unwrap() error { return e.Err }
+
+// RecordMayHaveLanded reports whether err from LogAuthEventErr leaves the record
+// possibly present at a sink, and so in need of correcting rather than forgetting.
+// A non-WriteError — a marshal failure, or any error from elsewhere — is not
+// something a sink ever saw.
+func RecordMayHaveLanded(err error) bool {
+	var we *WriteError
+	return errors.As(err, &we) && we.MayHaveLanded
+}
+
 // writeEvent writes event to every sink and returns the first failure.
 //
 // It used to log a failure and return nothing, which for a critical event meant a
@@ -288,24 +338,133 @@ func (al *AuditLogger) processEvents(ctx context.Context) {
 //
 // Every sink is attempted whatever the earlier ones did: a broken file output must
 // not cost the record on syslog as well.
+//
+// The write is bounded by auditWriteTimeout, because "the sink returned an error"
+// and "the sink never returned" are different failures and only the first one was
+// handled. A sink that stalls rather than erroring is not exotic: fileOutput.Write
+// ends in an fsync, and a hard NFS mount that becomes unreachable blocks it
+// indefinitely; syslogOutput.Write blocks the same way on a stream /dev/log whose
+// peer has stopped reading. Without a deadline the caller waits forever, and a
+// caller that waits forever never gets the error that would make it withdraw a
+// grant — so an unreachable log server turned the fail-closed guarantee above into
+// its exact opposite, granting logins and recording none of them (#87).
+//
+// The write therefore happens on its own goroutine and the deadline is enforced
+// here. Nothing can abort an fsync in progress, so that goroutine is still stuck
+// afterwards, holding writeMu; that is the point of the stalled flag. Once one
+// write has overrun, later ones fail immediately instead of each queueing behind
+// the mutex and waiting out the full timeout again — the sinks are known bad, and
+// the answer callers need is the error, quickly. Whichever write eventually
+// returns clears the flag, from inside writeMu so that the write clearing it is
+// necessarily the one that was past the lock.
+//
+// Which of the two paths reports a write's outcome is decided by a compare-and-set
+// on settled, so that the two cannot both act on the same write. A write that
+// returns in the same moment its deadline fires used to be declared stalled after
+// it had already cleared the flag — and since a refused write spawns no goroutine
+// to clear it, the flag stayed set and every later record was refused for the life
+// of the process. Fail-closed forever is still a broker that grants no logins.
+//
+// A stalled sink still blocks Stop, which takes writeMu to close the outputs. That
+// is not new — a caller stuck in Sync held the same mutex before this change — and
+// it is a shutdown that hangs rather than a login that is silently unrecorded.
 func (al *AuditLogger) writeEvent(event AuditEvent) error {
 	data, err := json.Marshal(event)
 	if err != nil {
 		log.Error().Err(err).Str("event_type", event.EventType).Msg("Failed to marshal audit event")
 		return fmt.Errorf("marshal audit event %s: %w", event.EventType, err)
 	}
-	al.writeMu.Lock()
-	defer al.writeMu.Unlock()
-	var firstErr error
-	for _, out := range al.outputs {
-		if err := out.Write(data); err != nil {
-			log.Error().Err(err).Str("event_type", event.EventType).Msg("Failed to write audit event")
-			if firstErr == nil {
-				firstErr = fmt.Errorf("write audit event %s: %w", event.EventType, err)
-			}
+
+	if al.stalled.Load() {
+		log.Error().Str("event_type", event.EventType).
+			Msg("Audit sinks are not draining; refusing the record rather than waiting on them")
+		return &WriteError{
+			EventType: event.EventType,
+			Err:       errors.New("an earlier write to the audit sinks has not returned"),
 		}
 	}
-	return firstErr
+
+	done := make(chan error, 1)
+	// settled decides which of the two paths below owns this write's outcome: the
+	// goroutine that returns, or the deadline that gives up on it. Exactly one.
+	var settled atomic.Bool
+	go func() {
+		al.writeMu.Lock()
+		defer func() {
+			// settled before stalled, and both before the unlock: claiming the outcome
+			// first is what stops the deadline path from setting a flag that this
+			// goroutine has already gone past clearing.
+			settled.Store(true)
+			al.stalled.Store(false)
+			al.writeMu.Unlock()
+		}()
+
+		var firstErr error
+		accepted := 0
+		for _, out := range al.outputs {
+			if err := out.Write(data); err != nil {
+				log.Error().Err(err).Str("event_type", event.EventType).Msg("Failed to write audit event")
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			accepted++
+		}
+		if firstErr == nil {
+			done <- nil
+			return
+		}
+		done <- &WriteError{
+			EventType:     event.EventType,
+			MayHaveLanded: accepted > 0,
+			Err:           firstErr,
+		}
+	}()
+
+	timer := time.NewTimer(al.writeTimeout())
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		if !settled.CompareAndSwap(false, true) {
+			// It came back in the moment the deadline fired. Its answer is the better
+			// one, and the send on done has either happened or is about to.
+			return <-done
+		}
+		al.stalled.Store(true)
+		log.Error().Str("event_type", event.EventType).Dur("timeout", al.writeTimeout()).
+			Msg("Audit write exceeded its deadline; treating the record as unwritten")
+		return &WriteError{
+			EventType: event.EventType,
+			// The write is still running and nothing can abort it. fileOutput.Write has
+			// already written the bytes by the time it is inside Sync, so the caller
+			// must treat this record as possibly readable.
+			MayHaveLanded: true,
+			Err: fmt.Errorf("audit sinks did not accept the record within %s",
+				al.writeTimeout()),
+		}
+	}
+}
+
+// auditWriteTimeout bounds one attempt to get a record in front of the sinks.
+//
+// Five seconds is far longer than any healthy sink needs — an fsync to a local
+// disk is single-digit milliseconds, and to a responsive NFS server tens — and
+// short enough that a caller holding a grant open on the answer is not waiting on
+// a dead log server for a minute. It is deliberately not configurable: an operator
+// who could raise it would be choosing to wait longer before finding out that
+// their audit trail has stopped, and there is no good reason to want that.
+const auditWriteTimeout = 5 * time.Second
+
+// writeTimeout is the deadline writeEvent enforces. Tests override it; nothing
+// else does.
+func (al *AuditLogger) writeTimeout() time.Duration {
+	if al.testWriteTimeout > 0 {
+		return al.testWriteTimeout
+	}
+	return auditWriteTimeout
 }
 
 // --- output implementations ---
@@ -332,8 +491,15 @@ func newAuditOutput(cfg config.AuditOutput) (AuditOutput, error) {
 
 type stdoutOutput struct{}
 
+// Write returns the write error rather than discarding it. stdout is the default
+// sink — config.setDefaults installs it when audit.outputs is empty — so a sink
+// that can never fail made the fail-closed guarantee above vacuous on the default
+// configuration: under systemd stdout is a journal socket, and a full or
+// unreachable journal is exactly the case the guarantee is for.
 func (o *stdoutOutput) Write(data []byte) error {
-	fmt.Println(string(data))
+	if _, err := fmt.Println(string(data)); err != nil {
+		return fmt.Errorf("write to stdout: %w", err)
+	}
 	return nil
 }
 
