@@ -172,12 +172,23 @@ sudo systemctl enable --now oauth2-pam-broker
 
 ### 6. Configure PAM (SSH)
 
-Edit `/etc/pam.d/sshd`:
+**Open a second root session first and leave it open.** Everything in this section can lock you out of the host, and the recovery is a console, not another ssh attempt. Read [Before you edit the PAM stack](#before-you-edit-the-pam-stack) below.
+
+Add the module to `/etc/pam.d/sshd` **after** the distribution's own auth stack, as a *second* factor:
 
 ```
-# Add before @include common-auth
-auth sufficient oauth2_pam.so socket=/var/run/oauth2-pam/broker.sock
+# Debian/Ubuntu: common-auth is the password factor
+@include common-auth
+auth required oauth2_pam.so socket=/var/run/oauth2-pam/broker.sock
 ```
+
+```
+# RHEL/Fedora/Amazon Linux: same idea, one line later
+auth       substack     password-auth
+auth       required     oauth2_pam.so socket=/var/run/oauth2-pam/broker.sock
+```
+
+The password stack runs first and this module runs second, and the login needs both: a correct password *and* an approved GitHub device authorization. `required` is the whole point of the arrangement: with `sufficient`, this module succeeding *ends* the auth phase, which makes any bug in it — in the C, in the broker, in the mapper — the entire authentication decision. v0.1.x is the worked example: it returned `PAM_SUCCESS` the moment a device flow started, and the `auth sufficient` line the README recommended at the time turned that into an unauthenticated login as any username.
 
 In `/etc/ssh/sshd_config`:
 
@@ -186,7 +197,34 @@ KbdInteractiveAuthentication yes
 UsePAM yes
 ```
 
-(On OpenSSH before 8.7 the option is the now-deprecated `ChallengeResponseAuthentication yes`.) Restart sshd.
+(On OpenSSH before 8.7 the option is the now-deprecated `ChallengeResponseAuthentication yes`.) Then `sudo sshd -t` to check the config parses, and restart sshd.
+
+One difference between the two stacks, worth knowing before you read the broker log: Debian's `common-auth` ends in a `requisite`, which terminates the whole stack, so a wrong password never reaches this module. A RHEL `substack` terminates only *itself*, so a wrong password still starts a device flow that nobody will approve — the login fails either way, but the broker log will show a pending flow and an `authentication_attempt` for it.
+
+**Do not "fix" that by changing `substack` to `include`.** It looks like the same thing with tidier short-circuiting, and it removes the second factor: `password-auth` authenticates with `auth sufficient pam_unix.so`, and under `include` that success ends the *entire* auth stack, so the line below it never runs. `substack` is what confines it. Whatever you change here, test it — a correct password with the phone left face-down must still be refused.
+
+#### If you want GitHub to be the only factor
+
+Some hosts genuinely want that — a bastion whose whole purpose is "prove you are in the org". It is a defensible choice; make it deliberately rather than by reaching for `sufficient` because it appears first in every PAM tutorial. Still `required`, with nothing else in the auth stack:
+
+```
+auth required oauth2_pam.so socket=/var/run/oauth2-pam/broker.sock
+# and nothing else: no @include common-auth, no substack password-auth
+```
+
+With nothing following it, `required` and `sufficient` behave identically today. The difference is what happens next year. `sufficient` means "if I succeed, stop reading the stack", so the day a distribution upgrade or a colleague adds a line below this one, that line silently stops running — and on failure `sufficient` falls *through* to whatever follows, which is how a password prompt you thought you had removed comes back. `required` can only fail the stack, never end it early, so it composes safely with whatever arrives later. This is the arrangement the container harness runs, which is why `never_authorized` means what it says.
+
+If you take this path, keep an ssh key working for at least one account (below) — you are now one broker outage away from no interactive logins at all. And note `pam_deny.so` is not the way to close the stack: it always fails, so `auth required pam_deny.so` after this line denies every login, successful device flow or not.
+
+#### Before you edit the PAM stack
+
+A PAM misconfiguration is not a failed login, it is a locked host, and this module adds three more ways to get there: a stopped broker, an unreachable GitHub, and a user without their phone. The module fails closed by design, which is correct and is also exactly what locks you out.
+
+- **Keep a second root session open** for the whole edit, and test with a *third* connection. Never close the session that still works until a new one has succeeded.
+- **Keep a key-based path in.** sshd does not run the PAM auth stack for `publickey` authentication at all, so an authorized key stays usable no matter what the auth stack says — that is the most reliable break-glass here. Do not set `AuthenticationMethods publickey,keyboard-interactive` on your own account until you have tested the interactive path from somewhere else.
+- **Know your out-of-band console** before you need it: a cloud provider's serial or VNC console, IPMI, or physical access. If the only way in is ssh, there is no recovery from a bad `/etc/pam.d/sshd`.
+- **`sudo sshd -t`** catches an `sshd_config` mistake; nothing validates `/etc/pam.d/sshd`, so a typo in a module name is discovered at the next login attempt.
+- **A stopped broker denies every login through this module** (immediately, not after a timeout). That is deliberate — an unreachable broker must not become an allowed login — so `systemctl status oauth2-pam-broker` belongs in whatever you check before rebooting.
 
 ### Module arguments
 
@@ -393,6 +431,7 @@ oauth2-pam/
 
 ## Security notes
 
+- The documented PAM stack makes this module a **second factor** (`auth required`, after the distribution's own auth stack), not the whole authentication decision. `auth sufficient` hands the decision to one module; v0.1.x is what that costs when the module is wrong. [Configure PAM (SSH)](#6-configure-pam-ssh) has both arrangements and the break-glass checklist.
 - Tokens are held encrypted in memory (AES-256-GCM) and never written to disk. Set `token_encryption_key` with `oauth2-pam-admin gen-key` rather than typing one: 32 typeable characters cannot carry 256 bits. With no key configured the broker generates one for the process instead of storing tokens in the clear — an unrecoverable key is no loss for data that never outlives the process, and it means the default is not plaintext. `secure_token_storage: false` opts out.
 - Audit records go to `file`, `stdout`, or `syslog`; anything else is a startup error. An unrecognised type used to become `stdout`, so a typo moved the whole trail somewhere nobody was watching.
 - The broker socket is `0660` in a `0750` directory. The PAM module runs as root and so can reach it; other local users cannot, which matters because anything that can talk to the socket can start device flows.

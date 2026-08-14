@@ -360,6 +360,20 @@ And four more in the broker's own defaults:
   ran out of time saw an abrupt disconnect rather than a message. The README now
   documents all three deadlines and which order they have to be in.
 
+- **The documented PAM stack is now `auth required` after the distribution's own
+  auth stack, not `auth sufficient` before it.** With `sufficient`, this module
+  succeeding ends the auth phase, so any bug in the C, the broker, or the mapper is
+  the entire authentication decision — v0.1.x is the worked example, where a
+  started device flow returned `PAM_SUCCESS` and that one line turned it into an
+  unauthenticated login as any username. The recommended arrangement makes GitHub a
+  second factor; for hosts where GitHub really is meant to be the only factor, it
+  is still `required` with nothing else in the auth stack, because `sufficient`
+  stops the stack being read and a line added below it later silently stops
+  running. Also new: a break-glass checklist (an
+  authorized key stays usable because sshd runs no PAM auth stack for `publickey`),
+  Debian and RHEL forms of the stanza, and why changing RHEL's `substack` to
+  `include` silently removes the second factor.
+
 - **The rate-limiting defaults are raised: `max_requests_per_minute` 60 → 300 and
   `max_concurrent_auths` 10 → 50.** Both are host-wide backstops against a
   runaway client, not per-user limits — every PAM caller is sshd as root, so there

@@ -93,6 +93,9 @@ Next:
   2. sudo systemctl enable --now oauth2-pam-broker
   3. oauth2-pam-admin status         # confirm the broker is answering
   4. oauth2-pam-admin test-auth --user YOUR_GITHUB_LOGIN
-  5. Only then add the auth line to /etc/pam.d/sshd — with a second root
-     session open, and a working key-based or console login available.
+  5. Only then add the auth line to /etc/pam.d/sshd — "auth required", after
+     the distribution's own auth stack, so this is a second factor rather than
+     the whole decision. With a second root session open, and a working
+     key-based or console login available. See "Configure PAM (SSH)" in
+     README.md before you edit that file.
 EOF

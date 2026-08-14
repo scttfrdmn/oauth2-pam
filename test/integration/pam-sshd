@@ -4,8 +4,10 @@
 # client and a shell. The distribution stack is not included, because a fallback
 # to pam_unix would let a test pass for the wrong reason.
 #
-# "required" rather than the README's "sufficient" — with nothing after it in the
-# auth stack the two behave alike here, and required cannot short-circuit.
+# "required" with nothing after it, which is the arrangement the README documents
+# for a host where the device flow is the only factor: the two control flags behave
+# alike while the stack stays this short, and required cannot short-circuit if it
+# ever grows.
 auth     required   oauth2_pam.so socket=/var/run/oauth2-pam/broker.sock poll_interval=1 timeout=20 debug
 
 account  required   pam_permit.so

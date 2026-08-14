@@ -40,16 +40,25 @@ rather not be.
 **Keep a second way in.** A PAM misconfiguration locks you out of your own host,
 and this module depends on a running broker, a reachable GitHub, and a user with
 their phone. Before changing `/etc/pam.d/sshd`, open a second root session and
-leave it open, and keep a key-based or console path available.
+leave it open, and keep a key-based or console path available — sshd does not run
+the PAM auth stack for `publickey` at all, which makes an authorized key the most
+reliable break-glass here. The README's
+[Before you edit the PAM stack](README.md#before-you-edit-the-pam-stack) is the
+longer version.
 
-**`auth sufficient` is a decision, not a default.** With `sufficient`, this
-module succeeding ends the auth phase — so any bug in it is the whole
-authentication decision. `required` alongside another factor is the conservative
-arrangement.
+**`auth sufficient` is a decision, not a default, and this project no longer
+recommends it.** With `sufficient`, this module succeeding *ends* the auth phase,
+so any bug in it — in the C, the broker, or the mapper — is the entire
+authentication decision. v0.1.x is what that costs. The documented arrangement is
+`auth required` after the distribution's own auth stack, making GitHub a second
+factor. If GitHub really is meant to be the only factor, it is still `required`,
+with nothing else in the auth stack: `sufficient` stops the stack being read on
+success, so a line added below it later silently stops running.
 
-**The config file holds the client secret in cleartext.** Keep
-`/etc/oauth2-pam/broker.yaml` `0600` and root-owned. See
-[#14](https://github.com/scttfrdmn/oauth2-pam/issues/14).
+**The config file may hold the client secret in cleartext.** Since v0.3.0 it does
+not have to: `client_secret_file` takes a systemd credential or a 0600 file. Where
+the secret is inline, `/etc/oauth2-pam/broker.yaml` must be `0600` and owned by
+root or the broker's uid, and the broker refuses to start otherwise.
 
 **Anything that can reach the broker socket can start device flows.** The socket
 is `0660` in a `0750` directory for that reason. Do not widen it to debug a
