@@ -188,6 +188,32 @@ start until it is chmodded; the error names the file and the command. A negative
 
 ### Changed
 
+- **The PAM module is plain C. The Go runtime is no longer loaded into `sshd`.** It was
+  built with `go build -buildmode=c-shared`, which links the entire Go runtime into
+  every process that loads the module — and the runtime installs its own signal
+  handlers over the ones its host process had already set, so the thing being
+  reconfigured was `sshd`'s signal handling. The module has no Go logic to justify any
+  of that: all of its behaviour was already in `cgo_bridge_linux.c`, and the two Go
+  files were a shim to make cgo compile it. They are deleted, the module is built by a
+  direct `cc -shared -fPIC` invocation, and the shipped object went from **1.2 MB to
+  73 KB**. Verified same-host, before and after: every mitigation is intact
+  (`BIND_NOW`, `GNU_RELRO`, `__stack_chk_fail` and the `_chk` fortify symbols), all six
+  `pam_sm_*` entry points are exported, and there are now zero Go runtime symbols in
+  the object. Two dynamic flags did change and neither is a lost mitigation — `SYMBOLIC`
+  had nothing left to do once everything but the entry points is `static`, and
+  `NODELETE` existed only because the Go runtime cannot be unloaded, so losing it means
+  PAM can `dlclose` the module again, which is correct.
+  ([#65](https://github.com/scttfrdmn/oauth2-pam/issues/65))
+
+- **CodeQL analyses the C.** It could not before: the bridge was compiled by cgo, and
+  the scanner ran with `languages: go`, so the most security-sensitive code in the
+  repository was the only code no scanner read. The plain `cc` line made a `c-cpp`
+  database possible, and there is now one with a real build command. Note the two
+  earlier changelog entries describing CodeQL as covering "the Go half of
+  `cmd/pam-module`" are left as written — they were accurate for the releases they
+  describe, and there is no Go half any more.
+  ([#38](https://github.com/scttfrdmn/oauth2-pam/issues/38))
+
 - **The C module is compiled with hardening flags**: stack protector, RELRO with
   `BIND_NOW`, and `_FORTIFY_SOURCE=2`. Level 2 rather than 3 deliberately — 3 needs
   gcc 12 with glibc 2.35, and on older enterprise distributions `features.h` emits a
@@ -241,19 +267,53 @@ start until it is chmodded; the error names the file and the command. A negative
 
 ### Added
 
+- **`pam_sm_acct_mgmt` does something.** It returned `PAM_SUCCESS` unconditionally, so
+  a session revoked after login, an enrollment deleted, or an org membership lost was
+  not caught at the account stage — the stage that exists to ask "is this account still
+  allowed?". It now sends `check_session` and maps the answer: authorized *and* naming
+  the same user → success; any terminal status, including `SESSION_NOT_FOUND` → denied,
+  because "I have no record of this session" must not be a pass; a transport failure or
+  an unparseable reply → `PAM_AUTHINFO_UNAVAIL`. With **no** stored session it answers
+  `PAM_IGNORE`, not success: the module is being asked about a login it did not
+  authenticate, and approving an account it knows nothing about is fail-open in exactly
+  the stacked configuration a real deployment is most likely to have.
+
+  The session id reaches the account stage through `pam_set_data`, stored only after the
+  username check passes. That handoff cannot be unit-tested — `pam_set_data` refuses to
+  run outside a service module — so the integration harness's account stage is now the
+  real module rather than `pam_permit.so`, which makes every passing login there proof
+  that the handoff works, and a new case covers the no-session path. The
+  `PAM_IGNORE` → `PAM_SUCCESS` mutation is checked by the harness, since nothing in the
+  C suite could catch it.
+  ([#75](https://github.com/scttfrdmn/oauth2-pam/issues/75))
+
+- **The QR code renders again.** Removing the duplicated art from `instructions` (see
+  #56 above) left the module rendering the one field the art was no longer in, so for a
+  short window on `main` no QR appeared at a login prompt at all. The module now reads
+  the `qr_code` field, bounding what it copies like every other field it parses, and an
+  absent or over-long one renders cleanly as no QR rather than as an empty caption.
+  ([#56](https://github.com/scttfrdmn/oauth2-pam/issues/56))
+
 - **`AuditLogger.LogAuthEventErr`**, so a path that is about to grant access can fail
   the login when the audit record cannot be written. An unlogged successful
   authentication is the outcome an audit log exists to prevent.
   ([#69](https://github.com/scttfrdmn/oauth2-pam/issues/69))
 
-- **A mutation-tested C suite.** `test/cbridge` grew from the transport and
-  audit-field mutations it started with to 16, and the suite that runs against them
-  now catches `authorized_for` → `return 1` — a mutation that makes the module accept
-  any user the broker authorized for anyone else, and which was green in every suite
-  this project had before this round. A mutation check only covers what its tests
-  actually call, which is why the count matters less than what the new ones exercise.
-  A hung run is now a failure rather than a hang.
+- **A mutation-tested C suite.** `test/cbridge` went from 147 checks and 8 transport
+  and audit-field mutations to **226 checks and 25 mutations, all caught**. The one
+  worth naming is `authorized_for` → `return 1`, which makes the module accept any user
+  the broker authorized for anyone else — and which was green in every suite this
+  project had before this round. A mutation check only covers what its tests actually
+  call, which is why the count matters less than what the new ones reach. A hung run is
+  now a failure rather than a hang.
   ([#57](https://github.com/scttfrdmn/oauth2-pam/issues/57))
+
+- **`make verify-linux` compiles the C again.** It never invoked a compiler directly —
+  it relied on `go build ./...` pulling the bridge in through cgo. With the module no
+  longer a Go package, a Go-only sweep would have gone green without touching the C at
+  all, which is the failure mode where a verification target stops verifying and
+  nothing announces it. The target now builds the module and runs the C suite
+  explicitly.
 
 ## [0.3.0] - 2026-08-14
 

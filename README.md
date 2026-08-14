@@ -44,12 +44,15 @@ Every request and reply carries a `protocol_version`, so the next change has som
 
 ## Requirements
 
-- Go 1.25+ (1.24 is end-of-life and no longer receives security backports)
+- Go 1.25+ for the broker and the CLIs (1.24 is end-of-life and no longer receives security backports)
+- A C compiler for the PAM module — it is plain C and needs no Go at all
 - Linux with PAM (`libpam0g-dev`)
 - `libjson-c-dev`
 - A GitHub OAuth App with Device Flow enabled
 
 The PAM module is Linux-only. `go build ./...` and the test suite work on macOS for development; `make build-pam` requires Linux.
+
+The module is built by a direct `cc -shared -fPIC` invocation rather than with `go build -buildmode=c-shared`, which is what it used to be. The Go build linked the entire Go runtime into every process that loads the module — including `sshd`, where it also installed the runtime's signal handlers over the ones sshd had set. The module has no Go logic to justify that, so it no longer pays for it: the object went from 1.2 MB to 73 KB, and `sshd` keeps its own signal handling ([#65](https://github.com/scttfrdmn/oauth2-pam/issues/65)).
 
 ## Quick Start
 
@@ -482,7 +485,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for how work is tracked (labels, mileston
 oauth2-pam/
 ├── cmd/
 │   ├── broker/              # Broker daemon (oauth2-pam-broker)
-│   ├── pam-module/          # PAM shared library (oauth2_pam.so) + C bridge
+│   ├── pam-module/          # PAM shared library (oauth2_pam.so) — plain C, no Go
 │   ├── oauth2-pam-admin/    # Admin CLI
 │   └── oauth2-pam-enroll/   # Self-enrollment CLI
 ├── internal/

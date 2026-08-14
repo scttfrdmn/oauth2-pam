@@ -198,11 +198,11 @@ test-integration-mutations:
 
 ## Run the Linux vet/test/lint sweep in a container, cgo packages included
 ##
-## On macOS the module cannot be compiled at all, so `go build ./...`,
-## `go test ./...` and golangci-lint all silently exclude cmd/pam-module — the
-## most security-sensitive package here. This is the same sweep CI runs, with the
-## headers present. Answers "does the Linux build compile and pass"; use
-## test-integration to answer "does a login work".
+## On macOS the module cannot be compiled at all. Since #65 it is not a Go package
+## either, so no Go command touches it on any platform — this target compiles it and
+## runs the C suite explicitly, because otherwise a green sweep would say nothing at
+## all about the most security-sensitive code here. Answers "does the Linux build
+## compile and pass"; use test-integration to answer "does a login work".
 verify-linux:
 	@echo "Building the verification image..."
 	@docker build -q -f test/docker/Dockerfile.verify -t oauth2-pam-verify . >/dev/null
@@ -212,7 +212,8 @@ verify-linux:
 		-v oauth2-pam-verify-gocache:/root/.cache/go-build \
 		-v oauth2-pam-verify-gomod:/go/pkg/mod \
 		oauth2-pam-verify \
-		sh -c 'go build ./... && go vet ./... && go test -race ./... && golangci-lint run ./...'
+		sh -c 'go build ./... && go vet ./... && go test -race ./... && golangci-lint run ./... \
+			&& make build-pam && test/cbridge/run.sh'
 
 ## Install binaries to system locations
 install: build
