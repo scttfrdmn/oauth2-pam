@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -154,6 +155,13 @@ func TestInvalidFieldsAreRejectedOverTheWire(t *testing.T) {
 // TestSocketPermissions: 0660 keeps arbitrary local users from talking to the
 // broker. A world-writable socket would let any user request a device flow for
 // any account.
+//
+// The directory mode is asserted alongside it because the two together are the
+// entire trust boundary. With the packaged unit running as root:root, 0750 on the
+// directory plus 0660 on the socket is what makes the broker reachable by root
+// and nobody else — and that fact is what several findings' severity rests on. It
+// is not enforced by anything at runtime, so it is enforced here: widening either
+// mode should fail a test rather than ship.
 func TestSocketPermissions(t *testing.T) {
 	h := newHarness(t)
 
@@ -163,6 +171,22 @@ func TestSocketPermissions(t *testing.T) {
 	}
 	if perm := info.Mode().Perm(); perm != 0660 {
 		t.Errorf("socket mode = %04o, want 0660", perm)
+	}
+	// Group and world must have no write bit, however the mode is spelled.
+	if perm := info.Mode().Perm(); perm&0002 != 0 {
+		t.Errorf("socket mode %04o is world-writable; any local user could drive the broker", perm)
+	}
+
+	dir, err := os.Stat(filepath.Dir(h.socket))
+	if err != nil {
+		t.Fatalf("stat socket directory: %v", err)
+	}
+	// t.TempDir() is 0700, so a harness socket lives somewhere stricter than the
+	// packaged runtime directory. Assert the property that matters in both cases —
+	// nothing for other — rather than the exact mode, which only production sets.
+	if perm := dir.Mode().Perm(); perm&0007 != 0 {
+		t.Errorf("socket directory mode = %04o, want no access for other; "+
+			"a traversable directory exposes the socket regardless of its own mode", perm)
 	}
 }
 

@@ -247,8 +247,8 @@ func (s *Server) Start(ctx context.Context) error {
 	if err := removeStaleSocket(s.socketPath); err != nil {
 		return err
 	}
-	// Directory needs to be accessible by the PAM module process (root-owned,
-	// group oauth2-pam). The socket itself is 0660.
+	// 0750 on a root-owned directory: only root may traverse it and reach the
+	// socket. See the socket mode below for who that leaves as the caller.
 	if err := os.MkdirAll(filepath.Dir(s.socketPath), 0750); err != nil {
 		return fmt.Errorf("create socket directory: %w", err)
 	}
@@ -259,10 +259,26 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	s.listener = l
 
-	// 0660: readable/writable by owner and group (oauth2-pam) only.
-	// The PAM module process must run as a member of the oauth2-pam group.
-	// 0666 (world-writable) would allow any local user to send arbitrary
-	// requests to the broker.
+	// 0660 — owner and group only, never world. Combined with the 0750 directory
+	// above and the packaged unit's User=root/Group=root, that makes the broker
+	// socket reachable by root and nobody else.
+	//
+	// Root-only is the whole trust boundary, and it is worth being blunt about
+	// because a good deal rests on it: an unauthenticated caller that reaches this
+	// socket can start device flows and name session IDs, so several defects in
+	// the verbs behind it are rated low purely because only root can get here.
+	// Nothing in this process enforces that, though — it is a property of the
+	// packaging (configs/systemd/oauth2-pam-broker.service) plus the two modes
+	// set here, so a change to either widens the boundary silently. The mode is
+	// asserted in server_test.go for that reason.
+	//
+	// This is not a group-based access model, and it deliberately is not one. The
+	// module runs inside sshd's pre-auth child, which is already root, so there is
+	// no unprivileged service account that needs to reach the socket and no
+	// oauth2-pam group to add one to. Introducing a group would mean creating it
+	// in packaging and chowning both the directory and the socket, and it would
+	// hand every group member the capabilities described above. If that day comes,
+	// re-rate the findings that assume root-only first.
 	if err := os.Chmod(s.socketPath, 0660); err != nil {
 		log.Warn().Err(err).Str("socket", s.socketPath).Msg("Failed to set socket permissions")
 	}

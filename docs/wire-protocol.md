@@ -66,9 +66,17 @@ Every other paragraph here is in service of that sentence. In particular:
 
 - **A Unix domain socket.** No TCP, ever: the peer's identity is the point of the
   transport, and `SO_PEERCRED` is what makes per-caller rate limiting possible.
-- **Socket mode `0660`, in a directory mode `0750`.** Anything that can reach the
-  socket can start device flows. That is a bounded, audited capability, not
-  nothing.
+- **Socket mode `0660`, in a root-owned directory mode `0750`.** In this project's
+  packaging the broker runs as `root:root`, so **only root can reach the socket**,
+  and the module reaches it because it runs inside `sshd`'s pre-auth child. There
+  is no group-based access model and no service account.
+
+  This is worth stating precisely rather than leaving to packaging, because a
+  reply is only as trustworthy as the question. Anything that can reach the socket
+  can start device flows for any account and name session IDs the broker has never
+  issued — a bounded, audited capability, but not nothing. An implementation that
+  widens the socket beyond root is making a decision this specification does not
+  make for it, and it should re-examine what it is relying on before doing so.
 - **One request, one reply, one connection.** The client connects, writes exactly
   one JSON object, reads exactly one JSON object, and the connection is closed by
   the broker. There is no framing beyond that: the reply ends at EOF. There is no
