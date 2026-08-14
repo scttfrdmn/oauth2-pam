@@ -469,8 +469,27 @@ int parse_broker_response(const char *json_text, struct broker_response **out) {
     copy_json_field(root, "error_message", r->error_message, sizeof(r->error_message));
     copy_json_field(root, "instructions",  r->instructions,  sizeof(r->instructions));
 
+    /* success is read strictly, because json_object_get_boolean *coerces*: any
+       non-empty string and any non-zero number read as true, so "success":"false"
+       would arrive here as success = 1. That is a fail-open read of one of the two
+       conjuncts authorized_for requires — the module would grant a login off a
+       reply that spelled out the opposite.
+     *
+     * Go's encoding/json cannot emit that shape, so this broker never will. The
+     * module is specified to be independently defensible against a broker that is
+     * "an older version of itself", though, and that is the whole reason the check
+     * exists twice; a wrong type for this field is a malformed reply, and a
+     * malformed reply is a transport failure rather than a decision about the
+     * user. Same treatment as protocol_version below. */
     json_object *success_obj = NULL;
     if (json_object_object_get_ex(root, "success", &success_obj)) {
+        if (success_obj == NULL || json_object_get_type(success_obj) != json_type_boolean) {
+            log_pam_message(LOG_ERR,
+                            "Broker sent a non-boolean \"success\"; rejecting the reply");
+            free(r);
+            json_object_put(root);
+            return -1;
+        }
         r->success = json_object_get_boolean(success_obj) ? 1 : 0;
     }
 

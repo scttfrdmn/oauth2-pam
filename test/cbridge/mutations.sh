@@ -165,6 +165,12 @@ run "any protocol version is acceptable" fail \
 run "protocol_version omitted from requests" fail \
     '$n = s/^.*json_object_object_add\(req, "protocol_version".*\n//mg'
 
+# success read with json-c's coercing accessor. Any non-empty string and any
+# non-zero number read as true, so "success":"false" would grant the login — a
+# fail-open read of a conjunct authorized_for depends on.
+run "success read with type coercion" fail \
+    '$n = s/json_object_get_type\(success_obj\) != json_type_boolean/0/g'
+
 # The grant decision itself, which until v0.4.0 no case here pointed at: both of
 # the mutations below were green in every suite this repository has, which is what
 # an authorization bypass looks like on the way in.

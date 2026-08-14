@@ -481,6 +481,58 @@ static void test_parse_reads_the_error_code(void) {
     CHECK(parse_broker_response("[1,2,3]", &r) != 0, "accepted a JSON array");
 }
 
+static void test_parse_reads_success_strictly(void) {
+    printf("  parse_broker_response: success is a boolean or nothing\n");
+
+    struct broker_response *r = NULL;
+
+    CHECK(parse_broker_response(
+              "{\"success\":true,\"status\":\"authorized\",\"user_id\":\"alice\"}", &r) == 0,
+          "failed to parse success=true");
+    if (r != NULL) {
+        CHECK(r->success == 1, "success=true read as %d", r->success);
+        free(r);
+        r = NULL;
+    }
+
+    CHECK(parse_broker_response("{\"success\":false,\"status\":\"denied\"}", &r) == 0,
+          "failed to parse success=false");
+    if (r != NULL) {
+        CHECK(r->success == 0, "success=false read as %d", r->success);
+        free(r);
+        r = NULL;
+    }
+
+    /* json_object_get_boolean coerces, so reading this field without checking its
+       type made "false" — a non-empty string — read as true, and the module would
+       grant a login off a reply that said the opposite. The wrong type here is a
+       malformed reply, refused outright, which the caller turns into
+       PAM_AUTHINFO_UNAVAIL. */
+    CHECK(parse_broker_response(
+              "{\"success\":\"false\",\"status\":\"authorized\",\"user_id\":\"alice\"}", &r) != 0,
+          "a string success was accepted; \"false\" would read as true");
+    CHECK(parse_broker_response(
+              "{\"success\":1,\"status\":\"authorized\",\"user_id\":\"alice\"}", &r) != 0,
+          "an integer success was accepted");
+    CHECK(parse_broker_response(
+              "{\"success\":null,\"status\":\"authorized\",\"user_id\":\"alice\"}", &r) != 0,
+          "a null success was accepted");
+    CHECK(parse_broker_response(
+              "{\"success\":{},\"status\":\"authorized\",\"user_id\":\"alice\"}", &r) != 0,
+          "an object success was accepted");
+
+    /* Absent is not malformed — nothing on the wire requires the field — but it
+       is not true either: authorized_for refuses a reply that never said it
+       succeeded. */
+    CHECK(parse_broker_response("{\"status\":\"pending\",\"session_id\":\"abc\"}", &r) == 0,
+          "a reply without success was rejected");
+    if (r != NULL) {
+        CHECK(r->success == 0, "absent success read as %d", r->success);
+        free(r);
+        r = NULL;
+    }
+}
+
 /* --------------------------------------------------- protocol versioning */
 
 static void test_protocol_version(void) {
@@ -833,6 +885,7 @@ int main(void) {
     test_source_ip_takes_only_addresses();
     test_target_host_is_this_host();
     test_parse_reads_the_error_code();
+    test_parse_reads_success_strictly();
     test_protocol_version();
     test_authorized_for();
     test_terminal_status_to_pam();
