@@ -51,6 +51,13 @@ type rateLimiter struct {
 	mu      sync.Mutex
 	windows map[string]*rateWindow
 	maxRPM  int
+	// maxKeys bounds how many windows may exist at once; 0 means unbounded.
+	// It matters when the key space is chosen by the caller rather than by the
+	// host, because allow() *allocates* on first sight of a key: a limiter keyed
+	// on something a client can mint at will (a session ID) will otherwise grow
+	// one entry per invented key until the next eviction tick. See
+	// maxSessionLimiterKeys.
+	maxKeys int
 }
 
 type rateWindow struct {
@@ -59,12 +66,25 @@ type rateWindow struct {
 }
 
 func newRateLimiter(maxRPM int) *rateLimiter {
+	return newBoundedRateLimiter(maxRPM, 0)
+}
+
+// newBoundedRateLimiter is newRateLimiter with a ceiling on the number of live
+// windows. At the ceiling a *new* key is refused rather than allocated; keys
+// that already have a window are unaffected, so a bucket that is already
+// established — an in-flight login's session — never starts failing because
+// somebody else filled the map.
+func newBoundedRateLimiter(maxRPM, maxKeys int) *rateLimiter {
 	if maxRPM <= 0 {
 		maxRPM = 60
+	}
+	if maxKeys < 0 {
+		maxKeys = 0
 	}
 	return &rateLimiter{
 		windows: make(map[string]*rateWindow),
 		maxRPM:  maxRPM,
+		maxKeys: maxKeys,
 	}
 }
 
@@ -74,16 +94,45 @@ func (rl *rateLimiter) allow(key string) bool {
 	defer rl.mu.Unlock()
 
 	now := time.Now()
-	w, ok := rl.windows[key]
-	if !ok || now.After(w.resetAt) {
-		rl.windows[key] = &rateWindow{count: 1, resetAt: now.Add(time.Minute)}
+	if w, ok := rl.windows[key]; ok {
+		if now.After(w.resetAt) {
+			// The window elapsed. Reuse the entry rather than reinserting it: the
+			// map does not grow, so maxKeys has nothing to say about this path.
+			w.count = 1
+			w.resetAt = now.Add(time.Minute)
+			return true
+		}
+		if w.count >= rl.maxRPM {
+			return false
+		}
+		w.count++
 		return true
 	}
-	if w.count >= rl.maxRPM {
-		return false
+
+	// A key seen for the first time is the only thing that makes the map bigger.
+	if rl.maxKeys > 0 && len(rl.windows) >= rl.maxKeys {
+		// Try to make room honestly first; a full map is usually a stale one.
+		rl.evictLocked(now)
+		if len(rl.windows) >= rl.maxKeys {
+			return false
+		}
 	}
-	w.count++
+	rl.windows[key] = &rateWindow{count: 1, resetAt: now.Add(time.Minute)}
 	return true
+}
+
+// hasLiveWindow reports whether key already has an unexpired window — that is,
+// whether allow(key) can answer without allocating.
+//
+// The broker uses it to tell an established bucket from a brand-new one, so that
+// only the act of *introducing* a key can be charged elsewhere. Racing callers
+// may both see false and both be charged, which over-charges by at most one per
+// concurrent handler and never under-charges.
+func (rl *rateLimiter) hasLiveWindow(key string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	w, ok := rl.windows[key]
+	return ok && !time.Now().After(w.resetAt)
 }
 
 // evict removes stale windows to prevent unbounded map growth.
@@ -91,7 +140,11 @@ func (rl *rateLimiter) allow(key string) bool {
 func (rl *rateLimiter) evict() {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-	now := time.Now()
+	rl.evictLocked(time.Now())
+}
+
+// evictLocked is evict's body; the caller holds rl.mu.
+func (rl *rateLimiter) evictLocked(now time.Time) {
 	for key, w := range rl.windows {
 		if now.After(w.resetAt) {
 			delete(rl.windows, key)
