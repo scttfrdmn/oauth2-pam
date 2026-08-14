@@ -29,15 +29,23 @@ fi
 
 # /lib/security is right on RHEL and wrong on Debian/Ubuntu multiarch. Ask the
 # package manager where the system's own modules live rather than guessing.
-PAMDIR=""
-if command -v dpkg >/dev/null 2>&1; then
-    permit=$(dpkg -L libpam-modules 2>/dev/null | grep -m1 '/pam_permit\.so$' || true)
-    [ -n "$permit" ] && PAMDIR=$(dirname "$permit")
-fi
-if [ -z "$PAMDIR" ]; then
-    for d in /lib64/security /lib/security /usr/lib64/security /usr/lib/security; do
-        [ -d "$d" ] && { PAMDIR="$d"; break; }
-    done
+#
+# A PAMDIR from the environment wins and is not second-guessed: it is the escape
+# hatch the failure at the end of this block names, and until now an unconditional
+# PAMDIR="" here threw it away before the discovery ever ran.
+PAMDIR="${PAMDIR:-}"
+if [ -n "$PAMDIR" ]; then
+    [ -d "$PAMDIR" ] || die "PAMDIR=$PAMDIR is not a directory"
+else
+    if command -v dpkg >/dev/null 2>&1; then
+        permit=$(dpkg -L libpam-modules 2>/dev/null | grep -m1 '/pam_permit\.so$' || true)
+        [ -n "$permit" ] && PAMDIR=$(dirname "$permit")
+    fi
+    if [ -z "$PAMDIR" ]; then
+        for d in /lib64/security /lib/security /usr/lib64/security /usr/lib/security; do
+            [ -d "$d" ] && { PAMDIR="$d"; break; }
+        done
+    fi
 fi
 [ -n "$PAMDIR" ] || die "cannot find the PAM module directory; set PAMDIR= explicitly"
 
@@ -63,9 +71,15 @@ else
     # nothing and access tokens sit in the broker's memory in the clear; and a
     # generated key beats whatever an administrator would type by ~200 bits.
     key=$("$PREFIX/bin/oauth2-pam-admin" gen-key) || die "gen-key failed"
+    # The sed script arrives on stdin rather than in argv. /proc/<pid>/cmdline is
+    # world-readable on Linux, so a key passed as an argument is recoverable by
+    # any local user polling /proc for the length of the install — the one value
+    # in this file whose entire purpose is to be secret, in a file installed 0600
+    # two lines up. A here-document is a pipe (or an unlinked file) the shell owns.
     # | as the delimiter: base64 contains / but never |.
-    sed -i "s|# token_encryption_key: \"paste the output of gen-key here\"|token_encryption_key: \"$key\"|" \
-        "$CONFDIR/broker.yaml"
+    sed -i -f - "$CONFDIR/broker.yaml" <<EOF
+s|# token_encryption_key: "paste the output of gen-key here"|token_encryption_key: "$key"|
+EOF
     if grep -q '^[[:space:]]*token_encryption_key:' "$CONFDIR/broker.yaml"; then
         echo "  generated a token_encryption_key"
     else
