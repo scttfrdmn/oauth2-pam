@@ -55,12 +55,18 @@ type Store struct {
 // mapper.Chain.ValidateLocalUser.
 type LocalUserValidator func(localUser string) error
 
-// Unvalidated is what a caller passes to Add when it has no mapper configuration
+// unvalidated is what a caller passes to Add when it has no mapper configuration
 // to validate against, and therefore cannot say whether the name it is recording
 // could ever authenticate. Named rather than a bare nil so that the callers making
 // that choice can be found by grep. Production writers should pass the mapper's
 // gate; a record that fails it is one the mapper will refuse at login.
-var Unvalidated LocalUserValidator
+//
+// Unexported since #109. It was exported so that such callers could be grepped
+// for, and the grep has stayed at zero outside this package's own tests — which is
+// the outcome it was watching for, so an exported sentinel is now only an
+// invitation to a first one. Passing nil to Add is identical and always was; what
+// the name buys is that doing so is legible at the call site.
+var unvalidated LocalUserValidator
 
 // Load reads the enrollment file at path. If the file does not exist, an
 // empty Store is returned without error.
@@ -258,7 +264,7 @@ func (s *Store) FindByLocalUser(localUser string) *Record {
 // store from loading or from being written back: the mapper refuses such a record
 // at login on its own, and making Load fail would turn one unusable enrollment
 // into a broken enrollment file for everybody, including the operator trying to
-// remove it. Pass Unvalidated if there is no configuration to validate against.
+// remove it. Pass nil (see unvalidated) if there is no configuration to validate against.
 func (s *Store) Add(rec Record, validate LocalUserValidator) error {
 	// A record is half of a pair, and a record with no login is half of nothing.
 	// Written out it would be a record Find could only ever match against an

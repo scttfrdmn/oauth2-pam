@@ -250,6 +250,13 @@ func (al *AuditLogger) LogAuthEventErr(event AuditEvent) error {
 		event.EventID = fmt.Sprintf("audit_%d", time.Now().UnixNano())
 	}
 
+	// Bounded here rather than in writeEvent, which is the other candidate for "the
+	// one place every record passes through": an oversized event that is only bounded
+	// at write time still sits in eventChan at full size until the dispatcher reaches
+	// it, and the queue is 1000 deep. See audit_bounds.go for what is bounded and
+	// why the bound is here rather than at the call sites that build events.
+	event = boundEvent(event)
+
 	if critical {
 		return al.writeEvent(event)
 	}
@@ -613,10 +620,19 @@ type fileOutput struct {
 	file *os.File
 }
 
+// newFileOutput opens the audit file. The open, and the checks around it, are in
+// audit_perms.go — this was the one file open in the tree without O_NOFOLLOW, a
+// mode check or a directory check (#106).
+//
+// A failure here refuses to start the broker, which is the same answer pkg/config
+// and pkg/enrollment give for their files. It is a stronger statement on this path
+// because it is the one that would otherwise fail silently: a sink that accepts
+// records and keeps none satisfies the fail-closed guarantee vacuously, so every
+// login is granted and the trail is empty.
 func newFileOutput(cfg config.AuditOutput) (*fileOutput, error) {
-	f, err := os.OpenFile(cfg.Path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	f, err := openAuditFile(cfg.Path)
 	if err != nil {
-		return nil, fmt.Errorf("open audit file %s: %w", cfg.Path, err)
+		return nil, err
 	}
 	return &fileOutput{file: f}, nil
 }

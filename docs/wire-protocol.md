@@ -166,8 +166,15 @@ should know about:
   ampersands measured 3072 bytes against the budget and serialized to 18432, past
   the whole reply cap on its own, which put #88's lockout straight back. Counted
   after escaping, a maximal reply measures the same ~4 KB whatever its characters
-  are. Control characters are still stripped rather than escaped, so a client will
-  not see them at all.
+  are. Control characters are stripped rather than escaped, so a client will not see
+  them at all — and "control character" here means the same set the broker's prompt
+  sanitizer uses: C0, DEL, **C1 (U+0080–U+009F)**, U+2028 and U+2029. Including C1
+  was [#105](https://github.com/scttfrdmn/oauth2-pam/issues/105): the reply filter
+  had its own narrower rule that stopped at C0 and DEL, so U+009B — which *is* CSI
+  to a terminal decoding UTF-8, and which `encoding/json` does not escape — was
+  forwarded intact to whatever displayed the field. A client can rely on these
+  fields being safe to print, and on there being one policy rather than one per
+  code path.
 - An over-budget `groups` is omitted entirely and `metadata.groups_omitted` is set
   to `"true"`. A truncated list is indistinguishable from a complete one, and a
   client acting on membership would act on a list missing whichever entries sorted

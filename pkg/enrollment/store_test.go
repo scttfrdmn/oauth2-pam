@@ -388,7 +388,7 @@ func TestARecordWithNoLoginIsNotAWildcard(t *testing.T) {
 func TestAddRequiresALogin(t *testing.T) {
 	store := &Store{}
 
-	err := store.Add(Record{LocalUser: "alice"}, Unvalidated)
+	err := store.Add(Record{LocalUser: "alice"}, unvalidated)
 	if err == nil {
 		t.Fatal("Add accepted a record with no provider login; it would match any identity that also has none")
 	}
@@ -420,11 +420,11 @@ func TestFindByLocalUser(t *testing.T) {
 func TestAddRejectsDuplicateLocalUser(t *testing.T) {
 	store := &Store{}
 
-	if err := store.Add(Record{LocalUser: "alice", Login: "alice-gh"}, Unvalidated); err != nil {
+	if err := store.Add(Record{LocalUser: "alice", Login: "alice-gh"}, unvalidated); err != nil {
 		t.Fatalf("first Add: %v", err)
 	}
 
-	err := store.Add(Record{LocalUser: "alice", Login: "mallory-gh"}, Unvalidated)
+	err := store.Add(Record{LocalUser: "alice", Login: "mallory-gh"}, unvalidated)
 	if err == nil {
 		t.Fatal("Add silently re-enrolled an existing local user under a different GitHub account")
 	}
@@ -441,10 +441,10 @@ func TestAddRejectsDuplicateLocalUser(t *testing.T) {
 
 func TestAddDuplicateIsCaseInsensitive(t *testing.T) {
 	store := &Store{}
-	if err := store.Add(Record{LocalUser: "alice", Login: "alice-gh"}, Unvalidated); err != nil {
+	if err := store.Add(Record{LocalUser: "alice", Login: "alice-gh"}, unvalidated); err != nil {
 		t.Fatalf("first Add: %v", err)
 	}
-	if err := store.Add(Record{LocalUser: "ALICE", Login: "mallory-gh"}, Unvalidated); err == nil {
+	if err := store.Add(Record{LocalUser: "ALICE", Login: "mallory-gh"}, unvalidated); err == nil {
 		t.Error("Add accepted a duplicate that differed only in case")
 	}
 }
@@ -481,7 +481,7 @@ func TestRemoveThenAddAllowsReEnrollment(t *testing.T) {
 	if !store.Remove("alice") {
 		t.Fatal("Remove failed")
 	}
-	if err := store.Add(Record{LocalUser: "alice", Login: "alice-new-gh"}, Unvalidated); err != nil {
+	if err := store.Add(Record{LocalUser: "alice", Login: "alice-new-gh"}, unvalidated); err != nil {
 		t.Fatalf("re-enrollment after Remove: %v", err)
 	}
 	if rec := store.FindByLocalUser("alice"); rec == nil || rec.Login != "alice-new-gh" {

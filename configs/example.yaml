@@ -61,8 +61,14 @@ providers:
     #      and refuses to start otherwise. A secret in a world-readable config
     #      is a secret every local user on the host already has.
     #
-    # Whichever file holds the secret, the same rule applies to it: mode 0600,
-    # owned by root. Set exactly one of client_secret and client_secret_file.
+    # Whichever file holds the secret, the same rule applies to it: mode 0600 or
+    # tighter, and owned by root or by the uid the broker runs as — the broker
+    # accepts either, and this comment said root alone until #109. The directory
+    # holding it is checked too: group- or other-writable (without the sticky bit),
+    # or owned by anyone else, and the broker refuses to start, because a directory
+    # somebody else can write is a file they can replace.
+    #
+    # Set exactly one of client_secret and client_secret_file.
     client_secret: "your-client-secret"     # GitHub OAuth App client secret
     # client_secret_file: github-client-secret
 
@@ -263,9 +269,17 @@ security:
   #   oauth2-pam-admin gen-key
   #
   # That prints a base64-encoded 32 bytes (44 characters), which is the preferred
-  # form. 16, 24, or 32 raw characters are still accepted for compatibility.
-  # Rotating the key invalidates the tokens held in the broker's memory, so the
-  # users holding them must authenticate again; nothing on disk is affected.
+  # form. 16, 24, or 32 raw characters are still accepted for compatibility, and
+  # give AES-128 or AES-192 rather than AES-256.
+  #
+  # Left unset the broker generates a key for the process and still encrypts —
+  # plaintext takes secure_token_storage: false and nothing else. Rotating the key
+  # invalidates the tokens held in the broker's memory, so the users holding them
+  # must authenticate again; nothing on disk is affected.
+  #
+  # A key set here is checked at startup whether or not it will be read, so a
+  # malformed one is a startup error even with secure_token_storage: false — it used
+  # to be exempt, and then failed the day storage was turned back on.
   # token_encryption_key: "paste the output of gen-key here"
 
   # Upper bound on how long a stored token may live. Must be >= token_lifetime
@@ -292,9 +306,16 @@ security:
     max_requests_per_minute: 300
     # Ceiling on device flows awaiting approval broker-wide; each one holds a
     # goroutine polling the provider. Further authenticate requests are refused
-    # with RATE_LIMITED until one finishes or hits device_flow_timeout. Size it
-    # for peak concurrent logins: a refusal is a failed login, and one abandoned
-    # flow holds a slot for device_flow_timeout.
+    # with AUTH_LIMIT_REACHED until one finishes or hits device_flow_timeout.
+    # Size it for peak concurrent logins: a refusal is a failed login, and one
+    # abandoned flow holds a slot for device_flow_timeout.
+    #
+    # AUTH_LIMIT_REACHED, not RATE_LIMITED — this comment said the latter until
+    # #108, and the two are deliberately different answers. RATE_LIMITED comes
+    # from max_requests_per_minute above and means "slow down": the client may
+    # retry. AUTH_LIMIT_REACHED means the capacity is held by other logins, is
+    # terminal for the attempt, and maps to a different PAM result. A client
+    # keying on the wrong one retries a refusal that will not clear.
     max_concurrent_auths: 50
 
 # ---------------------------------------------------------------------------
@@ -313,6 +334,25 @@ audit:
   # started cleanly and wrote its audit trail somewhere nobody was watching.
   # There is no webhook sink — url and headers were parsed and ignored, and are
   # now rejected.
+  #
+  # path must be absolute, and the file and the directory holding it are checked
+  # the way the client secret and the enrollment file are: the open refuses a
+  # symlink (O_NOFOLLOW), the target must be a regular file, and neither it nor
+  # its directory may be writable by group or other. A failure is a startup
+  # error.
+  #
+  # The check that matters most is the symlink one. A link pointing at /dev/null
+  # makes every write succeed, so the broker's fail-closed rule — a login whose
+  # record cannot be written is refused — is satisfied by a sink that keeps
+  # nothing, and every login is granted with no trail behind it. That is the one
+  # audit failure nothing downstream can detect. Group or other write is the
+  # authority to forge or erase the record of an access decision.
+  #
+  # Group *read* is deliberately allowed, so 0640 with an operators group works.
+  # Refusing it would refuse every login on the host, and an outage is a worse
+  # answer to a disclosure than the disclosure — but the trail does name local
+  # accounts, provider logins and email addresses, so 0600 is the default for a
+  # reason.
   outputs:
     - type: file
       path: /var/log/oauth2-pam/audit.log
@@ -332,18 +372,33 @@ audit:
     #   facility: auth
     #   severity: info
 
-  # Only these event types are written; everything else is dropped and counted.
-  # Omit the list entirely to record every event. An unrecognised name here is
-  # a startup error rather than a silent hole in the audit trail, so this list
-  # must be a subset of:
+  # Which event types are written. Omit the list entirely to record every event.
+  # An unrecognised name here is a startup error rather than a silent hole in the
+  # audit trail, so this list must be a subset of the six below.
+  #
+  # The list does not apply to the four events that record an access decision —
+  # authentication_success, authentication_failed, authentication_denied and
+  # session_revoked. Those are written whatever this says, because they are what
+  # an incident is reconstructed from and a volume control is not the place to
+  # decide they are not worth keeping. Leaving one out of this list has no
+  # effect. This comment said "only these event types are written" until #109,
+  # which is safer than documented but the opposite of what an operator editing
+  # it expects.
+  #
+  # So the two types this list can actually drop are authentication_attempt and
+  # device_flow_failed, marked below. A dropped event is counted, not silent.
   #
   #   authentication_attempt   a login attempt began (a device flow started)
-  #   authentication_success   a login was authorized
-  #   authentication_failed    the attempt failed (provider or broker error)
-  #   authentication_denied    the attempt was refused (denial, org/team, or
-  #                            a mapped user that is not the login name)
+  #                            — filterable, and the high-volume one
+  #   authentication_success   a login was authorized (always written)
+  #   authentication_failed    the attempt failed, provider or broker error
+  #                            (always written)
+  #   authentication_denied    the attempt was refused — denial, org/team, or
+  #                            a mapped user that is not the login name
+  #                            (always written)
   #   device_flow_failed       the device flow itself could not be started
-  #   session_revoked          a session was revoked
+  #                            — filterable
+  #   session_revoked          a session was revoked (always written)
   #
   events:
     - authentication_attempt

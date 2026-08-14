@@ -60,6 +60,12 @@ func NewTokenManager(cfg *config.Config) (*TokenManager, error) {
 	switch {
 	case !cfg.Security.SecureTokenStorage:
 		log.Warn().Msg("security.secure_token_storage is false; access tokens will be held as plaintext in memory")
+		if cfg.Security.TokenEncryptionKey != "" {
+			// Otherwise the config reads as "tokens are encrypted with this key" and
+			// the warning above reads as being about some other host (#109).
+			log.Warn().Msg("security.token_encryption_key is set but ignored, because " +
+				"security.secure_token_storage is false; remove one of the two")
+		}
 	case cfg.Security.TokenEncryptionKey != "":
 		e, err := security.NewEncryption(cfg.Security.TokenEncryptionKey)
 		if err != nil {
@@ -93,11 +99,26 @@ func (tm *TokenManager) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop shuts down the token manager.
+// Stop shuts down the token manager and drops the cipher.
+//
+// The Destroy call is what makes security.Encryption.Destroy's own documentation
+// ("call it when a key is rotated out or at shutdown") true: it had no non-test
+// caller until #109, so the one shutdown it names never happened. It is ordered
+// after wg.Wait so the cleanup goroutine cannot be mid-Decrypt, and it is safe
+// against a late request either way — Encrypt and Decrypt on a destroyed cipher
+// return an error rather than panicking, and the broker stops the IPC server
+// before it stops this (cmd/broker/main.go), so there should be no late request
+// at all.
+//
+// What it buys is bounded, and encryption.go says so: the round keys are not
+// zeroized, so this makes the cipher unreachable rather than erasing it.
 func (tm *TokenManager) Stop() error {
 	log.Info().Msg("Stopping token manager")
 	close(tm.stopChan)
 	tm.wg.Wait()
+	if tm.encryption != nil {
+		tm.encryption.Destroy()
+	}
 	return nil
 }
 

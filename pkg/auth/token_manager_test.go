@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"os"
 	"strings"
 	"testing"
@@ -334,5 +335,55 @@ func TestFingerprintIsStableAndDistinguishing(t *testing.T) {
 	}
 	if len(a) != 32 { // 16 bytes of SHA-256, hex-encoded
 		t.Errorf("fingerprint length = %d, want 32 hex chars", len(a))
+	}
+}
+
+// TestStopDropsTheCipher is #109's other half. security.Encryption.Destroy says to
+// call it "when a key is rotated out or at shutdown", and until this landed it had
+// no caller outside its own test — the shutdown it named did not happen. Asserted
+// through the exported surface: a token that decrypted before Stop must not decrypt
+// after it, and must fail rather than panic.
+func TestStopDropsTheCipher(t *testing.T) {
+	tm, err := NewTokenManager(tokenManagerConfig(encryptionKey))
+	if err != nil {
+		t.Fatalf("NewTokenManager: %v", err)
+	}
+	if err := tm.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	id, err := tm.StoreToken("sess-1", "alice", plaintextToken, "", time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("StoreToken: %v", err)
+	}
+	if _, err := tm.GetDecryptedAccessToken(id); err != nil {
+		t.Fatalf("GetDecryptedAccessToken before Stop: %v", err)
+	}
+
+	if err := tm.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	got, err := tm.GetDecryptedAccessToken(id)
+	if err == nil {
+		t.Errorf("GetDecryptedAccessToken returned %q after Stop; the cipher was not destroyed", got)
+	}
+}
+
+// Stop with secure_token_storage off has no cipher to drop, and must not panic on
+// the nil one.
+func TestStopWithoutACipher(t *testing.T) {
+	cfg := tokenManagerConfig("")
+	cfg.Security.SecureTokenStorage = false
+
+	tm, err := NewTokenManager(cfg)
+	if err != nil {
+		t.Fatalf("NewTokenManager: %v", err)
+	}
+	if err := tm.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := tm.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
 	}
 }

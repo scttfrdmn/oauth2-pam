@@ -154,6 +154,15 @@ func TestValidate(t *testing.T) {
 		{"facility on a file output", func(c *Config) {
 			c.Audit.Outputs = []AuditOutput{{Type: "file", Path: "/tmp/a.log", Facility: "auth"}}
 		}, "apply only to type"},
+		// #106. The broker's working directory under systemd is /, so a relative path
+		// names a file at the filesystem root — and the sink's new permission checks
+		// would then be checking a directory nobody chose.
+		{"relative file output path", func(c *Config) {
+			c.Audit.Outputs = []AuditOutput{{Type: "file", Path: "audit.log"}}
+		}, "must be an absolute path"},
+		{"file output path relative to a directory", func(c *Config) {
+			c.Audit.Outputs = []AuditOutput{{Type: "file", Path: "../../etc/audit.log"}}
+		}, "must be an absolute path"},
 		{"file output with a path", func(c *Config) {
 			c.Audit.Outputs = []AuditOutput{{Type: "file", Path: "/var/log/oauth2-pam/audit.log"}}
 		}, ""},
@@ -169,12 +178,20 @@ func TestValidate(t *testing.T) {
 		// The generated form: base64, 44 characters. Validate must accept what
 		// `oauth2-pam-admin gen-key` prints.
 		{"generated base64 key", func(c *Config) { c.Security.TokenEncryptionKey = generatedKey }, ""},
+		// A key is checked even where nothing will read it (#109). It used to be
+		// exempt when storage was off, so a malformed key waited in the file for
+		// whoever turned storage back on and then blamed that change.
 		{
-			"key length is unchecked when encryption is off",
+			"key length is checked even when encryption is off",
 			func(c *Config) {
 				c.Security.SecureTokenStorage = false
 				c.Security.TokenEncryptionKey = "short"
 			},
+			"token_encryption_key",
+		},
+		{
+			"no key at all is still fine when encryption is off",
+			func(c *Config) { c.Security.SecureTokenStorage = false },
 			"",
 		},
 

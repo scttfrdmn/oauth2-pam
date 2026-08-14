@@ -1779,7 +1779,20 @@ func boundedReplyField(s string, max int) string {
 	var out strings.Builder
 	width := 0
 	for _, r := range s {
-		if r < 0x20 || r == 0x7f {
+		// isDisallowedInPrompt, not a predicate of this function's own — #105. This
+		// used to be `r < 0x20 || r == 0x7f`, which is C0 and DEL and stops there. The
+		// sanitizer three files over rejects C1 as well (U+009B is CSI, and encoding/json
+		// does not escape it, so it reached the audit file, journald and
+		// oauth2-pam-admin's console output as a live escape) plus U+2028 and U+2029.
+		//
+		// Two filters for one class of value, and the weaker one governed the wire. The
+		// value being filtered is the same in both cases — a string the provider or the
+		// mapper chose — so there is one policy, in one place, and both callers ask it.
+		// Newline needs no separate case: isDisallowedInPrompt covers all of C0. Its
+		// comment says newline is "handled by the caller", meaning the caller that has
+		// structural newlines to keep — SanitizePromptBlock and the QR art. A reply
+		// field is single-line, so the answer here is the plain one.
+		if isDisallowedInPrompt(r) {
 			continue
 		}
 		w := escapedRuneWidth(r)
@@ -1796,13 +1809,17 @@ func boundedReplyField(s string, max int) string {
 // inside a JSON string.
 //
 // It follows encoding/json's own encoder with HTML escaping on, which is the
-// default and what internal/ipc's bare json.Marshal uses. Control characters are
-// absent by the time this is reached — boundedReplyField strips them — so the
-// six-byte escape they would take does not appear here; if that stripping is ever
-// removed this function has to grow the case back.
+// default and what internal/ipc's bare json.Marshal uses. C0 and DEL are absent by
+// the time this is reached — boundedReplyField strips them — so the six-byte escape
+// they would take does not appear here; if that stripping is ever removed this
+// function has to grow the case back.
 //
-// The expanding characters are spelled as escapes rather than literals on purpose:
-// U+2028 and U+2029 are invisible in an editor and in a diff.
+// The U+2028 and U+2029 arms are now unreachable through boundedReplyField too,
+// which strips them along with C1 since #105. They are kept because this function
+// answers "how wide is this rune in JSON" for whatever is handed to it, and an
+// answer that is right only for the current caller's filter is a trap for the next
+// caller. The expanding characters are spelled as escapes rather than literals on
+// purpose: U+2028 and U+2029 are invisible in an editor and in a diff.
 func escapedRuneWidth(r rune) int {
 	switch r {
 	case '"', '\\':

@@ -3,6 +3,7 @@ package auth
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -23,26 +24,114 @@ import (
 // These are the field-level bounds. internal/ipc's authorized-reply test measures
 // the result against the cap itself.
 
+// TestBoundedReplyFieldStripsControlCharacters.
+//
+// The assertion is assertNoDisallowedRunes — sanitize_test.go's helper, the strong
+// one — rather than a predicate written here. #105: this test used to assert
+// `r < 0x20 || r == 0x7f`, which was boundedReplyField's own condition restated, and
+// a test that restates the implementation cannot fail for anything the
+// implementation considers printable. It fed no C1, so it did not notice that C1 was
+// exactly what boundedReplyField let past: encoding/json does not escape U+009B, so
+// a raw CSI reached the audit file, journald and oauth2-pam-admin's console output.
+//
+// The helper lives in this package and was already pointed at device_url, user_code
+// and the QR art. Pointing it at the values on the authorized reply is the whole of
+// the fix's test side.
 func TestBoundedReplyFieldStripsControlCharacters(t *testing.T) {
-	// A NUL, a newline, an ESC introducing a terminal sequence, and a DEL.
-	got := boundedReplyField("al\x00ice\n\x1b[2Jbob\x7f", maxReplyEmailBytes)
+	got := boundedReplyField("al"+hostileReplyValue+"ice", maxReplyEmailBytes)
 
-	for i, r := range got {
-		if r < 0x20 || r == 0x7f {
-			t.Errorf("byte %d of %q is control character %#x", i, got, r)
-		}
-	}
-	if !utf8.ValidString(got) {
-		t.Errorf("%q is not valid UTF-8", got)
-	}
-	if strings.ContainsAny(got, "\x00\n\x1b\x7f") {
-		t.Errorf("%q still carries a control character", got)
-	}
+	// allowNewline is false: a reply field is single-line. The callers that pass true
+	// are the ones with structural newlines to keep, the prompt block and the QR art.
+	assertNoDisallowedRunes(t, false, got)
+
 	// The printable remainder survives: stripping is not sanitizing away the value.
-	if !strings.Contains(got, "alice") || !strings.Contains(got, "bob") {
+	if !strings.Contains(got, "al") || !strings.Contains(got, "ice") {
 		t.Errorf("%q dropped printable content", got)
 	}
 }
+
+// TestEveryFieldOnAnAuthorizedReplyIsFiltered is the call-site half, and the half
+// #105 was actually about. boundedReplyField being correct says nothing about
+// whether the values on the reply that somebody else chose go through it.
+//
+// Reflective over the whole reply rather than field by field, for the reason
+// internal/ipc's request test is reflective: a field added later is covered without
+// anybody remembering to come back here.
+func TestEveryFieldOnAnAuthorizedReplyIsFiltered(t *testing.T) {
+	b := &Broker{}
+	resp := b.successResponse(&Session{
+		ID:            strings.Repeat("ab", 16),
+		LocalUser:     "alice", // already through unixUsernameRe by this point
+		Email:         "alice" + hostileReplyValue + "@example.com",
+		ProviderLogin: "alice" + hostileReplyValue,
+		Groups:        []string{"wheel" + hostileReplyValue, "docker" + hostileReplyValue},
+		Provider:      "acme",
+		ExpiresAt:     time.Now().Add(8 * time.Hour),
+		LastAccessed:  time.Now(),
+	})
+
+	// The group list has to be small enough to be carried, so that a group name is a
+	// filtered value on the wire and not an omitted one. If that stopped being true
+	// this test would pass by having nothing left to check.
+	if resp.Metadata["groups_omitted"] == "true" || len(resp.Groups) != 2 {
+		t.Fatalf("the two-group list was not carried (groups=%v omitted=%q); this no longer "+
+			"checks a group name on the wire", resp.Groups, resp.Metadata["groups_omitted"])
+	}
+
+	for _, s := range replyStrings(t, resp) {
+		assertNoDisallowedRunes(t, false, s)
+	}
+}
+
+// replyStrings returns every string anywhere in resp, walking it by reflection so
+// that a field or a metadata key added later is included without an edit here.
+func replyStrings(t *testing.T, resp *AuthResponse) []string {
+	t.Helper()
+	var out []string
+	var walk func(v reflect.Value)
+	walk = func(v reflect.Value) {
+		switch v.Kind() {
+		case reflect.String:
+			out = append(out, v.String())
+		case reflect.Pointer, reflect.Interface:
+			if !v.IsNil() {
+				walk(v.Elem())
+			}
+		case reflect.Slice, reflect.Array:
+			for i := 0; i < v.Len(); i++ {
+				walk(v.Index(i))
+			}
+		case reflect.Map:
+			for _, k := range v.MapKeys() {
+				walk(k)
+				walk(v.MapIndex(k))
+			}
+		case reflect.Struct:
+			for i := 0; i < v.NumField(); i++ {
+				if v.Type().Field(i).IsExported() {
+					walk(v.Field(i))
+				}
+			}
+		}
+	}
+	walk(reflect.ValueOf(resp))
+	if len(out) == 0 {
+		t.Fatal("walked the reply and found no strings; the walk is broken, not the reply")
+	}
+	return out
+}
+
+// hostileReplyValue is what a provider or a mapper tier can put in a value the
+// broker forwards. Every class the prompt sanitizer rejects is present, because #105
+// was the reply filter rejecting a strict subset of them:
+//
+//   - NUL, an ESC introducing a CSI sequence, and DEL — the three the old filter did
+//     catch, kept so that a narrowing of the fix would still fail here;
+//   - U+0085 NEL and U+009B CSI, the C1 controls. U+009B *is* CSI to a terminal
+//     decoding UTF-8, and encoding/json escapes neither, so the old filter forwarded
+//     a live escape to the audit file, journald and oauth2-pam-admin's console;
+//   - U+2028 and U+2029, line breaks to a JavaScript reader of the same JSON.
+const hostileReplyValue = "\x00\x1b[2J\x7f\u0085\u009b2K\u2028\u2029"
 
 func TestBoundedReplyFieldTruncatesOnARuneBoundary(t *testing.T) {
 	// Two-byte runes against an odd budget, so a byte-wise truncation would split
