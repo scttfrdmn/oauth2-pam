@@ -38,6 +38,15 @@ type fakeProvider struct {
 	// codeLifetime is how long an issued device code stays valid at the provider.
 	// Deliberately much longer than any login, like github.com's 15 minutes.
 	codeLifetime time.Duration
+
+	// identityGate, when non-nil, holds GetIdentity until it is closed, and
+	// identityCtxErr records what the poll context said once it was released. A
+	// completed flow really can stall here — GetIdentity retries two seconds
+	// apart, and the mapper's NSS lookup takes no context at all — and holding
+	// that window open is the only way a test outside the broker can arrange for a
+	// flow to finish after its own deadline.
+	identityGate   chan struct{}
+	identityCtxErr error
 }
 
 func newFakeProvider(name string) *fakeProvider {
@@ -91,9 +100,20 @@ func (f *fakeProvider) PollDeviceAuthorization(_ context.Context, deviceCode str
 	}, nil
 }
 
-func (f *fakeProvider) GetIdentity(context.Context, *provider.Token) (*provider.Identity, error) {
+func (f *fakeProvider) GetIdentity(ctx context.Context, _ *provider.Token) (*provider.Identity, error) {
+	f.mu.Lock()
+	gate := f.identityGate
+	f.mu.Unlock()
+
+	// Waited on outside the lock: pollCount and authorize are what a test uses
+	// while the flow is held here.
+	if gate != nil {
+		<-gate
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.identityCtxErr = ctx.Err()
 	return f.identity, nil
 }
 
@@ -114,6 +134,26 @@ func (f *fakeProvider) failWith(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pollErr = err
+}
+
+// blockIdentity holds every GetIdentity call until the returned func is called,
+// so a test can choose when a flow that is already approved at the provider
+// finishes at the broker.
+func (f *fakeProvider) blockIdentity() (release func()) {
+	gate := make(chan struct{})
+	f.mu.Lock()
+	f.identityGate = gate
+	f.mu.Unlock()
+	return func() { close(gate) }
+}
+
+// identityContextErr reports the state of the poll context as GetIdentity last
+// saw it, which is how a test observes whether the flow's deadline reached the
+// work rather than only the session record.
+func (f *fakeProvider) identityContextErr() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.identityCtxErr
 }
 
 // pollCount reports how many times the nth issued device code (1-based) has been
@@ -176,6 +216,25 @@ func awaitStatus(t *testing.T, b *Broker, sessionID string) *AuthResponse {
 	}
 	t.Fatalf("session %s never left %q", sessionID, StatusPending)
 	return nil
+}
+
+// awaitPollerExit waits for a session's polling goroutine to finish. The poller
+// drops its cancel entry as its last act, so this is how a test knows the flow
+// reached its conclusion — including a conclusion that changes nothing, which no
+// session field records and no sleep can be trusted to cover.
+func awaitPollerExit(t *testing.T, b *Broker, sessionID string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		b.sessionMutex.RLock()
+		_, polling := b.pollCancel[sessionID]
+		b.sessionMutex.RUnlock()
+		if !polling {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("the poller for session %s never finished", sessionID)
 }
 
 // TestNonGitHubProviderAuthenticatesEndToEnd is the validation for the provider

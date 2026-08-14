@@ -407,13 +407,22 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 	// Poll in the background; update session when the device flow completes.
 	// The poller's context is cancelled the moment the session stops being
 	// interesting, so a login nobody is waiting for stops talking to the provider.
-	pollCtx, cancel := context.WithCancel(b.baseContext())
+	//
+	// The deadline is on the context, not only on a timer arm of the poll loop's
+	// select. Once that select has taken its ticker arm the body runs to
+	// completion before the select is re-entered — a poll, up to three identity
+	// attempts two seconds apart, up to three mapper attempts, then a token store —
+	// so a timer could not fire during any of it. The mapper's NSS lookup takes no
+	// context and has no timeout of its own, so on an LDAP or SSSD host that window
+	// is bounded by nothing this project controls. With the deadline here, every
+	// context-aware call in the flow ends when the broker stops waiting.
+	pollCtx, cancel := context.WithDeadline(b.baseContext(), expiresAt)
 	b.sessionMutex.Lock()
 	b.pollCancel[sessionID] = cancel
 	b.sessionMutex.Unlock()
 
 	b.wg.Add(1)
-	go b.pollDeviceAuthorization(pollCtx, sessionID, prov, deviceFlow, expiresAt)
+	go b.pollDeviceAuthorization(pollCtx, sessionID, prov, deviceFlow)
 
 	// Success is false: a started device flow is not an authenticated user.
 	return &AuthResponse{
@@ -688,15 +697,15 @@ func (b *Broker) RevokeSession(sessionID string) error {
 // It takes sessionID (not a *Session pointer) to avoid data races; all
 // session reads/writes go through getSession/setSession under the mutex.
 //
-// ctx is cancelled when the session is evicted, revoked, or fails, so the
-// goroutine and its provider traffic stop with it. deadline is when the broker
-// gives up waiting, which may be earlier than the provider's own code expiry.
+// ctx is cancelled when the session is evicted, revoked, or fails, and carries
+// the deadline at which the broker gives up waiting — which may be earlier than
+// the provider's own code expiry. Both endings are read through pollFinished, so
+// there is one deadline rather than a context and a timer that can disagree.
 func (b *Broker) pollDeviceAuthorization(
 	ctx context.Context,
 	sessionID string,
 	prov provider.Provider,
 	df *provider.DeviceFlow,
-	deadline time.Time,
 ) {
 	defer b.wg.Done()
 	defer b.forgetPoll(sessionID)
@@ -708,8 +717,6 @@ func (b *Broker) pollDeviceAuthorization(
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	timeout := time.NewTimer(time.Until(deadline))
-	defer timeout.Stop()
 
 	for {
 		select {
@@ -717,21 +724,15 @@ func (b *Broker) pollDeviceAuthorization(
 			return
 
 		case <-ctx.Done():
-			// The session this poll belonged to is gone. Whatever removed it has
-			// already recorded why, so there is nothing to report here.
-			log.Debug().Str("session_id", sessionID).Msg("Device flow poll cancelled")
-			return
-
-		case <-timeout.C:
-			log.Warn().
-				Str("session_id", sessionID).
-				Msg("Device flow expired")
-			b.failSession(sessionID, StatusExpired, "Device authorization expired")
+			b.pollFinished(ctx, sessionID)
 			return
 
 		case <-ticker.C:
 			token, err := prov.PollDeviceAuthorization(ctx, df.DeviceCode)
 			if err != nil {
+				if b.pollFinished(ctx, sessionID) {
+					return
+				}
 				// errors.Is, not equality: an implementation is entitled to wrap
 				// a sentinel with context ("poll acme-sso: %w"), and treating
 				// that as an unknown error would fail a login that is merely
@@ -771,6 +772,9 @@ func (b *Broker) pollDeviceAuthorization(
 				if err == nil {
 					break
 				}
+				if b.pollFinished(ctx, sessionID) {
+					return
+				}
 				if !isTransientError(err) || attempt == 3 {
 					log.Error().Err(err).Int("attempt", attempt).
 						Str("session_id", sessionID).Msg("Failed to resolve provider identity")
@@ -806,6 +810,9 @@ func (b *Broker) pollDeviceAuthorization(
 					mapResult, err = b.mapper.Map(ctx, identity, current.RequestedLocalUser)
 					if err == nil {
 						break
+					}
+					if b.pollFinished(ctx, sessionID) {
+						return
 					}
 					if !isTransientError(err) || attempt == 3 {
 						log.Error().Err(err).Int("attempt", attempt).
@@ -952,6 +959,35 @@ func (b *Broker) pollDeviceAuthorization(
 	}
 }
 
+// pollFinished reports whether the poll context has ended, recording the expiry
+// on the session when it ended because the flow's deadline passed. Every
+// failure branch in the loop above consults it first, so a provider or mapper
+// call aborted mid-flight is reported as what it is.
+//
+// Without it, the deadline on the context would change the answer a client gets:
+// context.DeadlineExceeded satisfies net.Error, so isTransientError calls it
+// transient, and a poll or identity attempt cut short by the deadline would be
+// retried twice more and then land in the default arm as StatusError — telling a
+// client the provider broke when what happened is that the broker stopped
+// waiting.
+func (b *Broker) pollFinished(ctx context.Context, sessionID string) bool {
+	err := ctx.Err()
+	switch {
+	case err == nil:
+		return false
+	case errors.Is(err, context.DeadlineExceeded):
+		log.Warn().
+			Str("session_id", sessionID).
+			Msg("Device flow expired")
+		b.failSession(sessionID, StatusExpired, "Device authorization expired")
+	default:
+		// The session this poll belonged to is gone. Whatever removed it has
+		// already recorded why, so there is nothing to report here.
+		log.Debug().Str("session_id", sessionID).Msg("Device flow poll cancelled")
+	}
+	return true
+}
+
 // identityFailureStatus classifies a GetIdentity failure. A provider-level
 // access-control refusal (not in the required org or team) is a denial; an
 // unreachable API is an error.
@@ -1001,18 +1037,30 @@ func (b *Broker) getSession(sessionID string) *Session {
 
 // activateSession promotes a pending session to authorized under a single lock,
 // applying mutate to the stored entry. It returns false — changing nothing — if
-// the session is gone, is no longer pending, or is not the same one the caller
-// started with: CreatedAt distinguishes a session that was removed and had its
-// ID reused from the one still in flight.
+// the session is gone, is no longer pending, has passed its own deadline, or is
+// not the same one the caller started with: CreatedAt distinguishes a session
+// that was removed and had its ID reused from the one still in flight.
 //
 // This is the only place a session becomes active, so it is the only place the
-// invariant "an authorized session was pending a moment ago" has to hold.
+// invariants "an authorized session was pending a moment ago" and "an authorized
+// session was approved before its deadline" have to hold.
+//
+// The expiry is checked here and not left to the poller's deadline because the
+// mutate below rewrites ExpiresAt to the session lifetime: an activation a
+// moment too late is indistinguishable afterwards, and nothing downstream
+// catches it. CheckSession's expiry branch only runs while !IsActive, so a
+// session activated past the flow deadline answered "authorized" with an hour on
+// it — the only clock bounding an unapproved flow, defeated by a slow mapper or
+// a provider that stalls on authorization_pending.
 func (b *Broker) activateSession(sessionID string, createdAt time.Time, mutate func(*Session)) bool {
 	b.sessionMutex.Lock()
 	defer b.sessionMutex.Unlock()
 
 	s, ok := b.sessions[sessionID]
 	if !ok || s.IsActive || s.Status != StatusPending || !s.CreatedAt.Equal(createdAt) {
+		return false
+	}
+	if !s.ExpiresAt.After(time.Now()) {
 		return false
 	}
 	mutate(s)
