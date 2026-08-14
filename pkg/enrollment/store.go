@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -69,10 +70,17 @@ var Unvalidated LocalUserValidator
 // store: falling through to the later tiers would turn "somebody else can rewrite
 // tier 0" into a silent change of mapping policy.
 func Load(path string) (*Store, error) {
-	f, err := os.Open(path) // #nosec G304 -- path comes from the broker's own root-owned config
+	// O_NOFOLLOW refuses a symlink in the same syscall as the open, rather than
+	// leaving a window in which one could appear between a check and the read (#96).
+	f, err := os.OpenFile(path, os.O_RDONLY|oNoFollow, 0) // #nosec G304 -- path comes from the broker's own root-owned config
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return &Store{}, nil
+		}
+		// O_NOFOLLOW reports a symlink as ELOOP, whose message describes a loop that
+		// is not there. Say what is actually wrong.
+		if fi, lerr := os.Lstat(path); lerr == nil && fi.Mode()&fs.ModeSymlink != 0 {
+			return nil, symlinkError(path)
 		}
 		return nil, fmt.Errorf("open enrollment file %s: %w", path, err)
 	}
@@ -130,9 +138,18 @@ func (r *Record) UnmarshalYAML(node *yaml.Node) error {
 
 // Save writes the store to path atomically using a temp file + rename, with
 // an exclusive flock on the destination file to prevent concurrent writers.
+//
+// The directory is checked before anything is written, by the same rule Load
+// applies. Writing the file first would produce an enrollment the broker then
+// refuses at login, which is an outage discovered by the user it locks out; the
+// operator gets the error and the chmod to fix it at enrollment time instead.
 func (s *Store) Save(path string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0750); err != nil {
 		return fmt.Errorf("create enrollment directory: %w", err)
+	}
+	if err := checkDirPerms(dir); err != nil {
+		return err
 	}
 
 	data, err := yaml.Marshal(s)
@@ -162,7 +179,14 @@ func (s *Store) Save(path string) error {
 
 	// Acquire an exclusive lock on the destination file (create if needed) to
 	// serialize concurrent writers, then atomically replace it.
-	lock, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0600)
+	//
+	// O_NOFOLLOW because this is an O_WRONLY open of a path another process may have
+	// just created. Nothing is ever written through this descriptor — it exists only
+	// to hold the flock, and the rename below is what puts the data in place — but
+	// opening a symlink for writing at all is the kind of thing that stops being
+	// harmless when someone later adds a write. Load refuses a symlink here too, so
+	// the two agree about what this path is allowed to be.
+	lock, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|oNoFollow, 0600)
 	if err != nil {
 		return fmt.Errorf("open enrollment file for locking: %w", err)
 	}

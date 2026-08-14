@@ -188,40 +188,58 @@ struct broker_response {
     int  protocol_version; // the reply's protocol_version; 0 if absent, i.e. 1
 };
 
-// Prototypes implemented in cgo_bridge_linux.c (compiled into the .so)
-void log_pam_message(int priority, const char *format, ...);
-void log_pam_message_string(int priority, const char *message);
+// Prototypes implemented in cgo_bridge_linux.c (compiled into the .so).
+//
+// static, every one of them — #97. Only the six pam_sm_* entry points are the
+// module's interface; nothing else in the tree links against these, because the
+// unit suite #includes the .c rather than the .so. Declared non-static they were
+// exported from the shared object as STB_GLOBAL/STV_DEFAULT under -fPIC, and their
+// internal call sites resolved through the PLT against the global scope, which is
+// the interposition -Bsymbolic used to prevent and which the Makefile's note on
+// dropping that flag asserted was already impossible.
+//
+// This header is included by cgo_bridge_linux.c and by nothing else. If that ever
+// changes, these move into the .c as forward declarations rather than losing the
+// static.
+// Two functions are gone from this list rather than made static, because making
+// them static is what proved they were dead: -Werror=unused-function is silent
+// about a non-static definition, since any other object might call it, and both
+// had no caller anywhere in the tree. log_pam_message_string was the non-variadic
+// sibling of the logger below; display_message drew a PAM_TEXT_INFO, which this
+// module deliberately does not do — OpenSSH may not flush one until the auth call
+// returns, so the device instructions go out as a PAM_PROMPT_ECHO_OFF and
+// display_message was a leftover of the approach that did not work.
+static void log_pam_message(int priority, const char *format, ...);
 
 // connect_to_broker returns a connected socket with io_timeout applied to every
 // send and receive on it, or -1. io_timeout is in seconds and must be positive.
-int  connect_to_broker(const char *socket_path, int io_timeout);
+static int  connect_to_broker(const char *socket_path, int io_timeout);
 
-int  get_user_info(pam_handle_t *pamh,
+static int  get_user_info(pam_handle_t *pamh,
                    const char **username,
                    const char **service,
                    const char **rhost,
                    const char **tty);
 // send_auth_request sends the initial authenticate request. provider may be
 // NULL, which asks the broker for its default (first configured) provider.
-int  send_auth_request(int sock,
+static int  send_auth_request(int sock,
                        const char *username,
                        const char *service,
                        const char *rhost,
                        const char *tty,
                        const char *provider);
-int  send_check_session_request(int sock, const char *session_id);
+static int  send_check_session_request(int sock, const char *session_id);
 
 // receive_auth_response reads until the broker closes the connection and
 // NUL-terminates the result. It accepts at most response_size - 1 bytes; a
 // longer response is rejected rather than silently truncated into invalid JSON.
-int  receive_auth_response(int sock, char *response, size_t response_size);
+static int  receive_auth_response(int sock, char *response, size_t response_size);
 
-int  validate_socket_path(const char *path);
-int  display_message(pam_handle_t *pamh, const char *message);
+static int  validate_socket_path(const char *path);
 
 // prompt_user runs one conversation round. echo controls whether the reply is
 // echoed: pass 0 for PAM_PROMPT_ECHO_OFF, non-zero for PAM_PROMPT_ECHO_ON.
-int  prompt_user(pam_handle_t *pamh,
+static int  prompt_user(pam_handle_t *pamh,
                  const char *prompt,
                  char *response,
                  size_t response_size,
@@ -229,6 +247,6 @@ int  prompt_user(pam_handle_t *pamh,
 
 // parse_broker_response parses a JSON reply into a freshly allocated
 // broker_response. Returns 0 on success (caller frees *out), -1 on failure.
-int  parse_broker_response(const char *json_text, struct broker_response **out);
+static int  parse_broker_response(const char *json_text, struct broker_response **out);
 
 #endif // CGO_BRIDGE_H

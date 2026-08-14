@@ -116,6 +116,152 @@ func TestLoadAcceptsAGroupReadableFile(t *testing.T) {
 	}
 }
 
+// The symlink and directory rules — #96.
+//
+// The mode and owner checks stop an attacker installing an enrollment file of their
+// own: what they cannot forge is root's ownership. What they leave open is the
+// rollback. With write access to the directory, an earlier root-owned copy of this
+// very file is theirs to put back — an operator's enrolled-users.yaml.bak alongside
+// it is enough — and it restores an enrollment that was deliberately removed, or one
+// that pointed a provider identity at a different local account. Every check on the
+// file itself passes, because in every respect they check, it is the same file.
+//
+// pkg/config makes both of these checks before reading a client secret and says why
+// in checkDirPerms. Tier 0 is the stronger case: a client secret decides which OAuth
+// app the broker trusts, and this file decides who logs in as whom.
+
+func TestLoadRefusesASymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "enrolled-users.yaml")
+	store := &Store{Enrollments: []Record{{LocalUser: "alice", Login: "alice-gh"}}}
+	if err := store.Save(target); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	link := filepath.Join(dir, "link.yaml")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	// The premise: the target is a file Load accepts. So the refusal below is about
+	// the link and nothing else.
+	if _, err := Load(target); err != nil {
+		t.Fatalf("Load of the target itself: %v", err)
+	}
+
+	if _, err := Load(link); err == nil {
+		t.Error("Load followed a symlink; the mode and owner it checked are the target's, and " +
+			"whoever owns the directory holding the link can repoint it without touching either")
+	} else if !strings.Contains(err.Error(), "symlink") {
+		t.Errorf("err = %q, want it to name the symlink as the problem", err)
+	}
+}
+
+func TestLoadRefusesAFileInAWritableDirectory(t *testing.T) {
+	for _, mode := range []os.FileMode{0770, 0707, 0777} {
+		t.Run(fmt.Sprintf("%04o", mode), func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "oauth2-pam")
+			path := filepath.Join(dir, "enrolled-users.yaml")
+			store := &Store{Enrollments: []Record{{LocalUser: "alice", Login: "alice-gh"}}}
+			if err := store.Save(path); err != nil {
+				t.Fatalf("Save: %v", err)
+			}
+			if err := os.Chmod(dir, mode); err != nil {
+				t.Fatalf("chmod dir: %v", err)
+			}
+
+			if _, err := Load(path); err == nil {
+				t.Fatalf("Load accepted a 0600 file in a mode-%04o directory; the file cannot be "+
+					"modified there but it can be renamed away and an older copy put back", mode)
+			} else if !strings.Contains(err.Error(), "chmod 750") {
+				t.Errorf("err = %q, want it to say how to fix the directory", err)
+			}
+		})
+	}
+}
+
+// A sticky directory is accepted, and this is why /tmp is safe to share: with the
+// sticky bit set only the owner of a file may rename or unlink it, which is the
+// whole of the attack the mode is being checked for. Without this case the rule
+// would be refusing a directory that is not actually exposed.
+func TestLoadAcceptsAFileInAStickyWritableDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "oauth2-pam")
+	path := filepath.Join(dir, "enrolled-users.yaml")
+	store := &Store{Enrollments: []Record{{LocalUser: "alice", Login: "alice-gh"}}}
+	if err := store.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := os.Chmod(dir, 0777|os.ModeSticky); err != nil {
+		t.Fatalf("chmod dir: %v", err)
+	}
+
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load from a sticky world-writable directory: %v", err)
+	}
+	if loaded.FindByLocalUser("alice") == nil {
+		t.Error("the record did not load")
+	}
+}
+
+// TestSaveRefusesAWritableDirectory: the operator finds out at enrollment time,
+// with the chmod that fixes it, rather than the enrolled user finding out at login
+// time when the broker refuses the file that was just written for them.
+func TestSaveRefusesAWritableDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "oauth2-pam")
+	if err := os.MkdirAll(dir, 0777); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatalf("chmod dir: %v", err)
+	}
+
+	path := filepath.Join(dir, "enrolled-users.yaml")
+	store := &Store{Enrollments: []Record{{LocalUser: "alice", Login: "alice-gh"}}}
+
+	err := store.Save(path)
+	if err == nil {
+		t.Fatal("Save wrote an enrollment into a world-writable directory, which Load then refuses: " +
+			"the enrollment appears to have worked and the user it is for cannot log in")
+	}
+	if !strings.Contains(err.Error(), "chmod 750") {
+		t.Errorf("err = %q, want it to say how to fix the directory", err)
+	}
+	if _, statErr := os.Stat(path); statErr == nil {
+		t.Error("Save left a file behind on the path it refused")
+	}
+}
+
+// Save's lock descriptor is an O_WRONLY open of a path something else may have
+// just created, so it refuses a symlink for the same reason Load does — and so
+// that the two cannot disagree about what the enrollment path is allowed to be.
+func TestSaveRefusesASymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "elsewhere.yaml")
+	if err := os.WriteFile(target, []byte("enrollments: []\n"), 0600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	path := filepath.Join(dir, "enrolled-users.yaml")
+	if err := os.Symlink(target, path); err != nil {
+		t.Skipf("symlink unsupported here: %v", err)
+	}
+
+	store := &Store{Enrollments: []Record{{LocalUser: "alice", Login: "alice-gh"}}}
+	if err := store.Save(path); err == nil {
+		t.Fatal("Save opened a symlink at the enrollment path for writing")
+	}
+
+	// And the link is still a link: nothing was renamed over it, so the target
+	// was not silently adopted as the enrollment file.
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("lstat: %v", err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Error("Save replaced the symlink, so a later Load would read a file the operator did not name")
+	}
+}
+
 // A path that is not a regular file is not an enrollment file, whatever it
 // contains.
 func TestLoadRefusesANonRegularFile(t *testing.T) {
