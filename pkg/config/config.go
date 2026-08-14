@@ -513,6 +513,16 @@ func (c *Config) Validate() error {
 		if o.Type == "file" && o.Path == "" {
 			return fmt.Errorf("audit.outputs[%d].path is required for type \"file\"", i)
 		}
+		// Absolute, like server.socket_path and the mapper script and unlike this
+		// field until #106. Under systemd the working directory is /, so a relative
+		// path put the audit trail at the filesystem root if it landed anywhere at
+		// all — and the permission checks the sink now makes are checks on a
+		// directory nobody named.
+		if o.Type == "file" && o.Path != "" && !filepath.IsAbs(o.Path) {
+			return fmt.Errorf("audit.outputs[%d].path %q must be an absolute path; the broker's "+
+				"working directory under systemd is /, so a relative path does not name the file "+
+				"the operator meant", i, o.Path)
+		}
 		if o.Type != "file" && o.Path != "" {
 			return fmt.Errorf("audit.outputs[%d].path applies only to type \"file\", not %q", i, o.Type)
 		}
@@ -523,7 +533,14 @@ func (c *Config) Validate() error {
 
 	// What counts as a valid key is defined once, in pkg/security/keys, so this
 	// check and the one at cipher construction cannot drift apart.
-	if c.Security.SecureTokenStorage && c.Security.TokenEncryptionKey != "" {
+	//
+	// Checked whenever a key is present, not only when it is about to be used
+	// (#109). A key configured alongside secure_token_storage: false is not read by
+	// anything, so a malformed one used to sit in the file unremarked until the day
+	// storage was turned back on — at which point the broker refuses to start, and
+	// the change being blamed is the one-line one that did not introduce the fault.
+	// A value in this field is either a key or a mistake.
+	if c.Security.TokenEncryptionKey != "" {
 		if err := keys.Validate(c.Security.TokenEncryptionKey); err != nil {
 			return fmt.Errorf("security.token_encryption_key %w", err)
 		}

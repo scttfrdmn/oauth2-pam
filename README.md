@@ -124,11 +124,17 @@ sudo make install
 ```
 
 This installs:
-- `oauth2_pam.so` into this distribution's PAM module directory — asked for with
-  `scripts/pam-module-dir.sh`, not assumed. It is `/lib64/security` on RHEL and
+- `oauth2_pam.so` into this distribution's PAM module directory, worked out by
+  `scripts/pam-module-dir.sh`. It is `/lib64/security` on RHEL and
   `/usr/lib/<triplet>/security` on Debian/Ubuntu multiarch, and a module in the
-  wrong one is a module PAM silently never loads. Override with
-  `PAMDIR=/path make install`.
+  wrong one is a module PAM silently never loads. Where `dpkg` exists the script
+  asks it (`dpkg -L libpam-modules`, and wherever that says `pam_permit.so` lives
+  is where a module goes), which covers the multiarch case that cannot be guessed.
+  Everywhere else it falls back to the first of `/lib64/security`,
+  `/lib/security`, `/usr/lib64/security`, `/usr/lib/security` that exists — a
+  guess, and the right one on the RPM distributions, but a guess. If your host
+  keeps them somewhere else, say so: `PAMDIR=/path make install`, which the script
+  takes as given and does not second-guess.
 - `/usr/local/bin/oauth2-pam-broker`
 - `/usr/local/bin/oauth2-pam-admin`
 - `/usr/local/bin/oauth2-pam-enroll`
@@ -147,10 +153,15 @@ sudo install -m 0600 -o root -g root configs/example.yaml /etc/oauth2-pam/broker
 sudo $EDITOR /etc/oauth2-pam/broker.yaml
 ```
 
-The directory is created explicitly, and `0750`. The broker checks the mode and
-owner of the file that holds the secret; nothing checks the directory around it,
-and a directory another user can write is a config file that user can *replace* —
-which would let them choose the OAuth app this host authenticates against.
+The directory is created explicitly, and `0750`. The broker checks the mode and owner
+of the file that holds the secret **and of the directory around it**, because a
+directory another user can write is a config file that user can *replace* — which
+would let them choose the OAuth app this host authenticates against. A directory that
+is writable by group or other (without the sticky bit) or owned by neither root nor
+the broker is a startup error, not a warning. This paragraph said nothing checked the
+directory until [#109](https://github.com/scttfrdmn/oauth2-pam/issues/109); the check
+has been there since #96, so an operator following the old text got a broker that
+refused to start for a reason they had been told was not checked.
 
 Minimal config:
 
@@ -335,10 +346,32 @@ The mapper resolves a GitHub identity to a local Unix user via a four-tier chain
 
 | Tier | Config key | Description |
 |------|-----------|-------------|
-| 0 | `mapper.enrollment_file` | Self-enrolled users (`oauth2-pam-enroll`) |
+| 0 | `mapper.enrollment_enabled` (plus `mapper.enrollment_file`) | Self-enrolled users (`oauth2-pam-enroll`) |
 | 1 | `mapper.rules` | Built-in YAML rules, zero deps |
 | 2 | `mapper.external_script` | External binary (JSON stdin/stdout) |
 | 3 | `mapper.http_endpoint` | HTTPS service (LDAP gateway, etc.) |
+
+Tier 0 needs both keys, and `mapper.enrollment_enabled: true` is the one that
+switches it on — a path alone does nothing. This table named only the path until
+[#107](https://github.com/scttfrdmn/oauth2-pam/issues/107), which was wrong twice
+over: a config with just `mapper.enrollment_file` does not satisfy "at least one
+tier", so the broker refuses to start, and adding a rule to get past that leaves
+tier 0 never consulted — so every enrolled user is silently ignored while
+`oauth2-pam-enroll` appears to work.
+
+```yaml
+mapper:
+  enrollment_enabled: true
+  enrollment_file: /etc/oauth2-pam/enrolled-users.yaml   # this is the default
+```
+
+The file is read fresh on every login, so enrolling somebody takes effect without a
+restart. It must be a regular file, not a symlink, owned by root, and neither it nor
+its directory may be writable by group or other — tier 0 decides which provider
+identity owns which local account, so whoever can write it chooses who logs in as
+whom. `oauth2-pam-enroll` writes it 0600. A file that fails those checks yields no
+tier-0 answer at all: the login falls through to the later tiers with a warning in
+the broker's log, rather than an untrusted file being honoured.
 
 ### Which local accounts can be mapped to
 
@@ -375,7 +408,7 @@ mapper:
       local_user: octocat
 ```
 
-All `match` fields within a rule are ANDed, and matching is case-insensitive. `local_user` supports `{{ .Login }}` (the provider username), `{{ .Email }}`, and `{{ .Name }}`; nothing else — an unknown field or a pipeline is rejected rather than expanded. The result must be a valid POSIX username or the mapping is refused. A provider whose logins are email addresses therefore cannot use `{{ .Login }}`; give those rules an explicit `local_user`, or map in Tier 2/3.
+All `match` fields within a rule are ANDed, and matching is case-insensitive. `local_user` substitutes three values, each in three spellings: `{{ .Login }}`, `{{.Login}}` or `{login}` (the provider username), and the same forms for `.Email` and `.Name`. Nothing else is substituted. A leftover `{{` after substitution is rejected outright, which is what stops a provider-controlled field turning into a template; a leftover single-brace form like `{bogus}` is left as literal text and then fails the POSIX-username check, so it is refused too, one step later. The result must be a valid POSIX username or the mapping is refused. A provider whose logins are email addresses therefore cannot use `{{ .Login }}`; give those rules an explicit `local_user`, or map in Tier 2/3.
 
 `github_org` and `github_team` are the GitHub spelling of provider-neutral **claims**, and a rule can name claims directly instead:
 
@@ -482,9 +515,14 @@ make test-cbridge-mutations      # put each fixed bridge defect back; the C test
 make test-integration-mutations  # put the v0.1.x bypass back; the harness must refuse the login
 ```
 
-Those two are the check on the checks, and CI runs both on every push and pull
-request — the harness mutation check as its own job, the C bridge one as a step in
-the Linux job, next to the suite it mutates. A green suite proves the code does what the tests say; it does not prove the tests would notice if it stopped — so each of the six C bridge defects fixed in v0.2.0, and the v0.1.x authentication bypass itself, is reintroduced in a copy of the tree and the suite is required to fail. A mutation that survives means that regression test is decoration.
+Those two are the check on the checks, and CI runs both on every push to `main` and
+every pull request — the harness mutation check as its own job, the C bridge one as a
+step in the Linux job, next to the suite it mutates. A green suite proves the code
+does what the tests say; it does not prove the tests would notice if it stopped — so
+each of 25 C bridge defects is reintroduced in turn in a copy of the tree, along with
+the v0.1.x authentication bypass and an account stage that fails open, and the suite
+is required to fail each time. A mutation that survives means that regression test is
+decoration.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for how work is tracked (labels, milestones, the roadmap board), what to run before pushing, and the two invariants that are easy to break.
 
@@ -521,7 +559,7 @@ oauth2-pam/
 ## Security notes
 
 - The documented PAM stack makes this module a **second factor** (`auth required`, after the distribution's own auth stack), not the whole authentication decision. `auth sufficient` hands the decision to one module; v0.1.x is what that costs when the module is wrong. [Configure PAM (SSH)](#6-configure-pam-ssh) has both arrangements and the break-glass checklist.
-- Tokens are held encrypted in memory (AES-256-GCM) and never written to disk. Set `token_encryption_key` with `oauth2-pam-admin gen-key` rather than typing one: 32 typeable characters cannot carry 256 bits. With no key configured the broker generates one for the process instead of storing tokens in the clear — an unrecoverable key is no loss for data that never outlives the process, and it means the default is not plaintext. `secure_token_storage: false` opts out.
+- Tokens are held encrypted in memory (AES-GCM) and never written to disk. Set `token_encryption_key` with `oauth2-pam-admin gen-key` rather than typing one: 32 typeable characters cannot carry 256 bits. A generated (base64, 32-byte) key gives AES-256; a raw 16- or 24-byte key, still accepted for 0.1.x configs, gives AES-128 or AES-192. With no key configured the broker generates one for the process instead of storing tokens in the clear — an unrecoverable key is no loss for data that never outlives the process, and it means the default is not plaintext. `secure_token_storage: false` opts out.
 - Audit records go to `file`, `stdout`, or `syslog`; anything else is a startup error. An unrecognised type used to become `stdout`, so a typo moved the whole trail somewhere nobody was watching.
 - The broker socket is `0660` in a `0750` directory. The PAM module runs as root and so can reach it; other local users cannot, which matters because anything that can talk to the socket can start device flows.
 - The broker rate-limits per calling UID and caps request bodies at 64 KB. The UID comes from the socket's peer credentials (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED` on macOS/FreeBSD); if a platform cannot supply them the broker logs `peer_credentials=false` at startup and every caller shares one window, rather than all being recorded as root.
@@ -529,8 +567,8 @@ oauth2-pam/
 - Session IDs are generated by the broker with `crypto/rand`; a client-supplied `session_id` on an `authenticate` request is ignored.
 - Org and team membership is checked server-side in the broker, before mapping.
 - Enrollment records name the provider they were created against, so on a host with two providers an account with the same login at the other one cannot claim an enrollment. Records written before v0.3.0 name no provider and match any; re-enroll to scope them.
-- The enrollment file is the most authoritative mapping tier, so it is read under the same rules as the client secret: 0600 or tighter, owned by root or the broker's uid, not a symlink, and in a directory no other local user can write. The directory matters because the file's own mode cannot be forged but its *name* can be reused — with write access to `/etc/oauth2-pam` an attacker cannot alter the file, but they can rename it away and put an earlier root-owned copy back, reinstating an enrollment that was deliberately removed. `oauth2-pam-enroll` applies the directory rule when it writes, so the operator hears about it then rather than the enrolled user hearing about it at the login that fails.
-- Authentication events go to the audit log; `audit.events` filters which types are recorded, and an unknown type in that list is a config error rather than a silently ignored one. Events that record an access decision (`authentication_success`, `authentication_failed`, `authentication_denied`, `session_revoked`) are written synchronously, so they survive a crash and cannot be dropped by a full queue; the high-volume `authentication_attempt` is buffered and may be.
+- The enrollment file is the most authoritative mapping tier, so it is read under nearly the same rules as the client secret: not writable by group or other, owned by root or the broker's uid, not a symlink, and in a directory no other local user can write. The one difference is read access, and it is deliberate — a secret must be 0600 or tighter, while a 0640 enrollment file loads. It is still a disclosure, since it says which local account belongs to which provider identity, which is what aiming a device-flow phish at the right person needs; refusing it would lock every enrolled user out of a host whose operator had chmodded it 0640, and that outage is the worse answer. Write is the one that is refused, because write is the whole of tier 0's authority. The directory matters because the file's own mode cannot be forged but its *name* can be reused — with write access to `/etc/oauth2-pam` an attacker cannot alter the file, but they can rename it away and put an earlier root-owned copy back, reinstating an enrollment that was deliberately removed. `oauth2-pam-enroll` applies the directory rule when it writes, so the operator hears about it then rather than the enrolled user hearing about it at the login that fails.
+- Authentication events go to the audit log; `audit.events` filters which types are recorded, and an unknown type in that list is a config error rather than a silently ignored one. The four events that record an access decision (`authentication_success`, `authentication_failed`, `authentication_denied`, `session_revoked`) are exempt from that filter and are written synchronously, so they survive a crash, cannot be dropped by a full queue, and cannot be configured away. That leaves `authentication_attempt` — the high-volume one the buffer exists for — and `device_flow_failed` as the two types `audit.events` can actually drop. A dropped event is counted, not silent.
 - A login whose `authentication_success` record cannot be written is refused rather than granted unrecorded, and that promise is bounded by a five-second deadline on the audit write: a sink that stalls — an `fsync` on an unreachable hard NFS mount, a `/dev/log` whose peer has stopped reading — is treated by the broker as a sink that refused, since a broker waiting forever for an answer never acts on it. The record is written before the session is activated, so no login exists that the trail does not already name. The converse needs saying too, because it is where that fail-closed answer costs something: a write that failed can still have left the record at a sink — every sink is attempted whatever the earlier ones did, a write that overran its deadline is still running with the bytes already in the file, and the file sink itself writes before it `fsync`s, so a full or failing disk reports the failure with the whole record already in the file and readable by anything tailing it — so the trail can name a login that did not happen. Where that is possible the broker follows the success with a `session_revoked` recording that the authentication did not take effect, which is the same correction a grant withdrawn between the record and the activation gets. That correction is best effort by nature: if the sinks have stopped draining it is refused for the same reason the record was, and the broker says so at `error` rather than leaving the impression it succeeded. The practical consequence for an operator is that an audit sink which stops draining stops logins on that host; the alternative is a host that keeps letting people in and recording none of it.
 
 ## Limitations
