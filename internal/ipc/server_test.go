@@ -443,6 +443,82 @@ func TestClientSessionIDIsIgnored(t *testing.T) {
 	}
 }
 
+// TestDispatchBudgetBoundsTheHandlerSlot is the regression test for a false
+// comment with real consequences: maxConcurrentHandlers said a slot could not be
+// held longer than server.read_timeout, but dispatch runs inside the slot and its
+// only clock was the provider HTTP client's 30s. 64 connections against a
+// provider that accepts and stalls held every slot, and acceptConnections blocks
+// after accepting, so no login on the host was served — including polls for
+// logins that had already succeeded.
+//
+// The comment is now true because dispatchWithin makes it true. What this test
+// pins is the property the comment claims: the handler comes back on its own.
+func TestDispatchBudgetBoundsTheHandlerSlot(t *testing.T) {
+	// A dispatch that never returns, standing in for a provider that accepts the
+	// connection and says nothing. Released at the end so the goroutine does not
+	// outlive the test.
+	stall := make(chan struct{})
+	t.Cleanup(func() { close(stall) })
+
+	entered := make(chan struct{})
+	dispatch := func(*Request) *Response {
+		close(entered)
+		<-stall
+		return &Response{Success: true, Status: auth.StatusAuthorized}
+	}
+
+	start := time.Now()
+	resp := dispatchWithin(20*time.Millisecond, &Request{Type: "authenticate", UserID: "alice"}, dispatch)
+	elapsed := time.Since(start)
+
+	<-entered
+	if elapsed > 5*time.Second {
+		t.Errorf("dispatchWithin held its caller for %s against a 20ms budget", elapsed)
+	}
+	if resp.Success {
+		t.Error("a dispatch that never answered was reported as a success")
+	}
+	if resp.Status != auth.StatusError {
+		t.Errorf("status = %q, want %q", resp.Status, auth.StatusError)
+	}
+	// The verb's own internal-error code, not a new one: see verbErrorCode.
+	if resp.ErrorCode != "AUTHENTICATION_FAILED" {
+		t.Errorf("error_code = %q, want AUTHENTICATION_FAILED", resp.ErrorCode)
+	}
+}
+
+// TestDispatchWithinPassesTheReplyThrough is the no-regression half. The budget
+// is a backstop for a provider with no clock of its own, and it must be invisible
+// to every request that answers in time — including the reply's error code, which
+// dispatchWithin only substitutes on a timeout.
+func TestDispatchWithinPassesTheReplyThrough(t *testing.T) {
+	want := &Response{Success: true, Status: auth.StatusAuthorized, UserID: "alice"}
+	got := dispatchWithin(5*time.Second, &Request{Type: "authenticate", UserID: "alice"},
+		func(*Request) *Response { return want })
+
+	if got != want {
+		t.Errorf("dispatchWithin returned %+v, want the dispatch's own reply %+v", got, want)
+	}
+}
+
+// TestVerbErrorCodeIsRegisteredInTheSpec: a timeout is reported with the verb's
+// own internal-error code because those are already in docs/wire-protocol.md and
+// a client already treats them as terminal. A code invented here would be a
+// contract change and a C-module change for nothing.
+func TestVerbErrorCodeIsRegisteredInTheSpec(t *testing.T) {
+	spec, err := os.ReadFile(filepath.Join("..", "..", "docs", "wire-protocol.md"))
+	if err != nil {
+		t.Fatalf("read the spec: %v", err)
+	}
+	for _, verb := range []string{"authenticate", "check_session", "refresh_session", "revoke_session"} {
+		code := verbErrorCode(verb)
+		if !strings.Contains(string(spec), code) {
+			t.Errorf("%s times out as %q, which docs/wire-protocol.md does not register; "+
+				"a client cannot be expected to know what it means", verb, code)
+		}
+	}
+}
+
 func TestServerIOTimeoutsComeFromConfig(t *testing.T) {
 	tests := []struct {
 		name              string

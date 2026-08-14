@@ -98,9 +98,35 @@ const defaultIOTimeout = 30 * time.Second
 // root they all shared one bucket, so a burst of logins denied each other. A
 // semaphore bounds the same resource without failing anything — excess
 // connections wait in the kernel's listen backlog and are served as slots free,
-// which for a login broker is the right trade. Each handler reads a bounded body
-// under a deadline, so a slot cannot be held longer than server.read_timeout.
+// which for a login broker is the right trade.
+//
+// A slot is held for at most server.read_timeout + maxDispatchDuration +
+// server.write_timeout, and every one of those three is a clock something in
+// handleConnection actually sets. This comment used to claim the read deadline
+// alone bounded a slot, which was false in the direction that matters: dispatch
+// runs inside the slot, after the read, and its only clock was the 30s on the
+// provider's HTTP client. 64 connections asking to authenticate against a
+// provider that accepts and then stalls therefore held every slot for 30s each,
+// and because acceptConnections blocks after accepting, nothing else on the host
+// was served for that time — including check_session polls for logins that had
+// already succeeded.
+//
+// Read it as a bound on hold time and not as a promise that 64 simultaneous
+// stalls are painless: with the default timeouts the bound is a little over a
+// minute, and the 65th connection waits for it. What the bound buys is that the
+// wait ends, and that it ends at a number set here rather than at whatever the
+// far end of the provider's TLS session decides.
 const maxConcurrentHandlers = 64
+
+// maxDispatchDuration bounds the work a handler does with a slot held: the
+// provider round trip a verb makes, plus the broker's own bookkeeping.
+//
+// It is deliberately above the provider HTTP client's own 30s
+// (pkg/provider/github) rather than below it. This is a backstop for a call that
+// turns out to have no clock of its own — a future provider, a library default
+// nobody checked — not a second and tighter provider timeout, and a dispatch cut
+// off here fails a login that might have been about to succeed.
+const maxDispatchDuration = 40 * time.Second
 
 // maxSessionRequestsPerMinute bounds polls against one session ID. The module
 // permits poll_interval as low as 1s, i.e. 60 requests a minute for a legitimate
@@ -450,7 +476,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	resp := s.dispatch(&req)
+	resp := dispatchWithin(maxDispatchDuration, &req, s.dispatch)
 
 	_ = conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
 	writeResponse(conn, resp)
@@ -650,6 +676,67 @@ func (s *Server) allowRequest(conn net.Conn, req *Request) bool {
 		return false
 	}
 	return true
+}
+
+// dispatchWithin runs one dispatch under a budget, so that a handler slot cannot
+// be held for as long as a provider is willing to stall. It takes the dispatch
+// function rather than calling s.dispatch so the timeout can be tested without a
+// broker, a socket, or a real 40 seconds.
+//
+// The reply comes back over a buffered channel because the goroutine outlives
+// this call when the budget expires. Nothing here can cancel dispatch —
+// auth.Broker.Authenticate takes no context, and the context the provider call
+// uses is the broker's own — so the work is abandoned, not stopped, and it must
+// not block forever handing back a reply nobody is reading.
+//
+// Abandoning it is the lesser of two failures, and it is worth being explicit
+// about the greater one. An abandoned authenticate may still create a session the
+// client never hears about, which is already what happens when the client's own
+// deadline expires first; holding the slot instead means holding a share of every
+// login on the host, because acceptConnections stops serving anything once all
+// the slots are taken.
+func dispatchWithin(budget time.Duration, req *Request, dispatch func(*Request) *Response) *Response {
+	done := make(chan *Response, 1)
+	go func() { done <- dispatch(req) }()
+
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+
+	select {
+	case resp := <-done:
+		return resp
+	case <-timer.C:
+		log.Error().Str("type", req.Type).Dur("budget", budget).
+			Msg("Dispatch exceeded its budget; abandoning it and releasing the handler slot")
+		return &Response{
+			Success:      false,
+			Status:       auth.StatusError,
+			ErrorCode:    verbErrorCode(req.Type),
+			ErrorMessage: "The request took too long to process",
+		}
+	}
+}
+
+// verbErrorCode is the internal-error code for a verb.
+//
+// A dispatch that overran its budget is reported as that verb's own internal
+// failure, which is what docs/wire-protocol.md already says these codes mean:
+// "the verb's handler returned an internal error; details are in the broker's
+// log, deliberately not on the wire". A new code would be a change to the
+// contract and to the C module for no gain — there is nothing a client would
+// usefully do differently, and all of these are terminal for the login either
+// way. Which one it was stays in the log.
+func verbErrorCode(reqType string) string {
+	switch reqType {
+	case "check_session":
+		return "SESSION_CHECK_FAILED"
+	case "refresh_session":
+		return "SESSION_REFRESH_FAILED"
+	case "revoke_session":
+		return "SESSION_REVOCATION_FAILED"
+	default:
+		return "AUTHENTICATION_FAILED"
+	}
 }
 
 func (s *Server) dispatch(req *Request) *Response {
