@@ -50,6 +50,13 @@ type fakeProvider struct {
 	identityGate   chan struct{}
 	identityCtxErr error
 
+	// identityErr, when set, is what GetIdentity returns instead of an identity:
+	// the provider has authenticated the person and then refuses to say who they
+	// are. Wrapping provider.ErrAccessForbidden is how "not in the required org or
+	// team" reaches the broker, which is the most common real refusal in a
+	// deployment and the one the poll loop classifies as a denial.
+	identityErr error
+
 	// startDelay is how long StartDeviceFlow takes to answer. A real one is an
 	// HTTPS round trip, and a test that wants concurrent Authenticate calls to
 	// actually overlap has to make it cost something.
@@ -144,6 +151,9 @@ func (f *fakeProvider) GetIdentity(ctx context.Context, _ *provider.Token) (*pro
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.identityCtxErr = ctx.Err()
+	if f.identityErr != nil {
+		return nil, fmt.Errorf("acme-sso identity: %w", f.identityErr)
+	}
 	return f.identity, nil
 }
 
@@ -158,6 +168,14 @@ func (f *fakeProvider) authorize() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.authorized = true
+}
+
+// failIdentityWith makes GetIdentity refuse. The error is wrapped, as a real
+// provider's would be.
+func (f *fakeProvider) failIdentityWith(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.identityErr = err
 }
 
 func (f *fakeProvider) failWith(err error) {

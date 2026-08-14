@@ -2,6 +2,7 @@ package ipc
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/scttfrdmn/oauth2-pam/pkg/auth"
+	"github.com/scttfrdmn/oauth2-pam/pkg/config"
 )
 
 // wireBytes runs resp through writeResponse over a real connection and returns
@@ -201,4 +203,83 @@ func TestARealFirstReplyIsWellUnderTheCap(t *testing.T) {
 			n, maxResponseSize)
 	}
 	t.Logf("github.com first reply: %d bytes on the wire", n)
+}
+
+// TestAnAuthorizedReplyFitsTheCapWhateverTheProviderAndMapperSay is the #88
+// regression test, and the case every test in this file used to skip: they all
+// build their reply with pendingReply — the *first* reply, which carries no email,
+// no groups and no provider_login. TestAnOversizedReplyIsReplacedRatherThanTruncated
+// even states the assumption this closes, "with a reply no provider can currently
+// produce". An authorized reply carries three fields the broker does not choose the
+// length of, and nothing anywhere constructed one and measured it.
+//
+// The mapper rule here declares 700 groups, which pkg/mapper's own comment used to
+// endorse ("a user in a thousand groups is a few tens of KB, so 1 MB is
+// generous"), and the fake provider answers with a 17 KB email, which needs no
+// operator mistake at all — a compromised or misconfigured GHES named by
+// api_base_url is enough.
+//
+// What made this more than a failed login is the residue: the session stays
+// authorized and active behind a RESPONSE_TOO_LARGE, counts toward
+// max_concurrent_sessions, and holds a live token for token_lifetime. Ten attempts
+// and the user is locked out for eight hours behind ten authorized sessions no
+// client can resolve. So the assertions are both halves: the reply fits, and the
+// login works.
+func TestAnAuthorizedReplyFitsTheCapWhateverTheProviderAndMapperSay(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) {
+		groups := make([]string, 700)
+		for i := range groups {
+			groups[i] = fmt.Sprintf("research-computing-group-%03d", i)
+		}
+		c.Mapper.Rules[0].Groups = groups
+	})
+	h.fake.setEmail(strings.Repeat("a", 17000) + "@example.com")
+
+	start := h.authenticate("alice")
+	if start.Status != auth.StatusPending {
+		t.Fatalf("status = %q, want pending", start.Status)
+	}
+	h.fake.grant()
+
+	resp := h.waitForTerminal(start.SessionID)
+	if resp.ErrorCode == "RESPONSE_TOO_LARGE" {
+		t.Fatalf("check_session answered RESPONSE_TOO_LARGE: the session is authorized and holding a token, "+
+			"and no client can ever resolve it (status=%q)", resp.Status)
+	}
+	if !resp.Success || resp.Status != auth.StatusAuthorized {
+		t.Fatalf("status = %q success = %v error = %q; the login has to work",
+			resp.Status, resp.Success, resp.ErrorMessage)
+	}
+	if resp.UserID != "alice" {
+		t.Errorf("user_id = %q, want alice", resp.UserID)
+	}
+	if len(resp.Groups) != 0 {
+		t.Errorf("got %d groups on the wire, want none: 700 does not fit", len(resp.Groups))
+	}
+	if resp.Metadata["groups_omitted"] != "true" {
+		t.Error("metadata.groups_omitted is not set, so a client cannot tell a dropped list from no membership")
+	}
+
+	// The reply measured as bytes, against the cap itself. The socket handed back a
+	// decoded object above, which cannot answer "how close was that to 16384" — and
+	// a reply that fits only because writeResponse replaced it would have passed
+	// every assertion so far if the status check had not been made first.
+	ar, err := h.broker.CheckSession(start.SessionID)
+	if err != nil {
+		t.Fatalf("CheckSession: %v", err)
+	}
+	wire := wireBytes(t, authResponseToIPC(ar))
+	if len(wire) > maxResponseSize {
+		t.Errorf("the authorized reply is %d bytes, over the %d-byte cap", len(wire), maxResponseSize)
+	}
+	if strings.Contains(string(wire), "RESPONSE_TOO_LARGE") {
+		t.Error("the authorized reply was replaced rather than sent")
+	}
+	// Headroom, not just a fit: the cap is a detector and the field bounds in
+	// pkg/auth are the enforcement point, so an authorized reply has no business
+	// approaching it.
+	if len(wire) > maxResponseSize/2 {
+		t.Errorf("the authorized reply is %d bytes, over half the %d-byte cap", len(wire), maxResponseSize)
+	}
+	t.Logf("authorized reply for a 700-group, 17 KB-email session: %d bytes on the wire", len(wire))
 }

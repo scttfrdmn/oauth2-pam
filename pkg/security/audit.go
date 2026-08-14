@@ -52,12 +52,20 @@ type AuditLogger struct {
 	// writeMu serializes writes to the outputs. Critical events are written on the
 	// caller's goroutine (see criticalAuditEvents) while the dispatcher may be
 	// writing a queued one, and Stop closes the sinks underneath both.
-	writeMu       sync.Mutex
-	eventChan     chan AuditEvent
-	stopChan      chan struct{}
-	wg            sync.WaitGroup
-	droppedCount  atomic.Uint64
-	filteredCount atomic.Uint64
+	writeMu sync.Mutex
+	// stalled records that a write overran auditWriteTimeout and has not come back.
+	// While it is set, writeEvent refuses immediately rather than queueing behind a
+	// mutex held by a goroutine stuck in an fsync. See writeEvent.
+	stalled atomic.Bool
+	// testWriteTimeout overrides auditWriteTimeout. Only tests set it — a stalled
+	// sink is otherwise untestable in reasonable time, since the honest version of
+	// the test has to wait out the deadline.
+	testWriteTimeout time.Duration
+	eventChan        chan AuditEvent
+	stopChan         chan struct{}
+	wg               sync.WaitGroup
+	droppedCount     atomic.Uint64
+	filteredCount    atomic.Uint64
 }
 
 // FilteredEvents returns the number of events not written because their type
@@ -288,24 +296,91 @@ func (al *AuditLogger) processEvents(ctx context.Context) {
 //
 // Every sink is attempted whatever the earlier ones did: a broken file output must
 // not cost the record on syslog as well.
+//
+// The write is bounded by auditWriteTimeout, because "the sink returned an error"
+// and "the sink never returned" are different failures and only the first one was
+// handled. A sink that stalls rather than erroring is not exotic: fileOutput.Write
+// ends in an fsync, and a hard NFS mount that becomes unreachable blocks it
+// indefinitely; syslogOutput.Write blocks the same way on a stream /dev/log whose
+// peer has stopped reading. Without a deadline the caller waits forever, and a
+// caller that waits forever never gets the error that would make it withdraw a
+// grant — so an unreachable log server turned the fail-closed guarantee above into
+// its exact opposite, granting logins and recording none of them (#87).
+//
+// The write therefore happens on its own goroutine and the deadline is enforced
+// here. Nothing can abort an fsync in progress, so that goroutine is still stuck
+// afterwards, holding writeMu; that is the point of the stalled flag. Once one
+// write has overrun, later ones fail immediately instead of each queueing behind
+// the mutex and waiting out the full timeout again — the sinks are known bad, and
+// the answer callers need is the error, quickly. Whichever write eventually
+// returns clears the flag, which is safe because writeMu means only one can be
+// past the lock at a time.
+//
+// A stalled sink still blocks Stop, which takes writeMu to close the outputs. That
+// is not new — a caller stuck in Sync held the same mutex before this change — and
+// it is a shutdown that hangs rather than a login that is silently unrecorded.
 func (al *AuditLogger) writeEvent(event AuditEvent) error {
 	data, err := json.Marshal(event)
 	if err != nil {
 		log.Error().Err(err).Str("event_type", event.EventType).Msg("Failed to marshal audit event")
 		return fmt.Errorf("marshal audit event %s: %w", event.EventType, err)
 	}
-	al.writeMu.Lock()
-	defer al.writeMu.Unlock()
-	var firstErr error
-	for _, out := range al.outputs {
-		if err := out.Write(data); err != nil {
-			log.Error().Err(err).Str("event_type", event.EventType).Msg("Failed to write audit event")
-			if firstErr == nil {
-				firstErr = fmt.Errorf("write audit event %s: %w", event.EventType, err)
+
+	if al.stalled.Load() {
+		log.Error().Str("event_type", event.EventType).
+			Msg("Audit sinks are not draining; refusing the record rather than waiting on them")
+		return fmt.Errorf("write audit event %s: an earlier write to the audit sinks has not returned",
+			event.EventType)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		defer al.stalled.Store(false)
+		al.writeMu.Lock()
+		defer al.writeMu.Unlock()
+		var firstErr error
+		for _, out := range al.outputs {
+			if err := out.Write(data); err != nil {
+				log.Error().Err(err).Str("event_type", event.EventType).Msg("Failed to write audit event")
+				if firstErr == nil {
+					firstErr = fmt.Errorf("write audit event %s: %w", event.EventType, err)
+				}
 			}
 		}
+		done <- firstErr
+	}()
+
+	timer := time.NewTimer(al.writeTimeout())
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		al.stalled.Store(true)
+		log.Error().Str("event_type", event.EventType).Dur("timeout", al.writeTimeout()).
+			Msg("Audit write exceeded its deadline; treating the record as unwritten")
+		return fmt.Errorf("write audit event %s: audit sinks did not accept the record within %s",
+			event.EventType, al.writeTimeout())
 	}
-	return firstErr
+}
+
+// auditWriteTimeout bounds one attempt to get a record in front of the sinks.
+//
+// Five seconds is far longer than any healthy sink needs — an fsync to a local
+// disk is single-digit milliseconds, and to a responsive NFS server tens — and
+// short enough that a caller holding a grant open on the answer is not waiting on
+// a dead log server for a minute. It is deliberately not configurable: an operator
+// who could raise it would be choosing to wait longer before finding out that
+// their audit trail has stopped, and there is no good reason to want that.
+const auditWriteTimeout = 5 * time.Second
+
+// writeTimeout is the deadline writeEvent enforces. Tests override it; nothing
+// else does.
+func (al *AuditLogger) writeTimeout() time.Duration {
+	if al.testWriteTimeout > 0 {
+		return al.testWriteTimeout
+	}
+	return auditWriteTimeout
 }
 
 // --- output implementations ---

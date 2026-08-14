@@ -26,8 +26,12 @@ func TestMain(m *testing.M) {
 // harness is a real broker behind a real IPC server on a real Unix socket,
 // talking to a fake GitHub. Only the human and the network are simulated.
 type harness struct {
-	t      *testing.T
-	fake   *fakeGitHub
+	t    *testing.T
+	fake *fakeGitHub
+	// broker is the same broker the server in front of it is talking to. A test
+	// that has to measure a reply needs the AuthResponse the broker built, since
+	// the socket hands back a decoded object and not the bytes it arrived in.
+	broker *auth.Broker
 	socket string
 }
 
@@ -83,7 +87,7 @@ func newHarness(t *testing.T, opts ...func(*config.Config)) *harness {
 	}
 	t.Cleanup(func() { _ = srv.Stop() })
 
-	return &harness{t: t, fake: fake, socket: socket}
+	return &harness{t: t, fake: fake, broker: broker, socket: socket}
 }
 
 func testConfig(socket string) *config.Config {

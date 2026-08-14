@@ -29,6 +29,9 @@ type fakeGitHub struct {
 	login string
 	orgs  []string
 	teams []string
+	// email is what /user reports, when a test needs to choose it. Empty means
+	// "derive it from the login", which is what a real account looks like.
+	email string
 	// scope is the scope string the token endpoint claims to have granted.
 	scope string
 	// granted flips to true to simulate the user approving at GitHub. Until
@@ -104,6 +107,15 @@ func (f *fakeGitHub) setLogin(login string) {
 	f.login = login
 }
 
+// setEmail chooses the email /user reports. A provider named by api_base_url gets
+// to pick this value and its length, and a GHES that has been compromised or
+// misconfigured picks badly.
+func (f *fakeGitHub) setEmail(email string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.email = email
+}
+
 func (f *fakeGitHub) polls() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -153,12 +165,15 @@ func (f *fakeGitHub) handleUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	f.mu.Lock()
-	login := f.login
+	login, email := f.login, f.email
 	f.mu.Unlock()
+	if email == "" {
+		email = login + "@example.com"
+	}
 	writeJSON(w, map[string]interface{}{
 		"login": login,
 		"name":  "Alice Example",
-		"email": login + "@example.com",
+		"email": email,
 		"id":    1234,
 	})
 }

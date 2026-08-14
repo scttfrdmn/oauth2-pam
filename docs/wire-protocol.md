@@ -141,6 +141,34 @@ multi-kilobyte `verification_uri` still writes a reply that will not fit — aro
 is a terminal answer with a reason in it, rather than a truncated object the client
 cannot parse.
 
+The figures above are all the **pending** reply, which is the largest one and was
+for a while the only one anybody had measured. The **authorized** reply carries
+three fields this broker does not choose the length of — `email` and
+`metadata.provider_login` come from the provider, and `groups` comes from a mapper
+tier whose own response limit is 1 MB — and none of them was bounded, so an
+authorized reply could exceed the cap on its own
+([#88](https://github.com/scttfrdmn/oauth2-pam/issues/88)). That was worse than a
+failed login: `RESPONSE_TOO_LARGE` is terminal for the attempt, but the session
+behind it stayed authorized, counted toward `max_concurrent_sessions` and held a
+live token for `token_lifetime`, so a handful of attempts locked the account out
+for hours behind sessions no client could resolve. The three fields are now bounded
+where the reply is composed — 320 bytes of `email`, 256 of `provider_login`, and a
+group list capped at 64 entries and 3072 bytes total — which puts a worst-case
+authorized reply under 1 KB. Two consequences a client should know about:
+
+- Control characters are stripped from those fields rather than escaped. JSON
+  escaping is not size-preserving (one control character becomes the six bytes of a
+  `\uXXXX` escape), so a byte budget on the composed string is not a byte budget on
+  the wire unless the expansion is bounded first.
+- An over-budget `groups` is omitted entirely and `metadata.groups_omitted` is set
+  to `"true"`. A truncated list is indistinguishable from a complete one, and a
+  client acting on membership would act on a list missing whichever entries sorted
+  last. Omission is at least honest.
+
+Neither is a new protocol version: `groups_omitted` is an added `metadata` key,
+which the extension rules below already permit, and a receiver that ignores it sees
+a reply it can still parse and act on.
+
 ## Versioning
 
 The version of this contract is an integer. Version 1 is what is described here.
@@ -372,10 +400,10 @@ One JSON object.
 | `expires_at` | RFC 3339 timestamp | When the session or the flow expires. |
 | `error_code` | string | Machine-readable. See below. |
 | `error_message` | string | For the log, not for a decision. |
-| `groups` | array of string | **Advisory.** The mapper's supplementary groups. This client discards them and nothing calls `setgroups(2)`. See [#39](https://github.com/scttfrdmn/oauth2-pam/issues/39). |
-| `email` | string | Optional, informational. |
+| `groups` | array of string | **Advisory.** The mapper's supplementary groups. This client discards them and nothing calls `setgroups(2)`. See [#39](https://github.com/scttfrdmn/oauth2-pam/issues/39). Bounded, and **dropped whole rather than truncated** when it does not fit — see the reply size budget. |
+| `email` | string | Optional, informational. At most 320 bytes. |
 | `requires_device`, `requires_approval` | bool | Legacy hints from before `status` existed. Do not make decisions on them. |
-| `metadata` | object of string→string | `polling_interval` on a pending reply, `provider` and `provider_login` where known. |
+| `metadata` | object of string→string | `polling_interval` on a pending reply, `provider` and `provider_login` where known, `groups_omitted: "true"` when `groups` was dropped for size. A receiver must treat an absent `groups` with `groups_omitted` set as "unknown membership", not as "no groups". |
 
 The QR code appears **once** in a reply, in `qr_code`. It used to be there and
 inside `instructions` as well, which put the largest field of the largest reply on

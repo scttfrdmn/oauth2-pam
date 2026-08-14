@@ -12,6 +12,12 @@ A third adversarial review round, on a tree that had already survived two. It fo
 the code reviewed: three of them were fail-**open** reads of the field that decides a
 login, and none of the three were reachable by the previous rounds' methods.
 
+A fourth round then found three more, and the shape of them says something about
+where the remaining defects live: all three are places where two fixes from
+*different* rounds were each correct alone and wrong together. The audit write that
+must fail a login met a sink that never returns; the 16 KiB reply cap met a mapper
+whose own comment endorsed a group list several times that size.
+
 **Upgrade notes.** `broker.yaml` must be mode 0600 regardless of where the client
 secret lives — the check used to apply only when the secret was inline, which left
 the file holding the token-encryption key unchecked in every deployment that did the
@@ -20,6 +26,54 @@ start until it is chmodded; the error names the file and the command. A negative
 `mapper.min_uid` is also now rejected rather than silently disabling the UID floor.
 
 ### Fixed
+
+- **An audit sink that stalled turned the fail-closed audit guarantee into its
+  opposite.** A login is now refused when its audit record cannot be written — but
+  "the sink returned an error" and "the sink never returned" are different failures,
+  and only the first was handled. `fileOutput.Write` ends in an `fsync`, which blocks
+  indefinitely on a hard NFS mount that has become unreachable, and the syslog sink
+  blocks the same way on a `/dev/log` whose peer has stopped reading. A caller that
+  never gets an answer never refuses anything, so an unreachable log server granted
+  logins and recorded none of them. Audit writes now run under a five-second deadline
+  (not configurable: an operator who could raise it would be choosing to wait longer
+  before finding out their audit trail has stopped), and once one write has overrun,
+  later ones fail immediately rather than each queueing behind an `fsync` nothing can
+  abort. Separately, the `authentication_success` record is now written *before* the
+  session is activated rather than after, so no grant exists until the record is in
+  front of a sink: the old order granted first and withdrew on a write failure, and
+  both PAM stages are sub-millisecond socket round trips, so a `check_session`
+  landing in that window got a shell the withdrawal could not take back. A
+  compare-and-set refusal after the record is written now emits a compensating
+  `session_revoked`, so the trail's last word on that session is not a login that
+  never took effect. ([#87](https://github.com/scttfrdmn/oauth2-pam/issues/87))
+
+- **An authorized reply could exceed the reply cap, stranding the session behind
+  it.** `email`, `groups` and `provider_login` are all in every authorized reply and
+  none of the three was bounded: the first two come from the provider, and `groups`
+  arrives through a mapper tier whose own limit is 1 MB — with a comment endorsing "a
+  user in a thousand groups". Over 16 KiB, `writeResponse` substitutes
+  `RESPONSE_TOO_LARGE`, which the module maps to a terminal `PAM_AUTHINFO_UNAVAIL`;
+  the residue is the real defect, because the session stays authorized and active,
+  counts toward `max_concurrent_sessions` (10) and holds a live token for
+  `token_lifetime` (8h) — so ten attempts locked a user out for eight hours behind
+  ten authorized sessions no client could resolve. The fields are now bounded where
+  they are composed, control characters stripped (JSON escaping is not
+  size-preserving: one control character becomes six bytes), and an over-budget group
+  list is dropped whole with `metadata.groups_omitted` set rather than silently
+  truncated to look complete. The cap is back to being a backstop.
+  ([#88](https://github.com/scttfrdmn/oauth2-pam/issues/88))
+
+- **An `authentication_failed` record named an account chosen by the person being
+  refused.** The mapping-failure branch built its record with `UserID:
+  identity.Login` — the provider's login, in the field every other event uses for the
+  local Unix account. Anyone with a provider account, needing no local account and no
+  org membership, could rename themselves to `root` and make the broker write an
+  unfilterable record attributing the failure there; a SIEM rule counting failures
+  per `user_id` would attribute them there too. Its sibling failed the other way: the
+  identity-refusal branch — "not in the required org or team", the most common real
+  refusal — recorded no `user_id` at all. Both now name the requested local account,
+  with the provider's login in `metadata.provider_login` where its neighbours already
+  put it. ([#89](https://github.com/scttfrdmn/oauth2-pam/issues/89))
 
 - **`"success":"false"` read as true in the C module.** `json_object_get_boolean`
   coerces: any non-empty string and any non-zero number is true. So the one field the

@@ -439,12 +439,21 @@ func expandLocalUser(tmplStr string, id *provider.Identity) (string, error) {
 // --- Tier 2: external script ---
 
 // maxTierResultSize bounds what Tier 2 and Tier 3 may hand back. Both answer with
-// the same object: one local_user and a group list. A user in a thousand groups
-// is a few tens of KB, so 1 MB is generous, and neither reply is worth a byte more
-// than that — the alternative is buffering whatever the far side sends, which for
-// Tier 3 is a network service the broker does not control and for Tier 2 is a
-// process that may simply be looping on a write. A broker that runs out of memory
-// takes every OAuth login on the host with it.
+// the same object: one local_user and a group list. 1 MB is generous for that, and
+// neither reply is worth a byte more — the alternative is buffering whatever the far
+// side sends, which for Tier 3 is a network service the broker does not control and
+// for Tier 2 is a process that may simply be looping on a write. A broker that runs
+// out of memory takes every OAuth login on the host with it.
+//
+// This is a bound on what the broker will *read*, and it is not the bound on what
+// the broker will *send*. This comment used to observe that "a user in a thousand
+// groups is a few tens of KB, so 1 MB is generous", which was true and misleading in
+// the same breath: the IPC reply cap is 16 KiB, so tens of KB of groups was several
+// times over what the socket could carry, and a reply that did not fit stranded the
+// session (#88). The group list that reaches a client is bounded separately and much
+// lower, by maxReplyGroups and maxReplyGroupsTotalBytes in pkg/auth. A mapper is
+// free to answer with more than that; the extra is used for the decision and then
+// left out of the reply, which is safe precisely because groups are advisory.
 const maxTierResultSize = 1024 * 1024
 
 // scriptInput is the JSON sent to the external script on stdin, and posted to

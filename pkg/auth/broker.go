@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rs/zerolog/log"
 	"github.com/scttfrdmn/oauth2-pam/pkg/config"
@@ -872,13 +874,30 @@ func (b *Broker) pollDeviceAuthorization(
 					log.Error().Err(err).Int("attempt", attempt).
 						Str("session_id", sessionID).Msg("Failed to resolve provider identity")
 					// A failure, not a grant: LogAuthEvent.
+					//
+					// user_id is the account the login was attempted for. It used to
+					// be absent here, which made the most common real refusal — not
+					// in the required org or team, which arrives on this path from
+					// checkAccess — a record naming nobody at all, with a session ID
+					// as the only handle on who had been turned away (#89). The
+					// session is read for it rather than threaded down, because this
+					// branch is reached before the snapshot the rest of the flow
+					// uses.
+					requestedUser := ""
+					if s := b.getSession(sessionID); s != nil {
+						requestedUser = s.RequestedLocalUser
+					}
 					b.auditLogger.LogAuthEvent(security.AuditEvent{
 						EventType:    "authentication_failed",
+						UserID:       requestedUser,
 						SessionID:    sessionID,
 						Provider:     prov.Name(),
 						Success:      false,
 						ErrorMessage: err.Error(),
 						Timestamp:    time.Now(),
+						Metadata: map[string]interface{}{
+							"requested_user": requestedUser,
+						},
 					})
 					// checkAccess failures (not in the required org/team) arrive
 					// here and are a decision about the user, not an outage.
@@ -914,14 +933,28 @@ func (b *Broker) pollDeviceAuthorization(
 							Str("provider_login", identity.Login).
 							Msg("Identity mapping failed")
 						// A failure, not a grant: LogAuthEvent.
+						//
+						// user_id is current.RequestedLocalUser, not identity.Login.
+						// It was the provider's login until #89 — a string the person
+						// being refused chooses, in the field every other event uses
+						// for the local Unix account. Anyone with a provider account
+						// could rename themselves to root and make this branch write
+						// an unfilterable authentication_failed record attributing
+						// the failure to root. The provider's login is real
+						// information and still recorded, in the metadata field that
+						// exists for it.
 						b.auditLogger.LogAuthEvent(security.AuditEvent{
 							EventType:    "authentication_failed",
-							UserID:       identity.Login,
+							UserID:       current.RequestedLocalUser,
 							SessionID:    sessionID,
 							Provider:     prov.Name(),
 							Success:      false,
 							ErrorMessage: err.Error(),
 							Timestamp:    time.Now(),
+							Metadata: map[string]interface{}{
+								"provider_login": identity.Login,
+								"requested_user": current.RequestedLocalUser,
+							},
 						})
 						// No mapping, and a mapping to an account this path may not
 						// reach, are both decisions about the identity; anything
@@ -1008,41 +1041,28 @@ func (b *Broker) pollDeviceAuthorization(
 				// eight-hour session holding a real access token that no login was
 				// waiting on. The compare-and-set refuses that, and subsumes the
 				// revoked-during-flow guard this replaced.
-				activated := b.activateSession(sessionID, current.CreatedAt, func(s *Session) {
-					s.LocalUser = mapResult.LocalUser
-					s.ProviderLogin = identity.Login
-					s.Email = identity.Email
-					s.Groups = mapResult.Groups
-					s.TokenFingerprint = token.Fingerprint
-					s.TokenID = tokenID
-					s.Status = StatusAuthorized
-					s.IsActive = true
-					// The session now governs a live login rather than a device
-					// code, so switch to the configured session lifetime.
-					s.ExpiresAt = time.Now().Add(tokenLifetime)
-					s.LastAccessed = time.Now()
-				})
-				if !activated {
-					b.tokenManager.RevokeToken(tokenID)
-					log.Info().Str("session_id", sessionID).
-						Msg("Session no longer pending when the device flow completed; discarding result")
-					return
-				}
-
 				// The only grant path in this file, and so the only audit write whose
-				// failure has to fail the login — #69. The session is active as of the
-				// line above: the next check_session hands out an authenticated user.
-				// LogAuthEvent would log the write failure and grant anyway, which is
-				// a full disk turning into a successful login with no record of who
-				// was let in, and that record is the one an incident is reconstructed
-				// from. So the error is taken, and the grant is withdrawn if the
-				// record did not reach a sink.
+				// failure has to fail the login — #69. LogAuthEvent would log the
+				// write failure and grant anyway, which is a full disk turning into a
+				// successful login with no record of who was let in, and that record
+				// is the one an incident is reconstructed from. So the error is taken.
 				//
-				// Written after activation rather than before, deliberately: before,
-				// the record would claim a success that activateSession might still
-				// refuse. The order here can only produce a session that existed for
-				// microseconds and was then destroyed, which is what the client is
-				// told.
+				// Written *before* activation, which is the opposite of what this did
+				// until #87. The old order activated first and withdrew the grant if
+				// the write then failed, on the reasoning that the exposure "can only
+				// produce a session that existed for microseconds". That was wrong:
+				// the window is however long the sinks take, an fsync on a degraded
+				// disk is not microseconds, and both PAM stages are sub-millisecond
+				// socket round trips — so a check_session landing inside the window
+				// got a shell that the withdrawal afterwards could not take back. Now
+				// no grant exists until the record is in front of a sink, so there is
+				// no window to land in and nothing to withdraw.
+				//
+				// The cost of this order is the case the old comment was worried
+				// about: the CAS below can still refuse, and then this record
+				// describes an authentication that never took effect. That is handled
+				// where it happens, by recording the withdrawal rather than leaving
+				// the success as the last word.
 				if err := b.auditLogger.LogAuthEventErr(security.AuditEvent{
 					EventType:  "authentication_success",
 					UserID:     mapResult.LocalUser,
@@ -1062,9 +1082,49 @@ func (b *Broker) pollDeviceAuthorization(
 					log.Error().Err(err).
 						Str("session_id", sessionID).
 						Str("local_user", mapResult.LocalUser).
-						Msg("Could not record the authentication; withdrawing the grant rather than allowing an unlogged login")
-					b.withdrawGrant(sessionID, current.CreatedAt, tokenID,
+						Msg("Could not record the authentication; refusing the login rather than granting one that is not recorded")
+					b.tokenManager.RevokeToken(tokenID)
+					b.failSession(sessionID, StatusError,
 						"Internal error recording the authentication")
+					return
+				}
+
+				activated := b.activateSession(sessionID, current.CreatedAt, func(s *Session) {
+					s.LocalUser = mapResult.LocalUser
+					s.ProviderLogin = identity.Login
+					s.Email = identity.Email
+					s.Groups = mapResult.Groups
+					s.TokenFingerprint = token.Fingerprint
+					s.TokenID = tokenID
+					s.Status = StatusAuthorized
+					s.IsActive = true
+					// The session now governs a live login rather than a device
+					// code, so switch to the configured session lifetime.
+					s.ExpiresAt = time.Now().Add(tokenLifetime)
+					s.LastAccessed = time.Now()
+				})
+				if !activated {
+					b.tokenManager.RevokeToken(tokenID)
+					// The authentication_success above is now describing a session
+					// that never activated — revoked or expired while the identity
+					// was being resolved. Left alone it would be the last word on
+					// this session in the audit trail, and an incident reader would
+					// count a login that never happened. So the record is corrected
+					// rather than contradicted by silence.
+					b.auditLogger.LogAuthEvent(security.AuditEvent{
+						EventType:    "session_revoked",
+						UserID:       mapResult.LocalUser,
+						SessionID:    sessionID,
+						Provider:     prov.Name(),
+						Success:      false,
+						ErrorMessage: "session was no longer pending when the device flow completed; the recorded authentication did not take effect",
+						Timestamp:    time.Now(),
+						Metadata: map[string]interface{}{
+							"provider_login": identity.Login,
+						},
+					})
+					log.Info().Str("session_id", sessionID).
+						Msg("Session no longer pending when the device flow completed; discarding result")
 					return
 				}
 
@@ -1483,35 +1543,15 @@ func (b *Broker) failSession(sessionID, status, message string) {
 		Msg("Session marked terminally failed")
 }
 
-// withdrawGrant takes back an activation: it destroys the token this flow stored,
-// marks the session terminally errored, and retains it for terminalGrace so the
-// client polling check_session is told the login failed rather than being handed
-// the session that was authorized a moment ago.
-//
-// failSession cannot do this. It refuses to rewrite a session that is no longer
-// pending — right for a cancelled poller's late failure, which must not overwrite
-// an outcome a client has already been given, and wrong here, where the caller is
-// the goroutine that made the session authorized in the first place and is
-// deciding, before anyone has seen it, that it must not stand.
-//
-// createdAt identifies the session that was activated: if the entry is gone or is
-// a different session that reused the ID, only the token is destroyed, because
-// there is nothing left of the grant to withdraw.
-func (b *Broker) withdrawGrant(sessionID string, createdAt time.Time, tokenID, message string) {
-	b.sessionMutex.Lock()
-	if s, ok := b.sessions[sessionID]; ok && s.CreatedAt.Equal(createdAt) {
-		s.Status = StatusError
-		s.ErrorMessage = message
-		s.IsActive = false
-		s.TokenID = ""
-		s.ExpiresAt = time.Now().Add(terminalGrace)
-	}
-	b.sessionMutex.Unlock()
-
-	if tokenID != "" {
-		b.tokenManager.RevokeToken(tokenID)
-	}
-}
+// withdrawGrant is gone as of #87, and the reason is worth keeping: it existed to
+// take back an activation after the audit write for that activation failed, which
+// was necessary only because the write happened after the activation. Reversing
+// that order removed the only caller — the session is still pending when the write
+// is attempted, so failSession, which refuses to rewrite anything that is not
+// pending, is now the correct and sufficient tool. A function that un-does a grant
+// is not something to keep on hand for a caller that does not exist; if a path ever
+// genuinely needs to revoke an active session, RevokeSession is that path and it
+// audits the revocation.
 
 // evictExcessPendingFlowsLocked drops the oldest pending flows for userID until
 // at most maxPendingFlowsPerUser-1 remain, leaving room for the flow about to
@@ -1613,21 +1653,117 @@ func errorResponse(code, message string) *AuthResponse {
 	}
 }
 
+// The bounds on an authorized reply's provider- and mapper-supplied fields — #88.
+//
+// Until this existed, the only limit on an authorized reply was the socket's
+// 16 KiB cap in internal/ipc, and that cap is a detector rather than a bound: it
+// substitutes RESPONSE_TOO_LARGE, which the module maps to a terminal
+// PAM_AUTHINFO_UNAVAIL. So a reply that did not fit was not merely a failed
+// login. The session stayed authorized and active, counted toward
+// max_concurrent_sessions, and held a live token for token_lifetime — so ten
+// retries locked the user out for eight hours behind ten authorized sessions no
+// client could ever resolve. Three fields could get there, none of them ours:
+// email and provider_login come from the provider, and Groups came in through a
+// mapper tier whose own limit is 1 MB.
+//
+// The budget is deliberately far below 16 KiB rather than just under it, because
+// JSON escaping is not size-preserving: one control character becomes the six
+// bytes of a \uXXXX escape. Control characters are stripped below, which caps
+// expansion at 2x for quotes and backslashes, and 2x of this budget still leaves
+// room for the rest of the reply.
+// The two group bounds are set so that each one can actually be the one that
+// fires: 64 × 96 is 6144, twice the total, so a list of long names is stopped by
+// the total while a list of ordinary ones (Unix group names run to 32 characters)
+// is stopped only by the count. A pair where count × per-group equalled the total
+// would leave the total unreachable — a bound that reads as defence in depth and
+// is really dead code.
+const (
+	maxReplyEmailBytes         = 320 // RFC 5321's longest path
+	maxReplyProviderLoginBytes = 256 // GitHub's own limit is 39; GHES may differ
+	maxReplyGroups             = 64
+	maxReplyGroupBytes         = 96
+	maxReplyGroupsTotalBytes   = 3072
+)
+
 func (b *Broker) successResponse(session *Session) *AuthResponse {
+	groups, groupsOmitted := replyGroups(session.Groups)
+
+	metadata := map[string]string{
+		"provider":       session.Provider,
+		"provider_login": boundedReplyField(session.ProviderLogin, maxReplyProviderLoginBytes),
+		"last_accessed":  session.LastAccessed.Format(time.RFC3339),
+	}
+	if groupsOmitted {
+		// Said out loud rather than left to look like "no groups". A client that
+		// grows a use for groups must be able to tell an empty list from a list
+		// that did not fit, and #39 is exactly that client.
+		metadata["groups_omitted"] = "true"
+		log.Warn().
+			Str("session_id", session.ID).
+			Str("local_user", session.LocalUser).
+			Int("groups", len(session.Groups)).
+			Msg("Group list does not fit the reply budget; omitting it from the reply")
+	}
+
+	// UserID, SessionID and ExpiresAt are not bounded here and do not need to be:
+	// LocalUser has already been through unixUsernameRe, the session ID is
+	// broker-generated, and the timestamp is fixed width.
 	return &AuthResponse{
 		Success:   true,
 		Status:    StatusAuthorized,
 		UserID:    session.LocalUser,
-		Email:     session.Email,
-		Groups:    session.Groups,
+		Email:     boundedReplyField(session.Email, maxReplyEmailBytes),
+		Groups:    groups,
 		SessionID: session.ID,
 		ExpiresAt: session.ExpiresAt,
-		Metadata: map[string]string{
-			"provider":       session.Provider,
-			"provider_login": session.ProviderLogin,
-			"last_accessed":  session.LastAccessed.Format(time.RFC3339),
-		},
+		Metadata:  metadata,
 	}
+}
+
+// boundedReplyField makes one string somebody else chose the length of safe to put
+// in a reply: control characters removed, then truncated to max bytes on a rune
+// boundary so the result is still valid UTF-8 and still valid JSON.
+func boundedReplyField(s string, max int) string {
+	if s == "" {
+		return s
+	}
+	var out strings.Builder
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			continue
+		}
+		if out.Len()+utf8.RuneLen(r) > max {
+			break
+		}
+		out.WriteRune(r)
+	}
+	return out.String()
+}
+
+// replyGroups bounds the advisory group list, reporting whether it was dropped.
+//
+// Dropped whole rather than truncated: a truncated list is indistinguishable from a
+// complete one, and a client that acts on group membership would act on a list
+// missing the entries that happened to sort last. Omission is at least honest, and
+// the reference client discards this field anyway (docs/wire-protocol.md).
+func replyGroups(groups []string) ([]string, bool) {
+	if len(groups) == 0 {
+		return groups, false
+	}
+	if len(groups) > maxReplyGroups {
+		return nil, true
+	}
+	total := 0
+	out := make([]string, 0, len(groups))
+	for _, g := range groups {
+		clean := boundedReplyField(g, maxReplyGroupBytes)
+		total += len(clean)
+		if total > maxReplyGroupsTotalBytes {
+			return nil, true
+		}
+		out = append(out, clean)
+	}
+	return out, false
 }
 
 func (b *Broker) sessionCleanup(ctx context.Context) {
