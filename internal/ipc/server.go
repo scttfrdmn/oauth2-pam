@@ -18,8 +18,14 @@ import (
 )
 
 // maxRequestSize is the largest JSON body accepted from a PAM client.
-// Requests larger than this are rejected before decoding to prevent
-// memory exhaustion attacks.
+//
+// The read is capped at this many bytes, so a caller cannot make the broker
+// allocate without bound. It is a cap on the allocation rather than a check that
+// happens before any decoding: a request is a bare JSON object with no length
+// prefix, so nothing on the wire announces its size in advance and the only way
+// to learn a body is too big is to reach the cap while reading it. See
+// handleConnection, and the note in docs/wire-protocol.md that used to claim the
+// refusal came first.
 const maxRequestSize = 64 * 1024 // 64 KB
 
 // ErrorCodeRateLimited is returned when a request was refused by the rate
@@ -92,9 +98,35 @@ const defaultIOTimeout = 30 * time.Second
 // root they all shared one bucket, so a burst of logins denied each other. A
 // semaphore bounds the same resource without failing anything — excess
 // connections wait in the kernel's listen backlog and are served as slots free,
-// which for a login broker is the right trade. Each handler reads a bounded body
-// under a deadline, so a slot cannot be held longer than server.read_timeout.
+// which for a login broker is the right trade.
+//
+// A slot is held for at most server.read_timeout + maxDispatchDuration +
+// server.write_timeout, and every one of those three is a clock something in
+// handleConnection actually sets. This comment used to claim the read deadline
+// alone bounded a slot, which was false in the direction that matters: dispatch
+// runs inside the slot, after the read, and its only clock was the 30s on the
+// provider's HTTP client. 64 connections asking to authenticate against a
+// provider that accepts and then stalls therefore held every slot for 30s each,
+// and because acceptConnections blocks after accepting, nothing else on the host
+// was served for that time — including check_session polls for logins that had
+// already succeeded.
+//
+// Read it as a bound on hold time and not as a promise that 64 simultaneous
+// stalls are painless: with the default timeouts the bound is a little over a
+// minute, and the 65th connection waits for it. What the bound buys is that the
+// wait ends, and that it ends at a number set here rather than at whatever the
+// far end of the provider's TLS session decides.
 const maxConcurrentHandlers = 64
+
+// maxDispatchDuration bounds the work a handler does with a slot held: the
+// provider round trip a verb makes, plus the broker's own bookkeeping.
+//
+// It is deliberately above the provider HTTP client's own 30s
+// (pkg/provider/github) rather than below it. This is a backstop for a call that
+// turns out to have no clock of its own — a future provider, a library default
+// nobody checked — not a second and tighter provider timeout, and a dispatch cut
+// off here fails a login that might have been about to succeed.
+const maxDispatchDuration = 40 * time.Second
 
 // maxSessionRequestsPerMinute bounds polls against one session ID. The module
 // permits poll_interval as low as 1s, i.e. 60 requests a minute for a legitimate
@@ -365,6 +397,23 @@ func (s *Server) acceptConnections(ctx context.Context) {
 	}
 }
 
+// countingReader records how many bytes were actually consumed from the wire.
+//
+// It exists so the request-size limit can be reported as a size limit. Wrapping
+// the connection in an io.LimitReader bounds the allocation but says nothing
+// about why the decode failed, and the client is left to guess from "unexpected
+// EOF" whether it sent bad JSON or too much of it.
+type countingReader struct {
+	r io.Reader
+	n int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += n
+	return n, err
+}
+
 func (s *Server) handleConnection(conn net.Conn) {
 	defer s.wg.Done()
 	defer func() { <-s.handlerSlots }()
@@ -372,12 +421,30 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	_ = conn.SetReadDeadline(time.Now().Add(s.readTimeout))
 
-	// Reject requests that exceed the size limit before JSON decoding.
-	limited := io.LimitReader(conn, maxRequestSize+1)
+	// The read stops one byte past the cap: reaching that byte is how an
+	// oversized request is recognised, since there is nothing to check before
+	// decoding starts. counted is what turns that into an answer the caller can
+	// act on — a truncated body makes the decoder report "unexpected EOF", which
+	// tells a client its JSON is malformed when in fact it was too long.
+	counted := &countingReader{r: io.LimitReader(conn, maxRequestSize+1)}
 
 	var req Request
-	if err := json.NewDecoder(limited).Decode(&req); err != nil {
-		log.Error().Err(err).Msg("Decode IPC request")
+	decodeErr := json.NewDecoder(counted).Decode(&req)
+
+	// Checked before decodeErr, and checked even when the decode succeeded: a body
+	// whose closing brace lands exactly on the last byte the limiter allows parses
+	// cleanly and is still over the cap. Refusing here rather than only on the
+	// error path keeps the limit and the behaviour the same number.
+	if counted.n > maxRequestSize {
+		log.Warn().Int("bytes_read", counted.n).Int("max", maxRequestSize).
+			Msg("Refusing an oversized IPC request")
+		_ = conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
+		s.sendError(conn, "INVALID_REQUEST",
+			fmt.Sprintf("Request exceeds the %d-byte limit", maxRequestSize))
+		return
+	}
+	if decodeErr != nil {
+		log.Error().Err(decodeErr).Msg("Decode IPC request")
 		_ = conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
 		s.sendError(conn, "INVALID_REQUEST", "Failed to decode request")
 		return
@@ -409,7 +476,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	resp := s.dispatch(&req)
+	resp := dispatchWithin(maxDispatchDuration, &req, s.dispatch)
 
 	_ = conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
 	writeResponse(conn, resp)
@@ -419,6 +486,106 @@ func (s *Server) handleConnection(conn net.Conn) {
 		Str("user_id", req.UserID).
 		Bool("success", resp.Success).
 		Msg("IPC request handled")
+}
+
+// The byte ceilings on the strings a request may carry. Each one is also a row in
+// the request table of docs/wire-protocol.md, which is what other implementations
+// build against, so the two are changed together.
+//
+// The whole request is already capped at maxRequestSize, so these are not what
+// keeps the broker from allocating without bound. What they bound is where the
+// values *go*: source_ip and target_host are copied verbatim into an audit event
+// (pkg/auth/broker.go), user_agent and device_id are carried into the audit
+// trail, and any of them can reach a log line. Before this list existed a 64 KB
+// user_agent was accepted, which is a 64 KB audit record written by whatever
+// reached the socket.
+//
+// Every ceiling is sized so that nothing a real client sends is refused. The two
+// that are not round numbers are the ones the wire contract sized for a specific
+// value: 45 bytes is an IPv6 literal with a zone, 253 a DNS name.
+const (
+	maxUserIDLen     = 256
+	maxSessionIDLen  = 128
+	maxProviderLen   = 256
+	maxSourceIPLen   = 45
+	maxTargetHostLen = 253
+	maxUserAgentLen  = 512
+	maxDeviceIDLen   = 256
+)
+
+// metadata is a map, so it needs a ceiling on the map as well as on the strings
+// inside it — 3000 keys were accepted before these existed, and the count is the
+// half that a per-value bound does not cover.
+//
+// The reference client sends four entries (service, tty, pid, rhost) and a
+// consumer's extension fields are audit context of the same shape, so 64 entries
+// of a 128-byte key and a 1 KB value is far above anything a real client sends
+// while still bounding one audit record to something a log can hold.
+const (
+	maxMetadataEntries  = 64
+	maxMetadataKeyLen   = 128
+	maxMetadataValueLen = 1024
+)
+
+// requestField is one string from a request together with the ceiling the wire
+// contract puts on it: a name for the error message, the value, and the maximum.
+type requestField struct {
+	name  string
+	value string
+	max   int
+}
+
+// requestFields is every string a request carries.
+//
+// It is a list rather than a run of ifs because the checks used to be written by
+// hand per field, and so which checks a field got depended on who added it:
+// user_agent and device_id arrived with neither a length bound nor a NUL check,
+// while session_id, source_ip and target_host had a length and no NUL check. A
+// field added to Request now gets both by being listed here, and one that is
+// missing is a visible omission in a single place —
+// TestEveryRequestStringIsBounded fails if the list falls behind the struct.
+//
+// type and login_type are deliberately absent: both are whitelisted against a
+// fixed set of values in validateRequest, which bounds them more tightly than a
+// length could.
+func requestFields(req *Request) []requestField {
+	return []requestField{
+		{"user_id", req.UserID, maxUserIDLen},
+		{"session_id", req.SessionID, maxSessionIDLen},
+		// A provider name is only ever compared against the configured ones, but it
+		// reaches the log and the error message, so bound it like the rest.
+		{"provider", req.Provider, maxProviderLen},
+		// Length-bounded and deliberately not parsed. docs/wire-protocol.md
+		// requires a receiver to accept a zoned IPv6 literal, which is exactly what
+		// net.ParseIP refuses, so validating harder here would refuse link-local
+		// logins the contract sized this field for.
+		{"source_ip", req.SourceIP, maxSourceIPLen},
+		{"target_host", req.TargetHost, maxTargetHostLen},
+		{"user_agent", req.UserAgent, maxUserAgentLen},
+		{"device_id", req.DeviceID, maxDeviceIDLen},
+	}
+}
+
+// checkRequestField is the two things every request string has to satisfy.
+//
+// The NUL check is not cosmetic, and it is why it applies to fields nothing here
+// interprets. The other end of this contract is C, where a NUL ends the string:
+// "alice\x00bob" can be audited as one value and acted on as another, and
+// source_ip and target_host reach an audit event unaltered. The PAM module never
+// sends one, so nothing legitimate is refused — this is the last line of defence
+// declining to fail open.
+//
+// The error names the field and its length and never its contents, because it is
+// written to the broker's log. What goes back on the wire stays the generic
+// INVALID_REQUEST.
+func checkRequestField(f requestField) error {
+	if len(f.value) > f.max {
+		return fmt.Errorf("%s too long (%d bytes, max %d)", f.name, len(f.value), f.max)
+	}
+	if strings.ContainsRune(f.value, '\x00') {
+		return fmt.Errorf("%s contains NUL byte", f.name)
+	}
+	return nil
 }
 
 // validateRequest checks that all fields are within expected bounds.
@@ -441,28 +608,10 @@ func validateRequest(req *Request) error {
 	if req.Type == "authenticate" && req.UserID == "" {
 		return fmt.Errorf("authenticate requires a non-empty user_id")
 	}
-	if len(req.UserID) > 256 {
-		return fmt.Errorf("user_id too long (%d bytes)", len(req.UserID))
-	}
-	if strings.ContainsRune(req.UserID, '\x00') {
-		return fmt.Errorf("user_id contains NUL byte")
-	}
-	if len(req.SessionID) > 128 {
-		return fmt.Errorf("session_id too long (%d bytes)", len(req.SessionID))
-	}
-	// A provider name is only ever compared against the configured ones, but it
-	// reaches the log and the error message, so bound it like the rest.
-	if len(req.Provider) > 256 {
-		return fmt.Errorf("provider too long (%d bytes)", len(req.Provider))
-	}
-	if strings.ContainsRune(req.Provider, '\x00') {
-		return fmt.Errorf("provider contains NUL byte")
-	}
-	if len(req.SourceIP) > 45 {
-		return fmt.Errorf("source_ip too long (%d bytes)", len(req.SourceIP))
-	}
-	if len(req.TargetHost) > 253 {
-		return fmt.Errorf("target_host too long (%d bytes)", len(req.TargetHost))
+	for _, f := range requestFields(req) {
+		if err := checkRequestField(f); err != nil {
+			return err
+		}
 	}
 	if req.LoginType != "" &&
 		req.LoginType != "ssh" &&
@@ -470,9 +619,18 @@ func validateRequest(req *Request) error {
 		req.LoginType != "gui" {
 		return fmt.Errorf("invalid login_type %q", req.LoginType)
 	}
+	if len(req.Metadata) > maxMetadataEntries {
+		return fmt.Errorf("metadata has too many entries (%d, max %d)", len(req.Metadata), maxMetadataEntries)
+	}
 	for k, v := range req.Metadata {
-		if strings.ContainsRune(k, '\x00') || strings.ContainsRune(v, '\x00') {
-			return fmt.Errorf("metadata contains NUL byte")
+		if err := checkRequestField(requestField{"metadata key", k, maxMetadataKeyLen}); err != nil {
+			return err
+		}
+		// The offending key is not named in the error for the same reason a value's
+		// contents are not: the error is a log line, and both halves of a metadata
+		// entry are chosen by the caller.
+		if err := checkRequestField(requestField{"metadata value", v, maxMetadataValueLen}); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -518,6 +676,67 @@ func (s *Server) allowRequest(conn net.Conn, req *Request) bool {
 		return false
 	}
 	return true
+}
+
+// dispatchWithin runs one dispatch under a budget, so that a handler slot cannot
+// be held for as long as a provider is willing to stall. It takes the dispatch
+// function rather than calling s.dispatch so the timeout can be tested without a
+// broker, a socket, or a real 40 seconds.
+//
+// The reply comes back over a buffered channel because the goroutine outlives
+// this call when the budget expires. Nothing here can cancel dispatch —
+// auth.Broker.Authenticate takes no context, and the context the provider call
+// uses is the broker's own — so the work is abandoned, not stopped, and it must
+// not block forever handing back a reply nobody is reading.
+//
+// Abandoning it is the lesser of two failures, and it is worth being explicit
+// about the greater one. An abandoned authenticate may still create a session the
+// client never hears about, which is already what happens when the client's own
+// deadline expires first; holding the slot instead means holding a share of every
+// login on the host, because acceptConnections stops serving anything once all
+// the slots are taken.
+func dispatchWithin(budget time.Duration, req *Request, dispatch func(*Request) *Response) *Response {
+	done := make(chan *Response, 1)
+	go func() { done <- dispatch(req) }()
+
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+
+	select {
+	case resp := <-done:
+		return resp
+	case <-timer.C:
+		log.Error().Str("type", req.Type).Dur("budget", budget).
+			Msg("Dispatch exceeded its budget; abandoning it and releasing the handler slot")
+		return &Response{
+			Success:      false,
+			Status:       auth.StatusError,
+			ErrorCode:    verbErrorCode(req.Type),
+			ErrorMessage: "The request took too long to process",
+		}
+	}
+}
+
+// verbErrorCode is the internal-error code for a verb.
+//
+// A dispatch that overran its budget is reported as that verb's own internal
+// failure, which is what docs/wire-protocol.md already says these codes mean:
+// "the verb's handler returned an internal error; details are in the broker's
+// log, deliberately not on the wire". A new code would be a change to the
+// contract and to the C module for no gain — there is nothing a client would
+// usefully do differently, and all of these are terminal for the login either
+// way. Which one it was stays in the log.
+func verbErrorCode(reqType string) string {
+	switch reqType {
+	case "check_session":
+		return "SESSION_CHECK_FAILED"
+	case "refresh_session":
+		return "SESSION_REFRESH_FAILED"
+	case "revoke_session":
+		return "SESSION_REVOCATION_FAILED"
+	default:
+		return "AUTHENTICATION_FAILED"
+	}
 }
 
 func (s *Server) dispatch(req *Request) *Response {
@@ -624,18 +843,88 @@ func (s *Server) sendError(conn net.Conn, code, message string) {
 	})
 }
 
+// maxResponseSize is the largest reply this broker will put on the socket,
+// counting the newline the encoding adds. It is MAX_RESPONSE_SIZE from
+// cmd/pam-module/cgo_bridge.h, deliberately the same number: the client reads at
+// most that many bytes and refuses one more, so a reply above it is not a large
+// reply, it is a failed login with no diagnosis — the module gets a truncated
+// object, cannot parse it, and logs that it could not parse a response.
+//
+// It is a belt, not the fix. Nothing the broker composes on purpose comes close:
+// the biggest reply is the first one, and the bound on what a provider can put
+// into it is maxQRCodeURLBytes in pkg/auth. This is here because that bound is in
+// a different package from this socket, and every field a reply carries is
+// something somebody else chose the length of — provider_login and error_message
+// among them. The cap belongs at the one place a reply becomes bytes.
+const maxResponseSize = 16384
+
 // writeResponse is the only place a reply reaches the socket, so it is the only
 // place that has to remember to stamp the protocol version. Every reply carries
 // it, including the errors written before dispatch: a client that cannot parse a
 // reply should still be able to tell whether it was talking to a broker speaking
 // a contract it knows.
+//
+// It is also the only place that can see how big a reply turned out to be, so an
+// oversized one is replaced here with a RESPONSE_TOO_LARGE error rather than
+// written and left for the client to fail on. docs/wire-protocol.md registers
+// that code and permits sending it; substituting it is the difference between a
+// client learning "the broker had something to say and it did not fit" and a
+// client learning nothing. None of the oversized reply's own fields is copied
+// forward, because whatever made it oversized is in one of them.
 func writeResponse(conn net.Conn, resp *Response) {
 	resp.ProtocolVersion = ProtocolVersion
-	if err := json.NewEncoder(conn).Encode(resp); err != nil {
+
+	payload, err := encodeResponse(resp)
+	if err != nil {
 		log.Error().Err(err).Msg("Encode IPC response")
+		return
+	}
+
+	if len(payload) > maxResponseSize {
+		log.Error().Int("bytes", len(payload)).Int("cap", maxResponseSize).
+			Str("status", resp.Status).
+			Msg("Reply exceeds the reply cap; sending RESPONSE_TOO_LARGE instead")
+		payload, err = encodeResponse(&Response{
+			ProtocolVersion: ProtocolVersion,
+			Success:         false,
+			Status:          auth.StatusError,
+			ErrorCode:       "RESPONSE_TOO_LARGE",
+			ErrorMessage:    "Reply did not fit the reply size limit",
+		})
+		if err != nil {
+			log.Error().Err(err).Msg("Encode IPC response")
+			return
+		}
+	}
+
+	if _, err := conn.Write(payload); err != nil {
+		log.Error().Err(err).Msg("Write IPC response")
 	}
 }
 
+// encodeResponse renders a reply exactly as it goes on the wire, trailing newline
+// included, so that the size the cap is applied to is the size the client reads.
+// json.Encoder is not used directly on the connection any more for the same
+// reason: it writes as it encodes, and a reply cannot be measured after part of it
+// has already left.
+func encodeResponse(resp *Response) ([]byte, error) {
+	payload, err := json.Marshal(resp)
+	if err != nil {
+		return nil, err
+	}
+	return append(payload, '\n'), nil
+}
+
+// authResponseToIPC copies a broker answer into a reply.
+//
+// QRCode stays a field of its own even though the ASCII art is the largest thing
+// a reply carries, and it is the copy that survived the fix for #56: the art used
+// to go out here *and* inside instructions, so the reply the module has to fit in
+// 16 KiB carried it twice. docs/wire-protocol.md makes removing a reply field a
+// new protocol version, and this is a bug fix, so the copy that went is the one
+// the spec does not describe the contents of — the block inside instructions. See
+// the comment above the formatters in pkg/auth/qr_code.go. Do not "tidy" this by
+// deleting the field.
 func authResponseToIPC(ar *auth.AuthResponse) *Response {
 	return &Response{
 		Success:          ar.Success,

@@ -81,7 +81,24 @@ Every other paragraph here is in service of that sentence. In particular:
   one JSON object, reads exactly one JSON object, and the connection is closed by
   the broker. There is no framing beyond that: the reply ends at EOF. There is no
   multiplexing, no keep-alive, and no server-initiated message.
-- **A request is at most 64 KiB.** Larger is refused before it is decoded.
+- **A request is at most 64 KiB.** A receiver caps the read at that size instead
+  of growing a buffer to fit, and refuses a larger request with
+  `INVALID_REQUEST`.
+
+  This used to say "refused before it is decoded", which no implementation of
+  this framing can honour and none did: a request is a bare JSON object with no
+  length prefix, so nothing on the wire announces its size in advance and a
+  receiver learns a body is too long only by reaching the cap while reading it.
+  What the cap guarantees is the **allocation**, not the ordering — and a receiver
+  should say which of the two failed, because a body truncated at the cap looks
+  to a JSON parser like malformed input, and a client told its serialization is
+  broken will not go looking at the size of what it sent.
+- **A reply is at most 16 KiB.** A client is entitled to refuse a larger one
+  rather than grow a buffer without bound, and this one does: `MAX_RESPONSE_SIZE`
+  in `cmd/pam-module/cgo_bridge.h` is 16384, and `strncpy` past it truncates in
+  silence, which a client cannot then parse. This broker holds itself to the same
+  number and substitutes `RESPONSE_TOO_LARGE` rather than writing an oversized
+  reply — see that code below.
 - **Both ends apply deadlines to every send and receive.** A broker that accepts
   a connection and then says nothing must not be able to hang a login: the client
   is inside `sshd`'s `LoginGraceTime` and has no other timer for a blocked
@@ -89,10 +106,40 @@ Every other paragraph here is in service of that sentence. In particular:
   client's are per phase, because starting a device flow involves a provider
   round trip and polling does not.
 
-A reply is expected to fit comfortably under 16 KiB. The largest by a wide margin
-is the first one, whose `instructions` carry a QR code drawn in multibyte block
-characters — around 2–3 KiB in practice. A client is entitled to refuse a larger
-reply rather than grow a buffer without bound, and this one does.
+The largest reply by a wide margin is the first one, and the reason is the QR
+code: ASCII art in multibyte block characters, whose size grows superlinearly in
+the length of the URL it encodes, and the URL is `verification_uri` from the
+provider. Measured against the real `github.com/skip2/go-qrcode` at Medium
+recovery, serializing the reply this broker sends (JSON plus the trailing
+newline), with a lowercase URL because that is what puts the encoder in byte mode
+and byte mode is the larger of the two encodings a real URL can take:
+
+| `verification_uri` | QR art | first reply |
+|---|---|---|
+| 31 B — what github.com actually sends | 1940 B | **2.9 KB** |
+| 51 B — a URI with the user code in it | 2304 B | 3.3 KB |
+| 200 B — the ceiling, above which no QR is drawn | 5610 B | 6.9 KB |
+| longer than 200 B | none | ~1.4 KB plus the URL, which appears twice |
+
+Earlier revisions of this document said "around 2–3 KiB in practice", which was
+wrong on the happy path in the direction that made 16 KiB look generous: that
+figure was the size of the `instructions` field, while the reply carried the same
+art a second time in `qr_code`, so the real github.com baseline was 4.9 KB before
+any hostile input — and a 300-byte `verification_uri` reached 17.6 KB, over the
+buffer, while a 2 KB one reached 88 KB
+([#56](https://github.com/scttfrdmn/oauth2-pam/issues/56)). Both halves of that
+are fixed rather than re-documented: the art is serialized once, in `qr_code`, and
+the URL it is drawn from is bounded at 200 bytes with the code skipped above that.
+The sizing rule a consumer should take from it is to measure the whole reply
+rather than one field, and to remember that the largest field in it is a function
+of a string the provider chose the length of.
+
+That is also why the QR bound is not the whole answer. The URL itself is on the
+wire twice, in `device_url` and inside `instructions`, so a provider sending a
+multi-kilobyte `verification_uri` still writes a reply that will not fit — around
+7.7 KB of URL is enough. What it gets is the reply cap: `RESPONSE_TOO_LARGE`, which
+is a terminal answer with a reason in it, rather than a truncated object the client
+cannot parse.
 
 ## Versioning
 
@@ -173,13 +220,34 @@ with `status`.
 | `protocol_version` | int | Optional. Absent means 1. |
 | `type` | string | `authenticate`, `check_session`, `refresh_session`, `revoke_session`. Anything else is refused. |
 | `user_id` | string | The **local account being logged into** — the PAM username, not the provider's. Required and non-empty for `authenticate`. Max 256 bytes, no NUL. |
-| `session_id` | string | Required for the session verbs. Max 128 bytes. |
+| `session_id` | string | Required for the session verbs. Max 128 bytes, no NUL. |
 | `provider` | string | Optional. Names a configured provider; absent means the broker's default. A name that is not configured is refused rather than replaced by the default. Max 256 bytes, no NUL. |
-| `source_ip` | string | The client address, if the login has one and it really is an address. Max 45 bytes (an IPv6 literal with a scope). A resolved hostname does not belong here. See below: a receiver **must** accept a zone, and an absent value means *origin unknown*. |
-| `target_host` | string | The host being logged **into** — this host. Max 253 bytes. |
+| `source_ip` | string | The client address, if the login has one and it really is an address. Max 45 bytes (an IPv6 literal with a scope), no NUL. A resolved hostname does not belong here. See below: a receiver **must** accept a zone, and an absent value means *origin unknown*. |
+| `target_host` | string | The host being logged **into** — this host. Max 253 bytes, no NUL. |
 | `login_type` | string | `ssh`, `console`, or `gui`. Optional; empty is treated as `ssh`. Any other value is refused. It selects how instructions are formatted, nothing more. |
-| `user_agent`, `device_id` | string | Optional, carried into the audit trail. |
-| `metadata` | object of string→string | Optional. Free-form context for the audit trail: this client sends `service`, `tty`, `pid`, and the unabridged `rhost`. No NUL in keys or values. |
+| `user_agent` | string | Optional, carried into the audit trail. Max 512 bytes, no NUL. |
+| `device_id` | string | Optional, carried into the audit trail. Max 256 bytes, no NUL. |
+| `metadata` | object of string→string | Optional. Free-form context for the audit trail: this client sends `service`, `tty`, `pid`, and the unabridged `rhost`. At most 64 entries, keys max 128 bytes, values max 1024 bytes. No NUL in keys or values. |
+
+Every string above is bounded, including the fields a broker only stores: a
+maximum length *and* no embedded NUL, except for `type` and `login_type`, where
+the enumeration is a tighter bound than either. Both halves of that were missing
+here before v0.4.0 — `user_agent` and `device_id` had no maximum stated and none
+enforced, so a 64 KiB `user_agent` became a 64 KiB audit record written by
+whatever reached the socket, and `metadata` had no bound on its entry count at
+all.
+
+The NUL rule matters most for the fields nothing interprets. The reference client
+is C, where a NUL ends a string, so a value carrying one can be audited as one
+thing and acted on as another; `source_ip` and `target_host` in particular are
+copied into an audit event unaltered. A conformant client never sends one, which
+is the point: refusing it is a receiver declining to fail open, not a constraint
+on anybody's client.
+
+The maxima are ceilings on what reaches an audit record and a log line, not a
+budget a client is expected to manage. They are sized well above anything a real
+client sends — the reference client's `metadata` has four entries — so a receiver
+that has to refuse one is looking at something that is not a login.
 
 Note the two easily-confused fields. `user_id` in a *request* is the local account
 being asked for; `user_id` in a *reply* is the local account the broker
@@ -299,8 +367,8 @@ One JSON object.
 | `success` | bool | True only when `status` is `"authorized"` (or `"revoked"` for a revocation). Redundant with `status` on purpose: it is the field the pre-status clients read, and a client should require both to agree. |
 | `user_id` | string | The local account authorized. Populated **only** when authorized. |
 | `session_id` | string | The handle to poll. |
-| `instructions` | string | Ready-to-display text for the user, formatted for `login_type`. A client is not expected to build this from the parts. |
-| `device_code`, `device_url`, `qr_code` | string | The parts, for a client that wants to format its own prompt. |
+| `instructions` | string | Ready-to-display text for the user, formatted for `login_type`. A client is not expected to build this from the parts. It carries the URL and the user code as text and **does not embed the QR code** — see below. |
+| `device_code`, `device_url`, `qr_code` | string | The parts, for a client that wants to format its own prompt. `qr_code` is the only place the QR art travels, and it is empty when there is none. |
 | `expires_at` | RFC 3339 timestamp | When the session or the flow expires. |
 | `error_code` | string | Machine-readable. See below. |
 | `error_message` | string | For the log, not for a decision. |
@@ -309,16 +377,38 @@ One JSON object.
 | `requires_device`, `requires_approval` | bool | Legacy hints from before `status` existed. Do not make decisions on them. |
 | `metadata` | object of string→string | `polling_interval` on a pending reply, `provider` and `provider_login` where known. |
 
+The QR code appears **once** in a reply, in `qr_code`. It used to be there and
+inside `instructions` as well, which put the largest field of the largest reply on
+the wire twice at a size the provider chose; a client that wants to draw a QR code
+renders that field. `qr_code` may also be empty on a perfectly good `pending`
+reply — a broker that will not encode an overlong `verification_uri` is expected to
+send none rather than to fail the login — so a client must treat the art as
+optional and the URL and code in `instructions` as what the user acts on.
+
 ### Status values
 
 | `status` | Meaning | Terminal? | Grants access? |
 |---|---|---|---|
 | `pending` | A device flow is started and nobody has approved it yet | no | **no** |
 | `authorized` | Approved, identity mapped, and the mapping matches the requested account | yes | **yes**, with `success: true` |
-| `denied` | Refused: the user denied it at the provider, the identity mapped to a different account, the mapping was refused, or a limit was hit | yes | no |
+| `denied` | Refused: the user denied it at the provider, the identity mapped to a different account, or the mapping was refused | yes | no |
 | `expired` | The flow or the session ran out of time | yes | no |
-| `error` | Something failed. Read `error_code` | yes, unless the code says otherwise | no |
+| `error` | Something failed, or the broker is full. Read `error_code` | yes, unless the code says otherwise | no |
 | `revoked` | Reply to `revoke_session` only | yes | n/a |
+
+**A capacity refusal is `error`, never `denied`.** Running out of capacity —
+`SESSION_LIMIT_REACHED` or `AUTH_LIMIT_REACHED` — is a statement about the
+broker's load, not a judgement about the identity presenting itself: nobody was
+refused, the broker declined to try. `denied` is reserved for the three things in
+its row above, all of which are decisions about *this* user, and a client is
+entitled to treat it as one. This broker sent `denied` with
+`SESSION_LIMIT_REACHED` until v0.4.0, so the same condition — this host is full —
+arrived as a decision about the user down one path and as an operational failure
+down the other; a user at their session cap was told their identity had been
+refused, and the module mapped it to `PAM_AUTH_ERR` rather than the
+`PAM_AUTHINFO_UNAVAIL` its twin got ([#84](https://github.com/scttfrdmn/oauth2-pam/issues/84)).
+The two codes stay distinct so a log can tell them apart; the status they arrive
+with does not.
 
 A terminal session remains queryable for a grace period after it ends — two
 minutes in this broker — so a client that is still polling learns the real outcome
@@ -354,11 +444,17 @@ The one code whose retryability is part of the contract:
   answer.
 
 **Capacity conditions — `AUTH_LIMIT_REACHED` (the host's concurrent device flows)
-and `SESSION_LIMIT_REACHED` (this user's active sessions) — are not retried
-either**, but they deserve to be distinguishable in a log, because they say
-something about the host rather than about the user. `AUTH_LIMIT_REACHED` in
-particular is held by *other* logins for as long as their device flows live, so
-retrying inside this login only spends the user's remaining time to fail again.
+and `SESSION_LIMIT_REACHED` (this user's active sessions) — both arrive as
+`status: "error"`, and neither is retried.** The status is the same for both
+because the condition is the same: the broker is at a limit and declined to try,
+which is a fact about the host's load and not a decision about the identity that
+asked (see Status values above, and
+[#84](https://github.com/scttfrdmn/oauth2-pam/issues/84)). They keep separate
+codes because they are worth telling apart in a log — one is this user's own
+sessions, the other is every login on the host — not because a client should act
+on them differently. `AUTH_LIMIT_REACHED` in particular is held by *other* logins
+for as long as their device flows live, so retrying inside this login only spends
+the user's remaining time to fail again.
 
 The remaining codes are diagnostic. A client that does not recognise a code must
 treat the reply as a failure, which for all of these is the right answer:
@@ -372,6 +468,8 @@ treat the reply as a failure, which for all of these is the right answer:
 | `SESSION_NOT_FOUND` | broker | no such `session_id`, or it aged out past the grace period |
 | `SESSION_EXPIRED` | broker | the session or device code ran out of time |
 | `SESSION_NOT_ACTIVE` | broker | a session verb was used on a session that is not authorized |
+| `SESSION_LIMIT_REACHED` | broker | this user already has as many active sessions as the broker allows. `status: "error"` — capacity, not a denial |
+| `AUTH_LIMIT_REACHED` | broker | the host already has as many device flows in progress as the broker allows. `status: "error"` for the same reason |
 | `AUTHENTICATION_FAILED`, `SESSION_CHECK_FAILED`, `SESSION_REFRESH_FAILED`, `SESSION_REVOCATION_FAILED` | broker | the verb's handler returned an internal error; details are in the broker's log, deliberately not on the wire |
 | `RESPONSE_TOO_LARGE` | broker | the reply for this request did not fit the reply cap and was replaced by this one. Terminal |
 
@@ -385,9 +483,12 @@ not fit" — which is the whole value of substituting it.
 
 Whether a version-1 broker is *obliged* to substitute it, rather than writing an
 oversized reply and leaving the client to refuse, is not settled here: that is a
-requirement on brokers, this one does not yet meet it, and specifying it is
+requirement on brokers, and specifying it is
 [#48](https://github.com/scttfrdmn/oauth2-pam/issues/48). Sending it is permitted
-today; relying on receiving it is not.
+today; relying on receiving it is not. This broker does substitute it, as of the
+fix for [#56](https://github.com/scttfrdmn/oauth2-pam/issues/56) — every reply is
+serialized and measured before it is written — which is a property of this
+implementation and not yet a promise of version 1.
 
 ## What this contract deliberately does not do
 
@@ -444,8 +545,16 @@ A **broker**:
    does no work for it.
 5. Keeps a terminal session queryable long enough for one more poll to see the
    outcome.
-6. Bounds every request field, and rejects an oversized request before decoding
-   it.
+6. Bounds every request field — a maximum length *and* no embedded NUL, for each
+   one, including the fields it only stores — and caps the request read at 64 KiB
+   so an oversized request is refused rather than buffered. This item is written
+   as "every field" rather than a list because that is how it was got wrong: the
+   broker here bounded the fields somebody thought to bound, and `user_agent`,
+   `device_id` and the `metadata` entry count were not among them. Test it
+   against the struct the request decodes into, not against the table above.
+   ("Before decoding" is what this item used to require of the size cap; see
+   Transport for why that is not achievable for this framing, and what is
+   required instead.)
 7. Never puts internal error detail on the wire. `error_code` is a category;
    the detail belongs in the broker's log.
 8. Accepts a zoned IPv6 `source_ip` — a validator that rejects `fe80::1%eth0`
@@ -453,6 +562,10 @@ A **broker**:
 9. Never satisfies a network requirement from an absent `source_ip`. Absent is
    `unknown`, and what `unknown` does is a decision the broker must have made
    before it is asked, not one a validator makes for it by returning false.
+10. Reports a capacity refusal as `status: "error"`, whichever limit was reached,
+    and keeps `denied` for decisions about the identity. Test both limits in one
+    test: the way this was got wrong was two refusals of the same shape written in
+    different places, each self-consistent.
 
 Both ends: **an extension field is never load-bearing for the grant.** Not a
 separate item because it is not a separate test — it is the property the other
@@ -469,6 +582,11 @@ starting point — the conformance list above is what they are checking:
   fake provider, including that `authenticate` is not an authentication, that a
   mapping to a different account does not authorize the requested one, that every
   reply carries `protocol_version`, and that an unsupported version is refused.
+- `internal/ipc/reply_size_test.go` covers the sizing claims above with the real
+  QR encoder: that the art is serialized exactly once, that a `verification_uri`
+  from anywhere in the range that used to overflow the client's buffer cannot
+  inflate a reply past the cap, and that an oversized reply is replaced by
+  `RESPONSE_TOO_LARGE` rather than written.
 - `test/cbridge/cbridge_test.c` covers the client's parsing and serialization:
   which field carries what, a reply exactly the size of the buffer, a broker that
   accepts and then says nothing, and the version rules above.

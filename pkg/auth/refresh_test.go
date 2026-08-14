@@ -436,6 +436,156 @@ func TestMaxTokenAgeIsAnAbsoluteCeilingOnRefresh(t *testing.T) {
 	})
 }
 
+// TestCheckSessionAgreesWithRefreshSession is #59. docs/wire-protocol.md says the
+// two verbs "are required to agree" about whether a session is authorized, and
+// CheckSession applied neither of the two bounds RefreshSession applies: it never
+// called pastMaxTokenAge and never looked at the token store. Both cases were
+// measured as check_session answering authorized/success=true against
+// refresh_session answering expired/SESSION_EXPIRED for the same session ID.
+//
+// That matters more than a spec mismatch: no in-tree client sends
+// refresh_session, so check_session is the only verb that ever decides a login,
+// and it was the lenient one.
+//
+// Each case is put to both verbs on two identical sessions, because either verb
+// consumes the session it refuses — and asserting the pair agree is the property,
+// rather than asserting a particular answer twice.
+func TestCheckSessionAgreesWithRefreshSession(t *testing.T) {
+	const ceiling = 2 * time.Hour
+
+	cfg := brokerConfig(t)
+	cfg.Security.MaxTokenAge = ceiling
+	b := startBroker(t, cfg, newFakeProvider("acme"))
+
+	// twins installs the same session twice so one copy can be spent on each verb.
+	twins := func(t *testing.T, name string, createdAt, expiresAt time.Time) (checked, refreshed *Session) {
+		t.Helper()
+		return authorizedSession(t, b, name+"-check", createdAt, expiresAt),
+			authorizedSession(t, b, name+"-refresh", createdAt, expiresAt)
+	}
+	agree := func(t *testing.T, check, refresh *AuthResponse) {
+		t.Helper()
+		if check.Success != refresh.Success || check.Status != refresh.Status || check.ErrorCode != refresh.ErrorCode {
+			t.Errorf("check_session says status=%q success=%v (%s) but refresh_session says status=%q success=%v (%s)",
+				check.Status, check.Success, check.ErrorCode,
+				refresh.Status, refresh.Success, refresh.ErrorCode)
+		}
+	}
+
+	t.Run("past max_token_age", func(t *testing.T) {
+		now := time.Now()
+		// Half an hour of expiry left, so only the age can explain a refusal.
+		checked, refreshed := twins(t, "aged", now.Add(-ceiling-time.Minute), now.Add(30*time.Minute))
+
+		check, err := b.CheckSession(checked.ID)
+		if err != nil {
+			t.Fatalf("CheckSession: %v", err)
+		}
+		refresh, err := b.RefreshSession(refreshed.ID)
+		if err != nil {
+			t.Fatalf("RefreshSession: %v", err)
+		}
+		agree(t, check, refresh)
+
+		if check.Success || check.Status != StatusExpired || check.ErrorCode != "SESSION_EXPIRED" {
+			t.Errorf("check_session says status=%q success=%v (%s) for a session %s old under a %s ceiling",
+				check.Status, check.Success, check.ErrorCode, ceiling+time.Minute, ceiling)
+		}
+		if check.UserID != "" {
+			t.Errorf("user_id = %q on a refusal, want empty", check.UserID)
+		}
+
+		// Revoked, not merely refused, the way RefreshSession does it: the ceiling
+		// is a security control, so the credential goes with the session.
+		if live := b.getSession(checked.ID); live != nil {
+			t.Errorf("check_session left a session past the ceiling in the map (status=%q)", live.Status)
+		}
+		if tokenLives(b, checked.TokenID) {
+			t.Error("check_session refused a session past the ceiling but left its token in the store")
+		}
+	})
+
+	t.Run("token is no longer in the store", func(t *testing.T) {
+		now := time.Now()
+		checked, refreshed := twins(t, "tokenless", now, now.Add(30*time.Minute))
+
+		// What the token manager's own cleanup does when the token record's expiry
+		// passes. A refresh extends the session's expiry and not the record's, so
+		// this is the ordinary state of a session that has been refreshed once.
+		b.tokenManager.RevokeToken(checked.TokenID)
+		b.tokenManager.RevokeToken(refreshed.TokenID)
+
+		check, err := b.CheckSession(checked.ID)
+		if err != nil {
+			t.Fatalf("CheckSession: %v", err)
+		}
+		refresh, err := b.RefreshSession(refreshed.ID)
+		if err != nil {
+			t.Fatalf("RefreshSession: %v", err)
+		}
+		agree(t, check, refresh)
+
+		if check.Success || check.Status != StatusExpired {
+			t.Errorf("check_session says status=%q success=%v user_id=%q for a session whose access token is gone",
+				check.Status, check.Success, check.UserID)
+		}
+		if live := b.getSession(checked.ID); live != nil {
+			t.Errorf("a session with no usable token is still in the map (status=%q)", live.Status)
+		}
+	})
+
+	t.Run("a live session is still authorized by both", func(t *testing.T) {
+		// The companion that stops the cases above from passing for the wrong
+		// reason: two verbs that refuse everything also agree.
+		now := time.Now()
+		checked, refreshed := twins(t, "live", now, now.Add(30*time.Minute))
+
+		check, err := b.CheckSession(checked.ID)
+		if err != nil {
+			t.Fatalf("CheckSession: %v", err)
+		}
+		refresh, err := b.RefreshSession(refreshed.ID)
+		if err != nil {
+			t.Fatalf("RefreshSession: %v", err)
+		}
+		agree(t, check, refresh)
+
+		if !check.Success || check.Status != StatusAuthorized || check.UserID != "alice" {
+			t.Errorf("check_session says status=%q success=%v user_id=%q for a live session",
+				check.Status, check.Success, check.UserID)
+		}
+	})
+
+	t.Run("a refresh never extends past the ceiling", func(t *testing.T) {
+		now := time.Now()
+		// Half an hour of ceiling left, and inside refresh_threshold so the call
+		// reaches the extension. token_lifetime is an hour, so an uncapped
+		// extension lands half an hour past the ceiling — measured at 59 minutes
+		// past before the fix, with only the five-minute cleanup sweep to notice.
+		s := authorizedSession(t, b, "capped", now.Add(-ceiling+30*time.Minute), now.Add(30*time.Second))
+		ceilingAt := s.CreatedAt.Add(ceiling)
+
+		resp, err := b.RefreshSession(s.ID)
+		if err != nil {
+			t.Fatalf("RefreshSession: %v", err)
+		}
+		if !resp.Success {
+			t.Fatalf("status = %q (%s); a session inside the ceiling must still refresh",
+				resp.Status, resp.ErrorCode)
+		}
+		if resp.ExpiresAt.After(ceilingAt) {
+			t.Errorf("expires_at = %s, %s past the max_token_age ceiling at %s",
+				resp.ExpiresAt, resp.ExpiresAt.Sub(ceilingAt).Round(time.Second), ceilingAt)
+		}
+		if live := b.getSession(s.ID); live == nil {
+			t.Fatal("refresh removed the session it extended")
+		} else if live.ExpiresAt.After(ceilingAt) {
+			t.Errorf("stored expires_at = %s, %s past the ceiling; the cap was applied to the reply only",
+				live.ExpiresAt, live.ExpiresAt.Sub(ceilingAt).Round(time.Second))
+		}
+	})
+}
+
 // TestSessionCleanupRevokesSessionsPastMaxTokenAge covers the other half of #43.
 // Enforcing the ceiling only in RefreshSession would leave it unenforced for
 // every session nobody calls refresh_session on — which today is all of them, as

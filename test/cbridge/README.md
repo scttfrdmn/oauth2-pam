@@ -24,10 +24,13 @@ cannot make the broker misbehave in specific ways. These can, over a
 | a reply exactly `MAX_RESPONSE_SIZE` bytes long | the read loop stopped one byte early and rejected a complete response as "too large" |
 | one byte over the limit | must be refused, not truncated into JSON that might still parse |
 | a peer that accepts and then says nothing | without `SO_RCVTIMEO` the module blocks in `recv()` until sshd's `LoginGraceTime` kills the session; `timeout=` cannot help, it is only consulted between polls |
+| a peer that sends one byte per timeout | `SO_RCVTIMEO` bounds each `recv()`, not the reply, so a drip-feeding peer extended the wait per byte and held the login open for as long as it liked; the bound is now one absolute deadline for the whole transfer |
 | a peer that hangs up mid-request | without `MSG_NOSIGNAL`, `send()` raises SIGPIPE and **terminates sshd's pre-auth child** — a broker restart would drop the connection instead of failing the module |
 | the assembled `authenticate` request | the module sent `PAM_RHOST` as `target_host` and never sent `source_ip`, so every audit record named the client as the target and left the origin blank |
+| a zoned IPv6 `source_ip` | `inet_pton` fails on `fe80::1%eth0`, so a link-local login was audited as origin-unknown — the address `docs/wire-protocol.md` conformance item 8 names by hand |
 | `error_code` parsing | `RATE_LIMITED` arrives as `status: "error"` and was treated as terminal, failing logins that were only being asked to slow down |
 | `validate_socket_path` | `/run/oauth2-pam/` — where systemd's `RuntimeDirectory=` puts the socket — was refused as unsafe |
+| `authorized_for` and `terminal_status_to_pam` | the grant decision had **no coverage of any kind**: `authorized_for() { return 1; }` was green in every suite here, and the harness drives an honest broker that can never answer "authorized" for the wrong user |
 
 The SIGPIPE case is the one to watch: if it regresses, the test binary is
 *killed* rather than failing, and `run.sh` exits 141.
@@ -38,7 +41,7 @@ A green suite proves the code does what the tests say. It does not prove the
 tests would notice if it stopped — and a regression test that cannot fail is
 worse than no test, because it reads as protection.
 
-`mutations.sh` is the check on that. For each of the six defects above it
+`mutations.sh` is the check on that. For each of the defects above it
 reintroduces the defect in a copy of the source under `$TMPDIR`, rebuilds, and
 asserts the suite **fails**; a mutation the suite survives is reported as
 `MISSED` and fails the run. Nothing in the working tree is touched, so an
@@ -55,21 +58,24 @@ caught   a full buffer means too large (exit 1)
 ...
 ```
 
-Two ways a case can be inconclusive rather than reassuring, both reported as
+Three ways a case can be inconclusive rather than reassuring, all reported as
 failures rather than passes:
 
 - `SETUP` — the mutation's pattern matched nothing, or the mutated source did not
   compile. The source has moved and the mutation is no longer reintroducing the
   defect it names. Editing the bridge will eventually cause this; fix the pattern
   in `mutations.sh` rather than dropping the case.
+- `HUNG` — the suite did not finish within 120s. The failure mode of a deadline
+  defect is a test that blocks on a peer which will never speak, so each build is
+  run under `timeout`; a case that never answers is evidence about nothing.
 - `BROKEN` — the *unmutated* baseline failed. Usually this means the run is not
   privileged, the socket case skipped, and a skip counts as a failure. Run it
   under `sudo`, as the Makefile target and CI do; the container path is already
   root.
 
 Mutations are deliberately the specific defect each test was written against,
-not machine-generated. This is a check that six named regression tests still
-bite, not a coverage metric.
+not machine-generated. This is a check that named regression tests still bite,
+not a coverage metric.
 
 ## Notes
 

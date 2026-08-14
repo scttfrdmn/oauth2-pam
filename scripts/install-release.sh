@@ -13,6 +13,11 @@ CONFDIR="${CONFDIR:-/etc/oauth2-pam}"
 
 die() { echo "install: $*" >&2; exit 1; }
 
+# Where this script's helpers sit: the top level of the unpacked archive, next to
+# install.sh, and scripts/ in a source checkout. Both are "the directory this
+# script is in".
+HERE=$(dirname "$0")
+
 [ "$(id -u)" -eq 0 ] || die "must run as root (try: sudo ./install.sh)"
 [ "$(uname -s)" = "Linux" ] || die "the PAM module is Linux-only"
 
@@ -20,26 +25,45 @@ for f in oauth2_pam.so oauth2-pam-broker oauth2-pam-admin oauth2-pam-enroll; do
     [ -f "$f" ] || die "$f not found — run this from the unpacked archive directory"
 done
 
-# The module must export its entry points. A .so without them loads as nothing:
-# PAM logs an error and the auth line behaves as though the module were absent.
-if command -v nm >/dev/null 2>&1; then
-    count=$(nm -D --defined-only oauth2_pam.so 2>/dev/null | grep -c ' pam_sm_' || true)
-    [ "$count" -ge 6 ] || die "oauth2_pam.so exports $count pam_sm_* symbols, expected 6 — do not install this artifact"
+# Check the archive this directory came out of, if it is still beside it. Every
+# release publishes a .sha256 next to the tarball and until now nothing read it,
+# which made it a file rather than a check.
+#
+# Verifying after the unpack is weaker than verifying before, which is why the
+# README documents doing it first — but this is the check that runs on the host
+# where nobody read the README, and a truncated or substituted download still
+# fails it. It is not a signature: tarball and checksum come from the same place,
+# so this says the bytes arrived intact, not who produced them (see #40).
+archive="$(basename "$PWD").tar.gz"
+if [ -f "../$archive" ] && [ -f "../$archive.sha256" ]; then
+    command -v sha256sum >/dev/null 2>&1 \
+        || die "sha256sum not found, so ../$archive cannot be verified — install coreutils"
+    (cd .. && sha256sum -c "$archive.sha256" >/dev/null) \
+        || die "$archive does not match its published sha256 — do not install this artifact"
+    echo "Verified $archive against its published sha256."
+else
+    echo "Note: $archive and its .sha256 are not next to this directory, so the"
+    echo "      download itself was not verified here. See \"Get the software\" in"
+    echo "      README.md for the check to run before unpacking."
 fi
 
-# /lib/security is right on RHEL and wrong on Debian/Ubuntu multiarch. Ask the
-# package manager where the system's own modules live rather than guessing.
-PAMDIR=""
-if command -v dpkg >/dev/null 2>&1; then
-    permit=$(dpkg -L libpam-modules 2>/dev/null | grep -m1 '/pam_permit\.so$' || true)
-    [ -n "$permit" ] && PAMDIR=$(dirname "$permit")
-fi
-if [ -z "$PAMDIR" ]; then
-    for d in /lib64/security /lib/security /usr/lib64/security /usr/lib/security; do
-        [ -d "$d" ] && { PAMDIR="$d"; break; }
-    done
-fi
-[ -n "$PAMDIR" ] || die "cannot find the PAM module directory; set PAMDIR= explicitly"
+# The module must export its entry points. A .so without them loads as nothing:
+# PAM logs an error and the auth line behaves as though the module were absent.
+#
+# The same script the release workflow and `make build` run, and it fails when nm
+# is absent instead of skipping: this is the last check between an operator and an
+# artifact PAM cannot load, and it used to be the loosest of the three.
+[ -f "$HERE/verify-pam-symbols.sh" ] \
+    || die "verify-pam-symbols.sh is missing — unpack the whole archive and run install.sh from it"
+"$HERE/verify-pam-symbols.sh" oauth2_pam.so \
+    || die "do not install this artifact"
+
+# Where the module goes. Asked, not assumed — and asked by the same script
+# `make install` uses, so the two install routes cannot answer it differently.
+# PAMDIR from the environment still wins; the helper handles that.
+[ -f "$HERE/pam-module-dir.sh" ] \
+    || die "pam-module-dir.sh is missing — unpack the whole archive and run install.sh from it"
+PAMDIR=$("$HERE/pam-module-dir.sh") || die "cannot determine where this system keeps its PAM modules"
 
 echo "Installing:"
 echo "  PAM module -> $PAMDIR/oauth2_pam.so"
@@ -63,9 +87,15 @@ else
     # nothing and access tokens sit in the broker's memory in the clear; and a
     # generated key beats whatever an administrator would type by ~200 bits.
     key=$("$PREFIX/bin/oauth2-pam-admin" gen-key) || die "gen-key failed"
+    # The sed script arrives on stdin rather than in argv. /proc/<pid>/cmdline is
+    # world-readable on Linux, so a key passed as an argument is recoverable by
+    # any local user polling /proc for the length of the install — the one value
+    # in this file whose entire purpose is to be secret, in a file installed 0600
+    # two lines up. A here-document is a pipe (or an unlinked file) the shell owns.
     # | as the delimiter: base64 contains / but never |.
-    sed -i "s|# token_encryption_key: \"paste the output of gen-key here\"|token_encryption_key: \"$key\"|" \
-        "$CONFDIR/broker.yaml"
+    sed -i -f - "$CONFDIR/broker.yaml" <<EOF
+s|# token_encryption_key: "paste the output of gen-key here"|token_encryption_key: "$key"|
+EOF
     if grep -q '^[[:space:]]*token_encryption_key:' "$CONFDIR/broker.yaml"; then
         echo "  generated a token_encryption_key"
     else

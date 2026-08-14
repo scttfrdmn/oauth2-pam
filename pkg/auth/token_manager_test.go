@@ -232,6 +232,55 @@ func TestExpiredTokenIsNotReturned(t *testing.T) {
 	}
 }
 
+// TestHasAnswersWithoutTouchingTheToken pins both halves of the existence
+// predicate (#50): it agrees with GetDecryptedAccessToken about which tokens are
+// usable, and it leaves the store exactly as it found it. A predicate that
+// evicted the expired record it saw, or refreshed LastUsed, would make asking
+// whether a session is authorized change the answer — and its callers ask on
+// every check_session.
+func TestHasAnswersWithoutTouchingTheToken(t *testing.T) {
+	tm, err := NewTokenManager(tokenManagerConfig(encryptionKey))
+	if err != nil {
+		t.Fatalf("NewTokenManager: %v", err)
+	}
+
+	live, err := tm.StoreToken("sess-live", "alice", plaintextToken, "", time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("StoreToken: %v", err)
+	}
+	stale, err := tm.StoreToken("sess-stale", "alice", plaintextToken, "", time.Now().Add(-time.Second))
+	if err != nil {
+		t.Fatalf("StoreToken: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		tokenID string
+		want    bool
+	}{
+		{"stored and unexpired", live, true},
+		{"stored but past its own expiry", stale, false},
+		{"never stored", "nope", false},
+		{"no token at all", "", false},
+	} {
+		if got := tm.Has(tc.tokenID); got != tc.want {
+			t.Errorf("%s: Has = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+
+	// The record Has said no to is still there, and the one it said yes to is
+	// still decryptable: the answer cost nothing.
+	tm.tokenStore.mutex.RLock()
+	_, stillStored := tm.tokenStore.tokens[stale]
+	tm.tokenStore.mutex.RUnlock()
+	if !stillStored {
+		t.Error("Has evicted the expired token it was asked about")
+	}
+	if got, err := tm.GetDecryptedAccessToken(live); err != nil || got != plaintextToken {
+		t.Errorf("GetDecryptedAccessToken after Has = %q, %v; want the token intact", got, err)
+	}
+}
+
 func TestRevokeToken(t *testing.T) {
 	tm, err := NewTokenManager(tokenManagerConfig(encryptionKey))
 	if err != nil {

@@ -21,33 +21,54 @@ jobs:
   # CodeQL is the only tool here that reasons across function boundaries, which
   # is what this codebase needs: the v0.1.x bypass was a two-step data flow —
   # Success: true set in pkg/auth/broker.go, read and trusted in the C bridge.
+  #
+  # Both halves of that flow are analysed, which took until issue #38 to be true.
+  # `languages: go` runs only the Go extractor, so cgo_bridge_linux.c — the file
+  # that reads the socket, parses the broker's JSON and decides whether a login
+  # happens — was in no CodeQL database at all. What blocked it was the build: the
+  # C was compiled by cgo as a side effect of `go build -buildmode=c-shared`, and
+  # there is no command autobuild can guess for that. Issue #65 replaced it with a
+  # plain `cc -shared` line in the Makefile, and a plain compiler invocation is
+  # exactly what the C extractor can trace. So the job is a matrix now, one
+  # language per run, each with the build its extractor needs.
+  #
+  # This does not retire test/cbridge: CodeQL finds the bugs a query has been
+  # written for, and the mutation check is what proves the suite guarding the grant
+  # decision can still fail. They cover different things.
   codeql:
-    name: CodeQL
+    name: CodeQL (${{ matrix.language }})
     runs-on: ubuntu-latest
     permissions:
       contents: read
       security-events: write
       actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: go
+            build-mode: autobuild
+          - language: c-cpp
+            # manual, not autobuild: autobuild would go looking for a build system
+            # and find the Makefile, whose default target also builds three Go
+            # binaries the C extractor has no interest in. The one command that
+            # compiles the module is named below.
+            build-mode: manual
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - if: matrix.language == 'go'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
           check-latest: true
 
-      # Without these, autobuild still succeeds — it just quietly skips the Go
-      # half of cmd/pam-module, which is the most security-sensitive package here.
-      #
-      # It only ever gets that Go half: `languages: go` runs the Go extractor, so
-      # cgo_bridge_linux.c — the file that talks to the socket and parses the
-      # broker's JSON — is in no CodeQL database at all. Analyzing it needs
-      # `c-cpp` added here, which needs a build command autobuild will not guess
-      # for a C file compiled by cgo. Until then, what covers the bridge is
-      # test/cbridge (with -Werror -Wall -Wextra -Wconversion) and its mutation
-      # check, not this job.
+      # The module's own dependencies. Without them the compile below fails on a
+      # missing security/pam_appl.h, which — because the build is `manual` — fails
+      # the job rather than quietly producing an empty database.
       - name: Install PAM and json-c headers
+        if: matrix.language == 'c-cpp'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libpam0g-dev libjson-c-dev
@@ -55,13 +76,24 @@ jobs:
       - name: Initialize CodeQL
         uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
         with:
-          languages: go
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
           queries: security-extended,security-and-quality
 
-      - uses: github/codeql-action/autobuild@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+      # Traced by the extractor, so this has to be the real compile line and not a
+      # convenience copy of it: `make build-pam` is what CI and release.yml run,
+      # -Werror -Wconversion and the hardening flags included. VERSION is passed
+      # rather than left to git describe so the stamp cannot fail the build here.
+      - name: Build the PAM module for the C extractor
+        if: matrix.language == 'c-cpp'
+        run: make build-pam VERSION=codeql GIT_COMMIT=codeql BUILD_DATE=codeql
 
       - name: Analyze
         uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          # One SARIF upload per language against the same commit, so each needs a
+          # category of its own or the second overwrites the first.
+          category: "/language:${{ matrix.language }}"
 
   # Relevant surface here: file modes on the enrollment store and audit log, the
   # exec.Command in the tier-2 mapper, and the AES-GCM usage in pkg/security.
@@ -166,8 +198,23 @@ jobs:
           toolchain=$(curl -fsSL 'https://go.dev/dl/?mode=json' \
             | jq -er --arg prefix "go${major}." \
                 '[.[] | select(.stable) | .version | select(startswith($prefix))] | first')
+
+          # The one value here that comes off the network, and it is about to be
+          # handed to the toolchain resolver. Insist on the exact shape of a Go
+          # release version before using it, so a changed feed or a response from
+          # something that is not go.dev fails this step rather than making
+          # GOTOOLCHAIN mean something nobody intended.
+          if ! printf '%s' "$toolchain" | grep -qE '^go[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+            echo "::error::go.dev returned '$toolchain', which is not a goX.Y.Z version"
+            exit 1
+          fi
+
           echo "go.mod pins go${major}; scanning with ${toolchain}"
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          # Pinned, like gosec and golangci-lint: @latest is a moving target
+          # fetched into a job that then reports on this repository's security, and
+          # every uses: in this file is pinned to a SHA for the same reason.
+          # dependabot does not read `go install` lines, so this one moves by hand.
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
           GOTOOLCHAIN="$toolchain" govulncheck ./...
 
   dependency-review:
@@ -182,7 +229,7 @@ jobs:
       - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: moderate
-          # This project is MIT and links a c-shared object into sshd's address
+          # This project is MIT and loads a shared object into sshd's address
           # space; a copyleft dependency arriving unnoticed is a licensing
           # problem, not a style preference.
           deny-licenses: GPL-2.0, GPL-3.0, AGPL-3.0

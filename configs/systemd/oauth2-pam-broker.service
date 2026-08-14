@@ -6,6 +6,11 @@ Wants=network.target
 
 [Service]
 Type=simple
+# No --log-level: the level comes from server.log_level in broker.yaml, which is
+# where an operator looks for it. Adding the flag here would override that file
+# and there would be nothing in it saying so — which is what happened before
+# v0.4.0, when server.log_level was read by nothing and the flag's default was the
+# only level this unit could ever log at.
 ExecStart=/usr/local/bin/oauth2-pam-broker --config /etc/oauth2-pam/broker.yaml
 Restart=always
 RestartSec=5s

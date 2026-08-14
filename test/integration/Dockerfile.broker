@@ -35,6 +35,13 @@ RUN mkdir -p /etc/fakegithub \
 
 COPY test/integration/broker.yaml /etc/oauth2-pam/broker.yaml
 
+# As of #58 the config's own mode is checked unconditionally, not only when a
+# secret is inline, so a COPY that lands 0644 stops the broker from starting. The
+# chmod is what a real deployment has to do too — the harness should need the same
+# thing an operator needs, or it stops being evidence about deployment.
+RUN chmod 0600 /etc/oauth2-pam/broker.yaml \
+ && chown root:root /etc/oauth2-pam/broker.yaml
+
 # The client secret lives in its own 0600 file, which is what broker.yaml points
 # at. Written here rather than COPYed so the mode is not whatever the repo
 # checkout happens to be: the broker refuses to read a secret out of a file other

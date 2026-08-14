@@ -50,6 +50,14 @@ var unixUsernameRe = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
 // DefaultMinUID is the floor applied when mapper.min_uid is unset. 1000 is the
 // first non-system UID on Debian, Ubuntu, RHEL 7+, and SUSE; UID_MIN in
 // /etc/login.defs is 1000 on all of them.
+//
+// There is no way to switch the floor off. A negative min_uid used to do that,
+// and config.Validate now refuses one: a site with real accounts below 1000 says
+// so by setting the floor to the lowest UID it means to allow, and a site with a
+// real person named after a service account uses mapper.allow_system_users, which
+// exempts a name from the denylist and not from the floor. New() clamps a negative
+// value it is handed to this default rather than honouring it, so the two agree
+// however the Config was built.
 const DefaultMinUID = 1000
 
 // systemAccounts are local accounts a provider identity may never be mapped to,
@@ -137,6 +145,20 @@ var errUserUnknown = errors.New("no such local user")
 func New(cfg config.MapperConfig) *Chain {
 	minUID := cfg.MinUID
 	if minUID == 0 {
+		// 0 is "unset", so a Config built in code rather than loaded from a file
+		// still gets the floor.
+		minUID = DefaultMinUID
+	}
+	if minUID < 0 {
+		// A negative min_uid was once how the floor was turned off. config.Validate
+		// rejects one now, so a loaded config cannot reach here — but a Config built
+		// in code can, and honouring it would leave a broker running with no floor
+		// and only the name denylist, which on an LDAP or SSSD host a broker built
+		// without cgo cannot even resolve a name against. Clamped to the default and
+		// said out loud, because the quiet version of this is a host that believes
+		// it has a floor.
+		log.Warn().Int("min_uid", cfg.MinUID).Int("using", DefaultMinUID).
+			Msg("mapper: a negative mapper.min_uid does not disable the UID floor; using the default")
 		minUID = DefaultMinUID
 	}
 	allowSystem := make(map[string]bool, len(cfg.AllowSystemUsers))
@@ -292,6 +314,18 @@ func (c *Chain) Map(ctx context.Context, id *provider.Identity, requestedLocalUs
 // --- Tier 0: enrollment file ---
 
 func mapViaEnrollment(path, localUser string, id *provider.Identity) *Result {
+	// An identity with no login has nothing for this tier to match on, and must not
+	// be allowed to try. Matching is case-insensitive, EqualFold("", "") is true,
+	// and so an enrollment record whose login: key is missing would answer for every
+	// such identity — a wildcard in the tier that outranks every other one. The
+	// store refuses to write a record like that and refuses to match one; this is
+	// the same rule on the identity side, where a provider that returned no login
+	// gets no tier 0 answer rather than the first empty record in the file.
+	if id.Login == "" {
+		log.Warn().Str("provider", id.Provider).Str("path", path).
+			Msg("mapper tier0: identity has no provider login; skipping enrollment tier")
+		return nil
+	}
 	store, err := enrollment.Load(path)
 	if err != nil {
 		log.Warn().Err(err).Str("path", path).Msg("mapper tier0: failed to load enrollment file")
@@ -404,6 +438,15 @@ func expandLocalUser(tmplStr string, id *provider.Identity) (string, error) {
 
 // --- Tier 2: external script ---
 
+// maxTierResultSize bounds what Tier 2 and Tier 3 may hand back. Both answer with
+// the same object: one local_user and a group list. A user in a thousand groups
+// is a few tens of KB, so 1 MB is generous, and neither reply is worth a byte more
+// than that — the alternative is buffering whatever the far side sends, which for
+// Tier 3 is a network service the broker does not control and for Tier 2 is a
+// process that may simply be looping on a write. A broker that runs out of memory
+// takes every OAuth login on the host with it.
+const maxTierResultSize = 1024 * 1024
+
 // scriptInput is the JSON sent to the external script on stdin, and posted to
 // the HTTP mapping service.
 //
@@ -462,12 +505,50 @@ func mapViaScript(ctx context.Context, scriptPath string, id *provider.Identity)
 		"HOME=/nonexistent",
 	}
 
-	out, err := cmd.Output()
-	if err != nil {
+	// cmd.Output() would buffer the whole of stdout, so a script that writes
+	// without stopping is a way to exhaust the broker's memory rather than merely
+	// fail its own tier.
+	out := &boundedBuffer{limit: maxTierResultSize}
+	cmd.Stdout = out
+	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("script %q: %w", scriptPath, err)
 	}
+	if out.overflowed {
+		return nil, fmt.Errorf("script %q: output exceeds the %d byte limit", scriptPath, maxTierResultSize)
+	}
 
-	return parseResult(out)
+	return parseResult(out.buf.Bytes())
+}
+
+// boundedBuffer collects up to limit bytes and discards the rest, recording that
+// it did.
+//
+// Discarding rather than returning a write error is deliberate: os/exec copies the
+// child's stdout through this writer and closes the pipe when the copy stops, so a
+// write error kills the script with SIGPIPE and cmd.Wait then reports that signal
+// — an operator would see a script that crashed rather than one that was told to
+// stop talking. Draining keeps the diagnosis honest, and the buffer is bounded
+// either way.
+type boundedBuffer struct {
+	limit      int
+	buf        bytes.Buffer
+	overflowed bool
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	total := len(p)
+	if room := b.limit - b.buf.Len(); room < total {
+		b.overflowed = true
+		if room < 0 {
+			room = 0
+		}
+		p = p[:room]
+	}
+	// bytes.Buffer.Write never fails, and the whole write is reported as accepted:
+	// a short count here would surface as io.ErrShortWrite from cmd.Wait, hiding
+	// the overflow behind a less true error.
+	_, _ = b.buf.Write(p)
+	return total, nil
 }
 
 // --- Tier 3: HTTP service ---
@@ -499,9 +580,15 @@ func mapViaHTTP(ctx context.Context, client *http.Client, endpoint string, id *p
 		return nil, fmt.Errorf("POST %s: unexpected status %d", endpoint, resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	// One byte past the limit is read so that a body at the limit still parses and
+	// one over it is refused by size, rather than reaching parseResult truncated
+	// and being reported as malformed JSON.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTierResultSize+1))
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
+	}
+	if len(body) > maxTierResultSize {
+		return nil, fmt.Errorf("POST %s: response exceeds the %d byte limit", endpoint, maxTierResultSize)
 	}
 
 	return parseResult(body)
@@ -621,7 +708,9 @@ func (c *Chain) checkLocalUser(tier, name string) error {
 			Msg("mapper: refusing to map an identity to UID 0")
 		return fmt.Errorf("%w: %s produced %q, which is UID 0", ErrForbiddenLocalUser, tier, name)
 	}
-	if c.minUID >= 0 && uid < c.minUID {
+	// Unconditional: minUID is always positive here (see New), so there is no
+	// value of mapper.min_uid that reaches this line with the floor switched off.
+	if uid < c.minUID {
 		log.Warn().Str("tier", tier).Str("local_user", name).Int("uid", uid).Int("min_uid", c.minUID).
 			Msg("mapper: refusing to map an identity to an account below the UID floor")
 		return fmt.Errorf("%w: %s produced %q (uid %d), below mapper.min_uid %d",

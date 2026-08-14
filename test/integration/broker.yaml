@@ -53,6 +53,5 @@ security:
 
 audit:
   enabled: true
-  format: json
   outputs:
     - type: stdout

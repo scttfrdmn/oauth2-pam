@@ -2,15 +2,19 @@ package github
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/scttfrdmn/oauth2-pam/pkg/config"
@@ -22,7 +26,8 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// realisticToken is long enough that tokenDisplayLabel actually elides it.
+// realisticToken has the length and shape of a real GitHub access token, so a
+// fingerprint of it is being asked to hide something worth hiding.
 const realisticToken = "gho_16C7e42F292c6912E7710c838347Ae178B4a"
 
 func providerConfig() config.ProviderConfig {
@@ -202,11 +207,52 @@ func TestRedirectsToOtherHostsAreRefused(t *testing.T) {
 	if err == nil {
 		t.Fatal("GetIdentity followed a cross-host redirect")
 	}
-	if !strings.Contains(err.Error(), "unconfigured host") {
+	if !strings.Contains(err.Error(), "unconfigured origin") {
 		t.Errorf("err = %v, want the redirect to be refused by name", err)
 	}
 	if elsewhereHit.Load() {
 		t.Error("the bearer token was sent to a host outside the configured endpoints")
+	}
+}
+
+// TestRedirectDowngradingToHTTPIsRefused: the host is not the whole of an
+// origin. net/http decides whether to keep the Authorization header by comparing
+// hostnames only, so an https→http redirect back to the same host carries the
+// live access token in cleartext to whoever is on the path. Pinning the hostname
+// alone let that through, while nextPageURL had pinned scheme and host all along.
+func TestRedirectDowngradingToHTTPIsRefused(t *testing.T) {
+	var cleartextHit atomic.Bool
+	cleartext := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cleartextHit.Store(true)
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("the access token was sent over plain http: %q", got)
+		}
+		_, _ = w.Write([]byte(`{"login":"attacker"}`))
+	}))
+	defer cleartext.Close()
+
+	// Both servers listen on 127.0.0.1, so the scheme is the only thing that
+	// differs between the configured endpoint and the redirect target — which is
+	// exactly the case a hostname comparison cannot see.
+	secure := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, cleartext.URL+"/user", http.StatusFound)
+	}))
+	defer secure.Close()
+
+	p := providerFor(t, secure.URL)
+	// The test server's certificate is signed by nothing in the trust store, so
+	// borrowing its client is the only way to drive a real https→http hop.
+	p.httpClient.Transport = secure.Client().Transport
+
+	_, err := p.getUser(context.Background(), realisticToken)
+	if err == nil {
+		t.Fatal("getUser followed a redirect that downgraded to http")
+	}
+	if !strings.Contains(err.Error(), "unconfigured origin") {
+		t.Errorf("err = %v, want the redirect to be refused for its origin", err)
+	}
+	if cleartextHit.Load() {
+		t.Error("the request was replayed over cleartext http")
 	}
 }
 
@@ -279,6 +325,79 @@ func TestStartDeviceFlowDefaultsPollingInterval(t *testing.T) {
 	}
 	if df.PollingInterval != 5 {
 		t.Errorf("PollingInterval = %d, want the 5s default", df.PollingInterval)
+	}
+}
+
+// TestDeviceCodeLifetimeIsClamped: expires_in is a number the provider chooses
+// and it becomes the pending session's deadline. Taken as given, an absent field
+// expired the login immediately, a value above ~9.2e9 overflowed int64
+// nanoseconds into a deadline in the past, and anything in between could hold a
+// session open for as long as the provider liked.
+func TestDeviceCodeLifetimeIsClamped(t *testing.T) {
+	tests := []struct {
+		name      string
+		expiresIn string
+		wantAtMost,
+		wantAtLeast time.Duration
+	}{
+		{"github's own value", "900", 15 * time.Minute, 14 * time.Minute},
+		{"absent", "0", defaultDeviceCodeLifetime, defaultDeviceCodeLifetime - time.Minute},
+		{"negative", "-1", defaultDeviceCodeLifetime, defaultDeviceCodeLifetime - time.Minute},
+		{"a week", "604800", maxDeviceCodeLifetime, maxDeviceCodeLifetime - time.Minute},
+		// Large enough that time.Duration(expires_in) * time.Second wraps.
+		{"overflowing", "9223372036854", maxDeviceCodeLifetime, maxDeviceCodeLifetime - time.Minute},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`{"device_code":"d","user_code":"U","verification_uri":"https://x/",` +
+					`"expires_in":` + tc.expiresIn + `}`))
+			}))
+			defer srv.Close()
+
+			df, err := providerFor(t, srv.URL).StartDeviceFlow(context.Background())
+			if err != nil {
+				t.Fatalf("StartDeviceFlow: %v", err)
+			}
+			lifetime := time.Until(df.ExpiresAt)
+			if lifetime > tc.wantAtMost || lifetime < tc.wantAtLeast {
+				t.Errorf("lifetime = %s, want between %s and %s", lifetime, tc.wantAtLeast, tc.wantAtMost)
+			}
+		})
+	}
+}
+
+// TestPollingIntervalIsClamped: the interval becomes the broker's poll ticker, so
+// an interval the size of a week is a flow that never makes progress while its
+// session and polling goroutine stay alive.
+func TestPollingIntervalIsClamped(t *testing.T) {
+	tests := []struct {
+		interval string
+		want     int
+	}{
+		{"5", 5},
+		{"0", defaultPollInterval},
+		{"-3", defaultPollInterval},
+		{"86400", maxPollInterval},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.interval, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`{"device_code":"d","user_code":"U","verification_uri":"https://x/",` +
+					`"expires_in":900,"interval":` + tc.interval + `}`))
+			}))
+			defer srv.Close()
+
+			df, err := providerFor(t, srv.URL).StartDeviceFlow(context.Background())
+			if err != nil {
+				t.Fatalf("StartDeviceFlow: %v", err)
+			}
+			if df.PollingInterval != tc.want {
+				t.Errorf("PollingInterval = %d, want %d", df.PollingInterval, tc.want)
+			}
+		})
 	}
 }
 
@@ -363,13 +482,13 @@ func TestPollSendsClientCredentialsAndDeviceCode(t *testing.T) {
 	if tok.AccessToken != realisticToken {
 		t.Errorf("AccessToken = %q", tok.AccessToken)
 	}
-	// The label is what reaches the logs, so it must be an elision rather than
-	// the token itself.
+	// The fingerprint is what reaches the logs and the session record, so it must
+	// be a digest rather than any part of the token itself.
 	if tok.Fingerprint == tok.AccessToken {
 		t.Error("Fingerprint is the raw token")
 	}
-	if strings.Contains(tok.Fingerprint, realisticToken) {
-		t.Error("Fingerprint contains the raw token")
+	if want := tokenFingerprint(realisticToken); tok.Fingerprint != want {
+		t.Errorf("Fingerprint = %q, want the token's digest %q", tok.Fingerprint, want)
 	}
 }
 
@@ -451,6 +570,50 @@ func TestGetIdentityRequiresUserEndpoint(t *testing.T) {
 
 	if _, err := providerFor(t, srv.URL).GetIdentity(context.Background(), &provider.Token{AccessToken: "gho_abc"}); err == nil {
 		t.Error("GetIdentity succeeded with a failing /user call")
+	}
+}
+
+// TestGetIdentityRefusesAnEmptyLogin: an empty login is not a useless value, it is
+// a wildcard, and the provider is where it enters the system (#80).
+//
+// A /user reply with no login is malformed — every GitHub account has one — and the
+// candidates are a GHES answering with an error body, a proxy rewriting the
+// response, and a decode landing on the zero value. Downstream, the empty string
+// matched an enrollment record whose own login was missing, in the most
+// authoritative mapping tier, so the pair ("", "") granted whichever local account
+// that record named. Store.Find, Store.Add and the mapper each refuse it now; this
+// is the check that stops it being produced in the first place.
+//
+// The bodies below are the shapes it actually arrives in: absent, explicitly empty,
+// and an object that is not a user at all but decodes into one.
+func TestGetIdentityRefusesAnEmptyLogin(t *testing.T) {
+	for name, body := range map[string]string{
+		"absent":        `{"id":1,"name":"Alice"}`,
+		"empty string":  `{"login":"","id":1}`,
+		"an error body": `{"message":"Bad credentials","documentation_url":"https://docs.github.com"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/user", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(body))
+			})
+			mux.HandleFunc("/user/orgs", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`[{"login":"acme"}]`))
+			})
+			mux.HandleFunc("/user/teams", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`[]`))
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+
+			id, err := providerFor(t, srv.URL).GetIdentity(context.Background(), &provider.Token{AccessToken: "gho_abc"})
+			if err == nil {
+				t.Fatalf("GetIdentity returned an identity with login %q for a /user reply naming none", id.Login)
+			}
+			if !strings.Contains(err.Error(), "login") {
+				t.Errorf("err = %q, want it to name the missing login", err)
+			}
+		})
 	}
 }
 
@@ -629,6 +792,118 @@ func TestPaginationStopsOnAnEmptyPage(t *testing.T) {
 	}
 }
 
+// TestPaginationStopsAtTheEntryLimit: nothing obliges a server to honour
+// per_page, so the page count alone did not bound what a walk accumulated — a
+// server returning thousands of tiny entries per page reached hundreds of
+// thousands of retained entries inside the twenty-page budget.
+func TestPaginationStopsAtTheEntryLimit(t *testing.T) {
+	const perPage = 500
+
+	var requests atomic.Int32
+	var base string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Link", `<`+base+`/user/orgs?per_page=100&page=2>; rel="next"`)
+		_, _ = w.Write([]byte(jsonList("org-%d", perPage, `{"login":"%s"}`)))
+	}))
+	defer srv.Close()
+	base = srv.URL
+
+	_, err := providerFor(t, srv.URL).getUserOrgs(context.Background(), "gho_abc")
+	if err == nil {
+		t.Fatal("getUserOrgs accepted an unbounded number of entries")
+	}
+	if !strings.Contains(err.Error(), "entries") {
+		t.Errorf("err = %v, want the entry limit named", err)
+	}
+	// The entry bound has to bite before the page bound, or it is not the thing
+	// stopping the walk.
+	if got := requests.Load(); got >= maxAPIPages {
+		t.Errorf("made %d requests, want fewer than the %d page budget", got, maxAPIPages)
+	}
+}
+
+// TestOversizedResponsesAreRefused: a response body is buffered before anything
+// knows how long it is, and every one of these bodies comes from the GitHub
+// instance rather than from this host. Without a ceiling, a hostile or broken
+// GHES exhausts the broker's memory and takes OAuth logins down host-wide.
+func TestOversizedResponsesAreRefused(t *testing.T) {
+	tests := []struct {
+		name  string
+		limit int
+		call  func(*Provider) error
+	}{
+		{"device authorization", maxAuthResponseSize, func(p *Provider) error {
+			_, err := p.StartDeviceFlow(context.Background())
+			return err
+		}},
+		{"token", maxAuthResponseSize, func(p *Provider) error {
+			_, err := p.PollDeviceAuthorization(context.Background(), "dev-code")
+			return err
+		}},
+		{"api", maxAPIResponseSize, func(p *Provider) error {
+			_, err := p.getUser(context.Background(), realisticToken)
+			return err
+		}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Valid JSON, in a field the adapter ignores: the body is refused for
+			// its size, not because it failed to parse.
+			body := `{"padding":"` + strings.Repeat("a", tc.limit+1024) + `"}`
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(body))
+			}))
+			defer srv.Close()
+
+			err := tc.call(providerFor(t, srv.URL))
+			if err == nil {
+				t.Fatalf("a %d byte response was accepted", len(body))
+			}
+			if !strings.Contains(err.Error(), "byte limit") {
+				t.Errorf("err = %v, want the response refused for its size", err)
+			}
+		})
+	}
+}
+
+// TestDecodeJSONBodyStopsReadingAtTheLimit is the "refused, not consumed" half of
+// the bound: the reader here never ends, so a decoder that drained its input
+// would never return at all.
+func TestDecodeJSONBodyStopsReadingAtTheLimit(t *testing.T) {
+	const limit = 4096
+
+	body := &countingReader{r: io.MultiReader(strings.NewReader(`{"login":"`), endlessReader{})}
+	var dest gitHubUser
+
+	err := decodeJSONBody(body, limit, &dest)
+	if err == nil {
+		t.Fatal("an endless body was accepted")
+	}
+	if !strings.Contains(err.Error(), "byte limit") {
+		t.Errorf("err = %v, want the body refused for its size", err)
+	}
+	// limit+1 is the whole budget: one byte past the limit is what proves the body
+	// was over it.
+	if body.n > limit+1 {
+		t.Errorf("read %d bytes, want at most %d", body.n, limit+1)
+	}
+}
+
+// A body that fits must still decode, or the bound has broken the common case.
+func TestDecodeJSONBodyAcceptsABodyAtTheLimit(t *testing.T) {
+	var dest gitHubUser
+
+	body := `{"login":"alice","name":"` + strings.Repeat("n", 100) + `"}`
+	if err := decodeJSONBody(strings.NewReader(body), int64(len(body)), &dest); err != nil {
+		t.Fatalf("decodeJSONBody: %v", err)
+	}
+	if dest.Login != "alice" {
+		t.Errorf("Login = %q, want alice", dest.Login)
+	}
+}
+
 func TestParseNextLink(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -776,17 +1051,41 @@ func TestRevokeAccessTokenReportsFailure(t *testing.T) {
 	}
 }
 
-func TestTokenDisplayLabelDoesNotRevealTheToken(t *testing.T) {
-	label := tokenDisplayLabel(realisticToken)
-	if strings.Contains(label, realisticToken) {
-		t.Error("the label contains the whole token")
+// TestTokenFingerprintRetainsNothingOfTheToken: the label this replaced was
+// prefix…suffix, so it carried 16 bytes of a live secret into the session record
+// and would have carried them into the first log line that printed it.
+func TestTokenFingerprintRetainsNothingOfTheToken(t *testing.T) {
+	fp := tokenFingerprint(realisticToken)
+
+	sum := sha256.Sum256([]byte(realisticToken))
+	if want := hex.EncodeToString(sum[:16]); fp != want {
+		t.Errorf("fingerprint = %q, want %q", fp, want)
 	}
-	if !strings.Contains(label, "...") {
-		t.Errorf("label = %q, want an elided form", label)
+
+	// Every substring of the token long enough to be useful must be absent — the
+	// eight-byte head and tail of the old label above all.
+	for n := 4; n <= len(realisticToken); n++ {
+		if strings.Contains(fp, realisticToken[:n]) {
+			t.Errorf("fingerprint contains the token's first %d bytes", n)
+		}
+		if strings.Contains(fp, realisticToken[len(realisticToken)-n:]) {
+			t.Errorf("fingerprint contains the token's last %d bytes", n)
+		}
 	}
-	// Short strings cannot be elided meaningfully; they are returned as-is.
-	if got := tokenDisplayLabel("short"); got != "short" {
-		t.Errorf("tokenDisplayLabel(short) = %q", got)
+
+	// A short token is hashed like any other: returning it as-is, as the old
+	// label did, hands over the whole secret.
+	if got := tokenFingerprint("short"); got == "short" {
+		t.Error("a short token was returned in the clear")
+	}
+
+	// Stable for one token and distinct between two, or it cannot identify a
+	// token in an audit trail.
+	if tokenFingerprint(realisticToken) != fp {
+		t.Error("the fingerprint is not stable")
+	}
+	if tokenFingerprint(realisticToken+"x") == fp {
+		t.Error("two different tokens share a fingerprint")
 	}
 }
 
@@ -805,6 +1104,29 @@ func providerFor(t *testing.T, baseURL string) *Provider {
 		t.Fatalf("NewWithEndpoints: %v", err)
 	}
 	return p
+}
+
+// endlessReader is a body that never ends: it always has more of a JSON string
+// to hand over.
+type endlessReader struct{}
+
+func (endlessReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'a'
+	}
+	return len(p), nil
+}
+
+// countingReader records how much of the wrapped reader was actually consumed.
+type countingReader struct {
+	r io.Reader
+	n int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += n
+	return n, err
 }
 
 func jsonDecode(r *http.Request, dest interface{}) error {

@@ -45,7 +45,8 @@ type AuditLogger struct {
 	config config.AuditConfig
 	// enabledEvents is the audit.events allowlist. A nil map means "no filter
 	// configured", which allows every event — an empty allowlist that silently
-	// discarded the entire audit trail would be a trap.
+	// discarded the entire audit trail would be a trap. criticalAuditEvents are
+	// exempt however it is set, for the same reason.
 	enabledEvents map[string]struct{}
 	outputs       []AuditOutput
 	// writeMu serializes writes to the outputs. Critical events are written on the
@@ -60,7 +61,8 @@ type AuditLogger struct {
 }
 
 // FilteredEvents returns the number of events not written because their type
-// was absent from the audit.events allowlist.
+// was absent from the audit.events allowlist. No access decision is ever counted
+// here; those are not filterable.
 func (al *AuditLogger) FilteredEvents() uint64 {
 	return al.filteredCount.Load()
 }
@@ -95,6 +97,34 @@ func NewAuditLogger(cfg config.AuditConfig) (*AuditLogger, error) {
 		outputs = append(outputs, &stdoutOutput{})
 	}
 
+	return &AuditLogger{
+		config:        cfg,
+		enabledEvents: buildEventFilter(cfg.Events),
+		outputs:       outputs,
+		eventChan:     make(chan AuditEvent, 1000),
+		stopChan:      make(chan struct{}),
+	}, nil
+}
+
+// NewAuditLoggerWithOutputs creates an AuditLogger that writes to sinks the caller
+// supplies, instead of to the ones audit.outputs describes. cfg still supplies the
+// event allowlist; it must have Enabled set, and at least one output is required,
+// because a logger with neither would discard everything in silence.
+//
+// It exists for the reason auth.NewBrokerWithProviders exists: the behaviour worth
+// testing here is what a *caller* does when an access decision cannot be written
+// down, and no audit.outputs value can express a sink that fails. Every output type
+// the config can name either works, or fails when the logger is constructed and so
+// never reaches a caller at all. A broker that must fail a login when the audit
+// record does not land needs a sink that accepts the logger and then refuses the
+// write.
+func NewAuditLoggerWithOutputs(cfg config.AuditConfig, outputs ...AuditOutput) (*AuditLogger, error) {
+	if !cfg.Enabled {
+		return nil, fmt.Errorf("audit logger with explicit outputs requires audit.enabled")
+	}
+	if len(outputs) == 0 {
+		return nil, fmt.Errorf("at least one audit output is required")
+	}
 	return &AuditLogger{
 		config:        cfg,
 		enabledEvents: buildEventFilter(cfg.Events),
@@ -144,7 +174,8 @@ func (al *AuditLogger) Stop() error {
 
 // criticalAuditEvents are the events that record an access decision. They are
 // written on the calling goroutine rather than queued, so they cannot be lost to
-// a full channel or to the process dying with events still buffered.
+// a full channel or to the process dying with events still buffered, and they are
+// not subject to the audit.events allowlist.
 //
 // The buffered channel is the right default for volume — a flood of attempts must
 // not slow authentication down — but it is the wrong default for the handful of
@@ -161,18 +192,45 @@ var criticalAuditEvents = map[string]struct{}{
 	"session_revoked":        {},
 }
 
-// LogAuthEvent records an audit event. Events whose type is not in the configured
-// audit.events allowlist are discarded here. Access decisions
-// (criticalAuditEvents) are written synchronously; everything else is queued for
-// the background dispatcher and may be dropped if that queue is full.
+// LogAuthEvent records an audit event, reporting a failure to write a critical one
+// to the log and nowhere else. It is LogAuthEventErr for callers that have nothing
+// to do with the error; prefer LogAuthEventErr on any path that grants access,
+// where "the decision was not recorded" is a fact the decision should turn on.
 func (al *AuditLogger) LogAuthEvent(event AuditEvent) {
-	if !al.config.Enabled {
-		return
+	if err := al.LogAuthEventErr(event); err != nil {
+		log.Error().Err(err).Str("event_type", event.EventType).
+			Msg("Audit record of an access decision was not written")
 	}
-	if al.enabledEvents != nil {
+}
+
+// LogAuthEventErr records an audit event and returns the error from writing a
+// critical one.
+//
+// Access decisions (criticalAuditEvents) are written synchronously and are not
+// filterable. Everything else is checked against the audit.events allowlist,
+// counted if it is discarded, and otherwise queued for the background dispatcher,
+// where it may still be dropped if the queue is full.
+//
+// A returned error therefore means one thing: an event recording an access
+// decision reached none of its sinks. Queued events return nil — they have not
+// been written yet.
+func (al *AuditLogger) LogAuthEventErr(event AuditEvent) error {
+	if !al.config.Enabled {
+		return nil
+	}
+
+	// The allowlist is applied after this lookup, not before it. audit.events is a
+	// volume control, and a critical event is not something an operator gets to turn
+	// down: with the filter first, an audit.events that omitted
+	// authentication_success produced a broker that granted logins and recorded
+	// nothing, with a filteredCount as the only trace. Which is the shape of a
+	// deliberately blinded host as much as a misconfigured one.
+	_, critical := criticalAuditEvents[event.EventType]
+
+	if !critical && al.enabledEvents != nil {
 		if _, ok := al.enabledEvents[event.EventType]; !ok {
 			al.filteredCount.Add(1)
-			return
+			return nil
 		}
 	}
 	if event.Timestamp.IsZero() {
@@ -182,9 +240,8 @@ func (al *AuditLogger) LogAuthEvent(event AuditEvent) {
 		event.EventID = fmt.Sprintf("audit_%d", time.Now().UnixNano())
 	}
 
-	if _, critical := criticalAuditEvents[event.EventType]; critical {
-		al.writeEvent(event)
-		return
+	if critical {
+		return al.writeEvent(event)
 	}
 
 	select {
@@ -193,6 +250,7 @@ func (al *AuditLogger) LogAuthEvent(event AuditEvent) {
 		n := al.droppedCount.Add(1)
 		log.Warn().Uint64("total_dropped", n).Msg("Audit event channel full, dropping event")
 	}
+	return nil
 }
 
 func (al *AuditLogger) processEvents(ctx context.Context) {
@@ -206,30 +264,48 @@ func (al *AuditLogger) processEvents(ctx context.Context) {
 			for {
 				select {
 				case event := <-al.eventChan:
-					al.writeEvent(event)
+					// Only non-critical events are ever queued, and writeEvent has
+					// already logged whatever went wrong. There is no caller left here
+					// to return it to.
+					_ = al.writeEvent(event)
 				default:
 					return
 				}
 			}
 		case event := <-al.eventChan:
-			al.writeEvent(event)
+			_ = al.writeEvent(event)
 		}
 	}
 }
 
-func (al *AuditLogger) writeEvent(event AuditEvent) {
+// writeEvent writes event to every sink and returns the first failure.
+//
+// It used to log a failure and return nothing, which for a critical event meant a
+// full disk turned a granted login into a login recorded nowhere — the audit trail
+// missing exactly the record an incident would be reconstructed from, and the
+// caller unaware. The failure now travels back to LogAuthEventErr and from there to
+// whoever made the access decision.
+//
+// Every sink is attempted whatever the earlier ones did: a broken file output must
+// not cost the record on syslog as well.
+func (al *AuditLogger) writeEvent(event AuditEvent) error {
 	data, err := json.Marshal(event)
 	if err != nil {
 		log.Error().Err(err).Str("event_type", event.EventType).Msg("Failed to marshal audit event")
-		return
+		return fmt.Errorf("marshal audit event %s: %w", event.EventType, err)
 	}
 	al.writeMu.Lock()
 	defer al.writeMu.Unlock()
+	var firstErr error
 	for _, out := range al.outputs {
 		if err := out.Write(data); err != nil {
 			log.Error().Err(err).Str("event_type", event.EventType).Msg("Failed to write audit event")
+			if firstErr == nil {
+				firstErr = fmt.Errorf("write audit event %s: %w", event.EventType, err)
+			}
 		}
 	}
+	return firstErr
 }
 
 // --- output implementations ---

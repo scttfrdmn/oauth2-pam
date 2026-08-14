@@ -90,7 +90,7 @@ func testConfig(socket string) *config.Config {
 	return &config.Config{
 		Server: config.ServerConfig{
 			SocketPath:   socket,
-			LogLevel:     "disabled",
+			LogLevel:     "info",
 			ReadTimeout:  5 * time.Second,
 			WriteTimeout: 5 * time.Second,
 		},

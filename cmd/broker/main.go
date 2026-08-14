@@ -23,8 +23,12 @@ var (
 )
 
 var (
-	configPath  = flag.String("config", "/etc/oauth2-pam/broker.yaml", "Path to configuration file")
-	logLevel    = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
+	configPath = flag.String("config", "/etc/oauth2-pam/broker.yaml", "Path to configuration file")
+	// The flag overrides server.log_level, and only when it is actually given —
+	// see the call after LoadConfig. Its default is what the startup lines before
+	// the config has been read are logged at.
+	logLevel = flag.String("log-level", "info", "Log level (debug, info, warn, error); overrides server.log_level")
+
 	showVersion = flag.Bool("version", false, "Show version information")
 )
 
@@ -52,6 +56,17 @@ func main() {
 	}
 	if err := cfg.Validate(); err != nil {
 		log.Fatal().Err(err).Msg("Invalid configuration")
+	}
+
+	// server.log_level applies from here on. It could not be applied earlier —
+	// nothing knows what it says until the config has been read — so the lines
+	// above are at the flag's default, and the flag wins outright when it was given
+	// on the command line: --log-level=debug is for one run of a broker whose
+	// config says info, and it would be no use if the config could take it back.
+	// Until v0.4.0 there was no override to speak of, because server.log_level was
+	// read by nothing and the flag was the only input.
+	if !flagWasGiven("log-level") && cfg.Server.LogLevel != "" {
+		setupLogging(cfg.Server.LogLevel)
 	}
 
 	// Where each secret came from, never the secret. An operator who has just
@@ -115,6 +130,19 @@ func main() {
 	case <-time.After(30 * time.Second):
 		log.Warn().Msg("Shutdown timeout exceeded, forcing exit")
 	}
+}
+
+// flagWasGiven reports whether the named flag appeared on the command line, as
+// opposed to sitting at its default. flag.Visit walks only what was set, which is
+// the difference between "the operator asked for info" and "nobody said".
+func flagWasGiven(name string) bool {
+	given := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			given = true
+		}
+	})
+	return given
 }
 
 func setupLogging(level string) {

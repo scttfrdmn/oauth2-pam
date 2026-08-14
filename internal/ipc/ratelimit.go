@@ -42,6 +42,29 @@ func callerKey(uid uint32, known bool) string {
 // login spends 12 requests a minute, so a handful of concurrent logins hit the
 // default ceiling and the next poll came back RATE_LIMITED, which the module
 // treated as terminal and the login died.
+//
+// What this scheme protects, and what it does not:
+//
+// An *established* session is genuinely protected. Its window already exists, so
+// neither a full limiter map nor another caller's traffic can take it away —
+// TestEstablishedSessionPollsSurviveAnUnknownSessionFlood and
+// TestLegitimatePollSequenceIsNeverRateLimited hold that down.
+//
+// A *new* session can be starved, and that is accepted rather than fixed. A verb
+// naming a session with no live window is charged to the per-caller
+// newSessionLimiter before the per-session limiter is consulted, and every
+// legitimate login's first poll needs that same charge. So a caller sending
+// ~10 requests a second with invented session IDs exhausts the per-caller bucket
+// and new logins fail at their deadline while in-flight ones keep working. The
+// module's backoff is correct and does not help: the bucket is empty for everyone.
+//
+// It is left this way because the attacker here is already root — the socket is
+// root-only, and a caller that can send 10 req/s to it can equally send SIGKILL
+// to the broker. Every alternative examined either removed the bound that keeps
+// the limiter map from growing per invented key, or made the per-caller bucket
+// distinguish callers that are all sshd, which peer credentials cannot do. Stated
+// here so a reader does not infer from "polls are bucketed per session" a
+// guarantee about logins that do not have a session yet. See #84.
 func sessionKey(sessionID string) string {
 	return "session:" + sessionID
 }

@@ -97,6 +97,11 @@ Examples:
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
 			}
+			// The broker will not start on a config that fails this, so enrolling
+			// against one would write a record for a host that cannot serve it.
+			if err := cfg.Validate(); err != nil {
+				return fmt.Errorf("invalid config %s: %w", cfgPath, err)
+			}
 
 			enrollFile := cfg.Mapper.EnrollmentFile
 			if enrollFile == "" {
@@ -248,6 +253,16 @@ func runEnroll(localUser, providerName string, groups []string, enrollFile strin
 	identity, err := prov.GetIdentity(ctx, token)
 	if err != nil {
 		return fmt.Errorf("get provider identity: %w", err)
+	}
+
+	// An identity with no login is a provider error, not something to record. The
+	// login is one half of what tier 0 matches on; writing an empty one produces a
+	// record that matches any identity that also arrives without a login, which is a
+	// wildcard for this local account. Store.Add refuses it too — this check is here
+	// so the operator is told the provider was at fault rather than the record.
+	if identity.Login == "" {
+		return fmt.Errorf("%s returned an identity with no login, so there is nothing to enroll %q against",
+			prov.Name(), localUser)
 	}
 
 	// Write enrollment record

@@ -7,6 +7,314 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+A third adversarial review round, on a tree that had already survived two. It found
+27 things, which is the argument for keeping the rounds going rather than declaring
+the code reviewed: three of them were fail-**open** reads of the field that decides a
+login, and none of the three were reachable by the previous rounds' methods.
+
+**Upgrade notes.** `broker.yaml` must be mode 0600 regardless of where the client
+secret lives — the check used to apply only when the secret was inline, which left
+the file holding the token-encryption key unchecked in every deployment that did the
+right thing with its secret. A deployment relying on the old behaviour will refuse to
+start until it is chmodded; the error names the file and the command. A negative
+`mapper.min_uid` is also now rejected rather than silently disabling the UID floor.
+
+### Fixed
+
+- **`"success":"false"` read as true in the C module.** `json_object_get_boolean`
+  coerces: any non-empty string and any non-zero number is true. So the one field the
+  module consults to decide whether a login succeeded accepted a *string* `"false"`
+  as a grant. The field is now type-checked against `json_type_boolean` strictly, and
+  anything else is a parse failure rather than a value. The careful version of this
+  read was already sitting four lines below it, on `poll_interval` — which is the
+  useful lesson: the same file got it right where the stakes were lower.
+  ([#60](https://github.com/scttfrdmn/oauth2-pam/issues/60))
+
+- **A per-syscall receive timeout is not a per-message one.** `SO_RCVTIMEO` bounds
+  each `recv()`, so a broker drip-feeding one byte at a time reset the clock on every
+  byte and could hold a login open far past the deadline the module believed it had
+  set. The budget is now read off the socket once and decremented across the whole
+  transfer, so it bounds the message.
+  ([#57](https://github.com/scttfrdmn/oauth2-pam/issues/57))
+
+- **The device-flow poll had no deadline.** It ran on a cancel-only context, so
+  nothing but the client hanging up ended it.
+  ([#55](https://github.com/scttfrdmn/oauth2-pam/issues/55))
+
+- **An expired session could still be activated.** The compare-and-swap that
+  activates a session tested its status and creation time but never `ExpiresAt` — so
+  it succeeded on an already-expired session, and the mutation that followed rewrote
+  the expiry into the future. Expiry is now part of the CAS.
+  ([#55](https://github.com/scttfrdmn/oauth2-pam/issues/55))
+
+- **The concurrent-session cap could be overshot by any number of simultaneous
+  logins.** Sessions were counted under a read lock, the lock released, and the new
+  session inserted afterwards — so N calls arriving together all read the same count
+  and all inserted. Counting and insertion now happen under one write lock, via a
+  placeholder reservation.
+  ([#59](https://github.com/scttfrdmn/oauth2-pam/issues/59))
+
+- **A deadline-aborted provider call was retried as transient.**
+  `context.DeadlineExceeded` satisfies `net.Error`, so the classifier that decides
+  what is worth retrying could not tell "the network is flaky" from "we ran out of
+  time", and retried the second as if it were the first.
+  ([#79](https://github.com/scttfrdmn/oauth2-pam/issues/79))
+
+- **The QR code was on the wire twice, and a long provider URL overflowed the
+  client's buffer.** The art was serialized inside `instructions` and again in
+  `qr_code`, which made the real github.com baseline 4.9 KB rather than the "2–3 KiB"
+  this project had documented — and a 300-byte `verification_uri` reached 17.6 KB,
+  past the module's 16 KiB `MAX_RESPONSE_SIZE`, where `strncpy` truncates in silence
+  and the client is left with an object it cannot parse. The art is now serialized
+  once, the URL it is drawn from is bounded at 200 bytes, and the broker holds itself
+  to the same 16 KiB cap it expects of a client, substituting `RESPONSE_TOO_LARGE`
+  rather than writing a reply that cannot be read. Worth recording that the size
+  ceiling depends on the *encoder's mode*: an uppercase-and-digits URL gets
+  alphanumeric mode with a much larger capacity, so a 3 KB URL still encodes, and a
+  byte-mode-only reading of the limits understates the dangerous band by a kilobyte.
+  ([#56](https://github.com/scttfrdmn/oauth2-pam/issues/56))
+
+- **Checking a path is not checking the bytes read from it.** Secret loading did
+  `os.Stat` and then `os.ReadFile` — two resolutions of the same name, with a window
+  between them. It now opens with `O_NOFOLLOW` and stats the *file descriptor*, so the
+  permissions checked belong to the bytes returned.
+  ([#58](https://github.com/scttfrdmn/oauth2-pam/issues/58))
+
+- **A file-mode check is defeated by a writable directory.** Anyone who can write the
+  containing directory can rename a compliant file out and a hostile one in, whatever
+  the mode on the original. The directory is now checked too, with the sticky-bit case
+  exempted and the reason stated where the exemption is made.
+  ([#58](https://github.com/scttfrdmn/oauth2-pam/issues/58))
+
+- **Two of three secret sources skipped the config-file permission check.** Only the
+  inline branch checked `broker.yaml` itself, so a deployment that moved its client
+  secret into a file or the environment — the recommended practice — lost the check on
+  the file that still holds the token-encryption key. It is now unconditional.
+  ([#58](https://github.com/scttfrdmn/oauth2-pam/issues/58))
+
+- **An empty GitHub `login` was a wildcard.** An enrollment lookup for `""` matched,
+  which is the wrong answer to a malformed API response. Refused in `Store.Find`,
+  `Store.Add`, the mapper, the enroll CLI, and — the place the empty value actually
+  enters the system — the GitHub adapter's `getUser`.
+  ([#80](https://github.com/scttfrdmn/oauth2-pam/issues/80))
+
+- **A failed audit write on the grant path now fails the login.** There is exactly one
+  place in the broker where a session becomes usable for a login, and the
+  `authentication_success` record written there was discarding its error — so a full
+  disk produced an authenticated session with no trail of it, which is the outcome an
+  audit log exists to prevent. That site now uses `LogAuthEventErr` and, if the write
+  fails, withdraws the activation it had just made: the token is revoked, the session
+  is marked terminally errored, and the polling client is told the login failed. The
+  five sites recording a denial, a failure or an attempt deliberately still discard —
+  a lost refusal record is a gap in the trail, not an unlogged access — and each now
+  says so in a comment, because the distinction is the whole point.
+  ([#69](https://github.com/scttfrdmn/oauth2-pam/issues/69))
+
+- **`session_revoked` claimed success for a user it could not name.** Revoking a
+  *pending* session emitted `Success: true` with an empty `UserID`, which reads as
+  "someone's session was revoked successfully" with nothing to correlate it to. A
+  pending session has no authenticated user, so the record now says that: success is
+  false, the reason states no local user was ever established, the status that was
+  revoked and the account the client *asked* for are in metadata — the latter in
+  metadata rather than `UserID` precisely because the client chose it and the broker
+  never confirmed it. An authorized session still records the real user.
+  ([#69](https://github.com/scttfrdmn/oauth2-pam/issues/69))
+
+- **The two capacity refusals disagreed about what they were.** `SESSION_LIMIT_REACHED`
+  arrived as `status: "denied"` and `AUTH_LIMIT_REACHED` as `status: "error"`, and the
+  specification supported both readings. They are now both `error`. A capacity refusal
+  is a statement about the broker's load, not a judgement about the identity: the user
+  was not denied, the broker declined to try. This is not cosmetic — the C module maps
+  `denied` to `PAM_AUTH_ERR` and `error` to `PAM_AUTHINFO_UNAVAIL`, so under the old
+  behaviour a host that was merely full told PAM the credentials were bad.
+  ([#84](https://github.com/scttfrdmn/oauth2-pam/issues/84))
+
+- **The `audit.events` allowlist filtered before the critical-event check.** The
+  events that exist specifically to be undroppable were dropped by any allowlist that
+  did not happen to name them. The critical check now runs first.
+  ([#69](https://github.com/scttfrdmn/oauth2-pam/issues/69))
+
+- **`CheckRedirect` compared only the hostname**, while the pagination code in the
+  same package pinned scheme, host and port. Both now pin `scheme://hostname`, so a
+  redirect cannot downgrade the transport.
+  ([#63](https://github.com/scttfrdmn/oauth2-pam/issues/63))
+
+- **Nothing bounded a provider's pagination.** `per_page` is a request, not a
+  guarantee, and no code checked that a server honoured it — so 20 pages inside a 1 MB
+  per-response limit was hundreds of thousands of retained org and team entries. The
+  bound is now on entries, not pages.
+  ([#62](https://github.com/scttfrdmn/oauth2-pam/issues/62))
+
+- **`user_agent` and `device_id` were unbounded and unvalidated,** and `metadata` was
+  checked for NUL bytes and nothing else. Every request field now goes through one
+  table with an explicit limit, so adding a field without bounding it takes a
+  deliberate omission rather than an oversight.
+  ([#67](https://github.com/scttfrdmn/oauth2-pam/issues/67))
+
+- **An over-cap request body was reported as "unexpected EOF",** which tells a client
+  its serialization is broken when the actual problem is size — and a client told that
+  will not go looking at how much it sent.
+  ([#67](https://github.com/scttfrdmn/oauth2-pam/issues/67))
+
+- **A git tag interpolated into a `run:` block is shell injection.** Release workflow
+  steps built commands with `${{ steps.vars.outputs.* }}` derived from the pushed tag;
+  those values now arrive via `env:` and are quoted.
+  ([#70](https://github.com/scttfrdmn/oauth2-pam/issues/70))
+
+- **The installer passed the generated token-encryption key in argv,** where
+  `/proc/<pid>/cmdline` is world-readable for the life of the process — so every local
+  account could read the key of a broker being installed. It is now fed to
+  `sed -i -f -` over a pipe.
+  ([#77](https://github.com/scttfrdmn/oauth2-pam/issues/77))
+
+- **The symbol check in the installer matched a substring,** so it could report
+  entry points present that were not, and it silently skipped itself when `nm` was
+  absent. One shared `scripts/verify-pam-symbols.sh` now does it per symbol, and four
+  divergent copies of that loop are gone.
+  ([#76](https://github.com/scttfrdmn/oauth2-pam/issues/76))
+
+- **The admin client reported a pending device flow as a successful test.** `TestAuth`
+  switched on the wrong field; it now requires the `check_session` result to have
+  actually succeeded, and it sends and checks `protocol_version` like every other
+  client of this contract.
+  ([#83](https://github.com/scttfrdmn/oauth2-pam/issues/83))
+
+- **The integration harness could not start the broker after the permission fix.**
+  Its `broker.yaml` was `COPY`ed and landed 0644, so all 11 cases failed at "the
+  broker never created its socket". Found by running the harness against the collapsed
+  tree — no single remediation branch could have seen it. The fix is a `chmod` in
+  `Dockerfile.broker`, which is exactly what an operator now has to do, and that is
+  the point of having a harness.
+
+### Changed
+
+- **The PAM module is plain C. The Go runtime is no longer loaded into `sshd`.** It was
+  built with `go build -buildmode=c-shared`, which links the entire Go runtime into
+  every process that loads the module — and the runtime installs its own signal
+  handlers over the ones its host process had already set, so the thing being
+  reconfigured was `sshd`'s signal handling. The module has no Go logic to justify any
+  of that: all of its behaviour was already in `cgo_bridge_linux.c`, and the two Go
+  files were a shim to make cgo compile it. They are deleted, the module is built by a
+  direct `cc -shared -fPIC` invocation, and the shipped object went from **1.2 MB to
+  73 KB**. Verified same-host, before and after: every mitigation is intact
+  (`BIND_NOW`, `GNU_RELRO`, `__stack_chk_fail` and the `_chk` fortify symbols), all six
+  `pam_sm_*` entry points are exported, and there are now zero Go runtime symbols in
+  the object. Two dynamic flags did change and neither is a lost mitigation — `SYMBOLIC`
+  had nothing left to do once everything but the entry points is `static`, and
+  `NODELETE` existed only because the Go runtime cannot be unloaded, so losing it means
+  PAM can `dlclose` the module again, which is correct.
+  ([#65](https://github.com/scttfrdmn/oauth2-pam/issues/65))
+
+- **CodeQL analyses the C.** It could not before: the bridge was compiled by cgo, and
+  the scanner ran with `languages: go`, so the most security-sensitive code in the
+  repository was the only code no scanner read. The plain `cc` line made a `c-cpp`
+  database possible, and there is now one with a real build command. Note the two
+  earlier changelog entries describing CodeQL as covering "the Go half of
+  `cmd/pam-module`" are left as written — they were accurate for the releases they
+  describe, and there is no Go half any more.
+  ([#38](https://github.com/scttfrdmn/oauth2-pam/issues/38))
+
+- **The C module is compiled with hardening flags**: stack protector, RELRO with
+  `BIND_NOW`, and `_FORTIFY_SOURCE=2`. Level 2 rather than 3 deliberately — 3 needs
+  gcc 12 with glibc 2.35, and on older enterprise distributions `features.h` emits a
+  `#warning` that `-Werror` turns into a failed build. `-fcf-protection` is omitted
+  for the same class of reason: it is x86-only and breaks the aarch64 build. Verified
+  empirically on both architectures: `readelf` reports `SYMBOLIC BIND_NOW`, a
+  `GNU_RELRO` segment and `__stack_chk_fail` after the change, and neither RELRO nor
+  any `_chk` symbol before it.
+  ([#64](https://github.com/scttfrdmn/oauth2-pam/issues/64))
+
+- **`Token.Fingerprint` is a real fingerprint** — `hex(sha256(token)[:16])` — rather
+  than an elided slice of the token itself. A prefix of a credential in a log is a
+  prefix of a credential.
+  ([#82](https://github.com/scttfrdmn/oauth2-pam/issues/82))
+
+- **A zoned IPv6 literal is handled rather than rejected.** `fe80::1%eth0` fits the
+  field's 45-byte bound and is the one address shape a well-meaning validator breaks,
+  because `inet_pton` and `net.ParseIP` both fail on the zone. The zone is now split
+  off and validated separately.
+  ([#61](https://github.com/scttfrdmn/oauth2-pam/issues/61))
+
+- **`log-level` and `audit.format` were parsed and ignored.** `log-level` is now
+  honoured and validated against the levels that exist; `audit.format` is deleted
+  rather than kept as a field that does nothing. `server.*_timeout` is capped at five
+  minutes, since a longer one cannot help a login that lives inside sshd's
+  `LoginGraceTime`.
+  ([#72](https://github.com/scttfrdmn/oauth2-pam/issues/72),
+  [#73](https://github.com/scttfrdmn/oauth2-pam/issues/73))
+
+- **The UID floor can no longer be switched off.** A negative `mapper.min_uid` used to
+  disable it, documented as a feature. It is now a startup error, and the floor check
+  itself is unconditional rather than guarded on the value being non-negative — the
+  guard was the actual mechanism, and rejecting the config while leaving the guard in
+  place would have fixed only the paths that load config from a file. A `Config` built
+  in code with a negative value clamps to the default, with a warning.
+  ([#81](https://github.com/scttfrdmn/oauth2-pam/issues/81))
+
+- **`error_message` no longer carries provider-chosen text to the client.** Provider
+  strings reaching a prompt that root draws before authentication is the defect class
+  this project already fixed once; the same rule now applies to the error field.
+  ([#74](https://github.com/scttfrdmn/oauth2-pam/issues/74))
+
+- **The specification's claim that an over-size request is "refused before it is
+  decoded" was corrected rather than implemented.** No implementation of this framing
+  can honour it, and none did: a request is a bare JSON object with no length prefix,
+  so nothing announces its size in advance and a receiver learns a body is too long
+  only by reaching the cap while reading it. What the cap guarantees is the
+  allocation, not the ordering — and version 1 now says which of the two failed,
+  because a body truncated at the cap looks to a parser like malformed input.
+  ([#67](https://github.com/scttfrdmn/oauth2-pam/issues/67))
+
+### Added
+
+- **`pam_sm_acct_mgmt` does something.** It returned `PAM_SUCCESS` unconditionally, so
+  a session revoked after login, an enrollment deleted, or an org membership lost was
+  not caught at the account stage — the stage that exists to ask "is this account still
+  allowed?". It now sends `check_session` and maps the answer: authorized *and* naming
+  the same user → success; any terminal status, including `SESSION_NOT_FOUND` → denied,
+  because "I have no record of this session" must not be a pass; a transport failure or
+  an unparseable reply → `PAM_AUTHINFO_UNAVAIL`. With **no** stored session it answers
+  `PAM_IGNORE`, not success: the module is being asked about a login it did not
+  authenticate, and approving an account it knows nothing about is fail-open in exactly
+  the stacked configuration a real deployment is most likely to have.
+
+  The session id reaches the account stage through `pam_set_data`, stored only after the
+  username check passes. That handoff cannot be unit-tested — `pam_set_data` refuses to
+  run outside a service module — so the integration harness's account stage is now the
+  real module rather than `pam_permit.so`, which makes every passing login there proof
+  that the handoff works, and a new case covers the no-session path. The
+  `PAM_IGNORE` → `PAM_SUCCESS` mutation is checked by the harness, since nothing in the
+  C suite could catch it.
+  ([#75](https://github.com/scttfrdmn/oauth2-pam/issues/75))
+
+- **The QR code renders again.** Removing the duplicated art from `instructions` (see
+  #56 above) left the module rendering the one field the art was no longer in, so for a
+  short window on `main` no QR appeared at a login prompt at all. The module now reads
+  the `qr_code` field, bounding what it copies like every other field it parses, and an
+  absent or over-long one renders cleanly as no QR rather than as an empty caption.
+  ([#56](https://github.com/scttfrdmn/oauth2-pam/issues/56))
+
+- **`AuditLogger.LogAuthEventErr`**, so a path that is about to grant access can fail
+  the login when the audit record cannot be written. An unlogged successful
+  authentication is the outcome an audit log exists to prevent.
+  ([#69](https://github.com/scttfrdmn/oauth2-pam/issues/69))
+
+- **A mutation-tested C suite.** `test/cbridge` went from 147 checks and 8 transport
+  and audit-field mutations to **226 checks and 25 mutations, all caught**. The one
+  worth naming is `authorized_for` → `return 1`, which makes the module accept any user
+  the broker authorized for anyone else — and which was green in every suite this
+  project had before this round. A mutation check only covers what its tests actually
+  call, which is why the count matters less than what the new ones reach. A hung run is
+  now a failure rather than a hang.
+  ([#57](https://github.com/scttfrdmn/oauth2-pam/issues/57))
+
+- **`make verify-linux` compiles the C again.** It never invoked a compiler directly —
+  it relied on `go build ./...` pulling the bridge in through cgo. With the module no
+  longer a Go package, a Go-only sweep would have gone green without touching the C at
+  all, which is the failure mode where a verification target stops verifying and
+  nothing announces it. The target now builds the module and runs the C suite
+  explicitly.
+
 ## [0.3.0] - 2026-08-14
 
 0.2.0 made authentication work. This release is about being able to trust it:

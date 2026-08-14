@@ -67,6 +67,64 @@ func TestLoadMalformedFile(t *testing.T) {
 	}
 }
 
+// TestLoadRefusesAWritableFile is the point of checkPerms. Tier 0 says which
+// provider identity owns which local account, so any local user who can write
+// this file can add a record aiming their own provider login at somebody else's
+// Unix account — and the login that follows looks exactly like a legitimate one.
+// Load has to refuse before it parses, not warn.
+func TestLoadRefusesAWritableFile(t *testing.T) {
+	for _, mode := range []os.FileMode{0620, 0602, 0660, 0666, 0777} {
+		t.Run(fmt.Sprintf("%04o", mode), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "enrolled-users.yaml")
+			store := &Store{Enrollments: []Record{{LocalUser: "alice", Login: "alice-gh"}}}
+			if err := store.Save(path); err != nil {
+				t.Fatalf("Save: %v", err)
+			}
+			// Chmod rather than a mode passed to WriteFile, which the umask can trim.
+			if err := os.Chmod(path, mode); err != nil {
+				t.Fatalf("chmod: %v", err)
+			}
+
+			if _, err := Load(path); err == nil {
+				t.Fatalf("Load accepted a mode-%04o enrollment file; anyone in its group chooses who logs in as whom", mode)
+			} else if !strings.Contains(err.Error(), "chmod 600") {
+				t.Errorf("err = %q, want it to say how to fix the mode", err)
+			}
+		})
+	}
+}
+
+// The other half: group-*readable* still loads. A 0640 enrollment file is a
+// disclosure worth fixing, but refusing to load it would lock every enrolled
+// user off the host, and that is the worse failure of the two.
+func TestLoadAcceptsAGroupReadableFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "enrolled-users.yaml")
+	store := &Store{Enrollments: []Record{{LocalUser: "alice", Login: "alice-gh"}}}
+	if err := store.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := os.Chmod(path, 0644); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load of a 0644 file: %v", err)
+	}
+	if loaded.FindByLocalUser("alice") == nil {
+		t.Error("the record did not load")
+	}
+}
+
+// A path that is not a regular file is not an enrollment file, whatever it
+// contains.
+func TestLoadRefusesANonRegularFile(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Load(dir); err == nil {
+		t.Error("Load accepted a directory as the enrollment file")
+	}
+}
+
 // TestSaveIsNotWorldReadable: the file links Unix accounts to GitHub identities,
 // which is exactly the information an attacker needs to target a device-flow
 // phish at the right person.
@@ -140,6 +198,59 @@ func TestFindRequiresBothFields(t *testing.T) {
 	}
 	if store.Find("", "", "") != nil {
 		t.Error("Find matched on empty input")
+	}
+}
+
+// TestARecordWithNoLoginIsNotAWildcard: matching is case-insensitive, and
+// EqualFold("", "") is true, so a record whose login: key never made it to disk
+// used to match every identity that arrived without one — a wildcard in the tier
+// that outranks all the others. A file like this is a hand edit or a half-finished
+// write, so Load still reads it (--remove has to be able to reach it); what it
+// must not do is match.
+func TestARecordWithNoLoginIsNotAWildcard(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "enrolled-users.yaml")
+	partial := `enrollments:
+  - local_user: alice
+    enrolled_by: root
+`
+	if err := os.WriteFile(path, []byte(partial), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(store.Enrollments) != 1 {
+		t.Fatalf("got %d records, want the malformed record loaded so it can be removed", len(store.Enrollments))
+	}
+
+	if rec := store.Find("alice", "", "github"); rec != nil {
+		t.Errorf("a record with no login matched an identity with no login: %+v", rec)
+	}
+	if rec := store.Find("alice", "mallory", "github"); rec != nil {
+		t.Errorf("a record with no login matched login %q: %+v", "mallory", rec)
+	}
+	// And it is still removable, which is the whole reason Load accepts it.
+	if !store.Remove("alice") {
+		t.Error("the malformed record could not be removed")
+	}
+}
+
+// TestAddRequiresALogin: the store is where the wildcard record is stopped from
+// being created in the first place.
+func TestAddRequiresALogin(t *testing.T) {
+	store := &Store{}
+
+	err := store.Add(Record{LocalUser: "alice"}, Unvalidated)
+	if err == nil {
+		t.Fatal("Add accepted a record with no provider login; it would match any identity that also has none")
+	}
+	if !strings.Contains(err.Error(), "no provider login") {
+		t.Errorf("err = %q, want it to say the login is missing", err)
+	}
+	if len(store.Enrollments) != 0 {
+		t.Errorf("got %d records, want the store unchanged", len(store.Enrollments))
 	}
 }
 

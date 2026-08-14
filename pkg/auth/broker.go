@@ -51,8 +51,12 @@ const (
 	StatusExpired = "expired"
 
 	// StatusError means the attempt failed for an operational reason (provider
-	// unreachable, mapping service down, internal error) rather than a
-	// decision about the user. Terminal.
+	// unreachable, mapping service down, internal error, or the broker at a
+	// capacity limit) rather than a decision about the user. Terminal.
+	//
+	// Capacity belongs here and not in StatusDenied: SESSION_LIMIT_REACHED and
+	// AUTH_LIMIT_REACHED both say the broker declined to try, which is a fact
+	// about this host's load and not about the identity that asked. See #84.
 	StatusError = "error"
 )
 
@@ -283,6 +287,12 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 		Str("login_type", req.LoginType).
 		Msg("Processing authentication request")
 
+	// Not a grant path: this records that a login was attempted, before anything
+	// has been decided or handed out, so LogAuthEvent (log the write failure and
+	// carry on) is the right call. Failing the request here would mean a broker that
+	// cannot write its audit trail refuses to start device flows at all — see
+	// LogAuthEventErr at the one authentication_success site for the distinction,
+	// and criticalAuditEvents for why this event is the one the buffer exists for.
 	b.auditLogger.LogAuthEvent(security.AuditEvent{
 		EventType:  "authentication_attempt",
 		UserID:     req.UserID,
@@ -293,50 +303,55 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 		Timestamp:  time.Now(),
 	})
 
+	// Both refusals below carry a fixed category string, not err.Error().
+	// docs/wire-protocol.md's broker conformance item 7: error_code is the
+	// category and the detail belongs in the broker's log. internal/ipc copies
+	// ErrorMessage verbatim to the socket, so wrapping the underlying error put
+	// the configured Enterprise hostname or IP — and, for a selection failure,
+	// the client's own unsanitized provider name — into the reply.
 	prov, err := b.selectProvider(req.Provider)
 	if err != nil {
 		log.Warn().Err(err).Str("provider", req.Provider).Msg("Cannot select a provider")
-		return errorResponse("NO_PROVIDER", err.Error()), nil
+		return errorResponse("NO_PROVIDER", "Requested authentication provider is not available"), nil
 	}
 
-	// Enforce the per-user limit on *established* sessions. Pending flows are
-	// counted separately below: an abandoned SSH attempt must not consume a
-	// session slot.
-	if max := b.config.Authentication.MaxConcurrentSessions; max > 0 {
-		if b.countUserSessions(req.UserID) >= max {
-			return &AuthResponse{
-				Success:      false,
-				Status:       StatusDenied,
-				ErrorCode:    "SESSION_LIMIT_REACHED",
-				ErrorMessage: "Maximum concurrent sessions reached",
-			}, nil
-		}
+	// Generate a cryptographically random session ID server-side.
+	// The PAM client's req.SessionID is intentionally ignored to prevent
+	// session fixation attacks.
+	sessionID, err := generateSessionID()
+	if err != nil {
+		return nil, fmt.Errorf("generate session ID: %w", err)
 	}
 
-	// Global cap on device flows awaiting authorization. Each one holds a
-	// goroutine polling the provider, so this bounds the work a burst of login
-	// attempts can create broker-wide.
-	//
-	// Checked before eviction, not after. The other order made the cap
-	// unreachable for a single username: eviction keeps that user's pending count
-	// at maxPendingFlowsPerUser, so countPendingFlows never climbed toward the
-	// global limit however many requests arrived. Verified before the fix: a cap
-	// of 10 accepted 30 requests.
-	if max := b.config.Security.RateLimiting.MaxConcurrentAuths; max > 0 {
-		if n := b.countPendingFlows(); n >= max {
-			log.Warn().Int("pending", n).Int("max", max).
-				Msg("Concurrent device flow limit reached; rejecting authentication")
-			return errorResponse("AUTH_LIMIT_REACHED",
-				"Too many authentications in progress; try again shortly"), nil
-		}
+	// Take a slot before talking to the provider: the caps are enforced and the
+	// entry inserted under one write lock, so concurrent requests count each
+	// other. ExpiresAt is provisional until the provider has answered.
+	if refusal := b.reserveSession(&Session{
+		ID:                 sessionID,
+		RequestedLocalUser: req.UserID,
+		Provider:           prov.Name(),
+		CreatedAt:          time.Now(),
+		ExpiresAt:          time.Now().Add(reservationLifetime),
+		LastAccessed:       time.Now(),
+		SourceIP:           req.SourceIP,
+		Status:             StatusPending,
+		IsActive:           false,
+		Metadata:           req.Metadata,
+	}); refusal != nil {
+		return refusal, nil
 	}
-
-	// Bound in-flight device flows for this user, evicting the oldest.
-	b.evictExcessPendingFlows(req.UserID)
 
 	// Start device flow
 	deviceFlow, err := prov.StartDeviceFlow(b.ctx)
 	if err != nil {
+		// Release the reservation: a flow that never started holds no slot.
+		b.removeSession(sessionID)
+		log.Error().Err(err).Str("provider", prov.Name()).
+			Msg("Could not start a device flow at the provider")
+		// The audit record keeps the detail: it is a local log, and an operator
+		// diagnosing an unreachable provider has nowhere else to read it.
+		//
+		// Not a grant path — the login is already failing — so LogAuthEvent.
 		b.auditLogger.LogAuthEvent(security.AuditEvent{
 			EventType:    "device_flow_failed",
 			UserID:       req.UserID,
@@ -347,7 +362,7 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 			ErrorMessage: err.Error(),
 			Timestamp:    time.Now(),
 		})
-		return errorResponse("DEVICE_FLOW_FAILED", err.Error()), nil
+		return errorResponse("DEVICE_FLOW_FAILED", "Could not start device authorization"), nil
 	}
 
 	// The provider chose these two strings, and they are printed to a terminal by
@@ -370,50 +385,56 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 	userCode := SanitizePromptValue(deviceFlow.UserCode)
 
 	// Generated from the sanitized URL, so the QR encodes what the text says.
+	//
+	// A URL the encoder will not take is not a failed login. GenerateQRCode bounds
+	// its input — see maxQRCodeURLBytes for why the provider must not be the one
+	// choosing how many kilobytes of block characters this reply carries — and
+	// above the bound there is simply no QR code; the instructions still carry the
+	// URL and the user code as text.
+	//
+	// Sanitized here because the art now travels only in the reply's qr_code field
+	// and no longer inside instructions, so the prompt formatters are no longer
+	// where it gets filtered. Defence in depth either way: go-qrcode emits
+	// block-drawing runes and newlines and nothing else, which is exactly why the
+	// block policy leaves a real QR code untouched.
 	qrCode, err := GenerateQRCode(deviceURL)
 	if err != nil {
-		log.Warn().Err(err).Msg("Failed to generate QR code")
+		log.Warn().Err(err).Msg("Device flow will have no QR code")
 		qrCode = ""
 	}
-
-	// Generate a cryptographically random session ID server-side.
-	// The PAM client's req.SessionID is intentionally ignored to prevent
-	// session fixation attacks.
-	sessionID, err := generateSessionID()
-	if err != nil {
-		return nil, fmt.Errorf("generate session ID: %w", err)
-	}
+	qrCode = SanitizePromptBlock(qrCode)
 
 	// The flow lives until the user approves it, but no longer than the broker is
 	// willing to wait — see AuthenticationConfig.DeviceFlowTimeout for why the
 	// provider's own expiry is the wrong bound.
 	expiresAt := b.deviceFlowDeadline(deviceFlow)
 
-	// Create a pending session
-	session := &Session{
-		ID:                 sessionID,
-		RequestedLocalUser: req.UserID,
-		Provider:           prov.Name(),
-		CreatedAt:          time.Now(),
-		ExpiresAt:          expiresAt,
-		LastAccessed:       time.Now(),
-		SourceIP:           req.SourceIP,
-		Status:             StatusPending,
-		IsActive:           false,
-		Metadata:           req.Metadata,
+	if !b.armFlowDeadline(sessionID, expiresAt) {
+		log.Info().Str("session_id", sessionID).Str("user_id", req.UserID).
+			Msg("Reservation was evicted while the provider was starting the device flow")
+		return errorResponse("AUTH_LIMIT_REACHED",
+			"Too many authentications in progress; try again shortly"), nil
 	}
-	b.setSession(session)
 
 	// Poll in the background; update session when the device flow completes.
 	// The poller's context is cancelled the moment the session stops being
 	// interesting, so a login nobody is waiting for stops talking to the provider.
-	pollCtx, cancel := context.WithCancel(b.baseContext())
+	//
+	// The deadline is on the context, not only on a timer arm of the poll loop's
+	// select. Once that select has taken its ticker arm the body runs to
+	// completion before the select is re-entered — a poll, up to three identity
+	// attempts two seconds apart, up to three mapper attempts, then a token store —
+	// so a timer could not fire during any of it. The mapper's NSS lookup takes no
+	// context and has no timeout of its own, so on an LDAP or SSSD host that window
+	// is bounded by nothing this project controls. With the deadline here, every
+	// context-aware call in the flow ends when the broker stops waiting.
+	pollCtx, cancel := context.WithDeadline(b.baseContext(), expiresAt)
 	b.sessionMutex.Lock()
 	b.pollCancel[sessionID] = cancel
 	b.sessionMutex.Unlock()
 
 	b.wg.Add(1)
-	go b.pollDeviceAuthorization(pollCtx, sessionID, prov, deviceFlow, expiresAt)
+	go b.pollDeviceAuthorization(pollCtx, sessionID, prov, deviceFlow)
 
 	// Success is false: a started device flow is not an authenticated user.
 	return &AuthResponse{
@@ -434,6 +455,15 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 
 // CheckSession returns the current state of a session. This is the call the
 // PAM module polls while the user completes the device flow.
+//
+// Every bound RefreshSession refuses on, this must refuse on too:
+// docs/wire-protocol.md requires the two verbs to agree, and a client that only
+// ever polls check_session — which is every in-tree client, as nothing sends
+// refresh_session — would otherwise be told "authorized" for a session the
+// broker itself would not extend. It used to consult neither
+// security.max_token_age nor the token store; both cases were measured as
+// check_session answering authorized/success=true against refresh_session
+// answering expired/SESSION_EXPIRED for the same session ID.
 func (b *Broker) CheckSession(sessionID string) (*AuthResponse, error) {
 	session := b.getSession(sessionID)
 	if session == nil {
@@ -459,8 +489,10 @@ func (b *Broker) CheckSession(sessionID string) (*AuthResponse, error) {
 		}, nil
 	}
 
+	now := time.Now()
+
 	if !session.IsActive {
-		if session.ExpiresAt.Before(time.Now()) {
+		if session.ExpiresAt.Before(now) {
 			// Device code lifetime elapsed without the poller noticing yet.
 			b.failSession(sessionID, StatusExpired, "Device authorization expired")
 			return &AuthResponse{
@@ -480,7 +512,7 @@ func (b *Broker) CheckSession(sessionID string) (*AuthResponse, error) {
 		}, nil
 	}
 
-	if session.ExpiresAt.Before(time.Now()) {
+	if session.ExpiresAt.Before(now) {
 		b.removeSession(sessionID)
 		return &AuthResponse{
 			Success:      false,
@@ -488,6 +520,38 @@ func (b *Broker) CheckSession(sessionID string) (*AuthResponse, error) {
 			ErrorCode:    "SESSION_EXPIRED",
 			ErrorMessage: "Session has expired",
 		}, nil
+	}
+
+	// The absolute age ceiling. Revoked rather than merely refused, exactly as
+	// RefreshSession does it: the ceiling is a security control, so the token goes
+	// with the session.
+	if b.pastMaxTokenAge(session, now) {
+		log.Info().
+			Str("session_id", sessionID).
+			Str("local_user", session.LocalUser).
+			Dur("age", now.Sub(session.CreatedAt)).
+			Dur("max_token_age", b.config.Security.MaxTokenAge).
+			Msg("Session reached security.max_token_age; revoking instead of reporting it authorized")
+		if err := b.RevokeSession(sessionID); err != nil {
+			log.Warn().Err(err).Str("session_id", sessionID).
+				Msg("Failed to revoke a session past max_token_age")
+		}
+		return expiredSessionResponse(sessionID,
+			"Session has reached the maximum permitted age"), nil
+	}
+
+	// A session is what authorizes the use of a credential, so a session that has
+	// outlived its token is a shell and must not be reported as authorized.
+	//
+	// This is reachable without anyone calling refresh_session: the token manager
+	// drops a token when the *token record's* expiry passes, and a refresh extends
+	// the session's expiry without extending the record's, so after one refresh the
+	// token can be gone while the session stays live for up to token_lifetime.
+	if session.TokenID != "" && !b.tokenManager.Has(session.TokenID) {
+		log.Warn().Str("session_id", sessionID).Str("local_user", session.LocalUser).
+			Msg("Authorized session has no usable token; reporting it expired")
+		b.removeSession(sessionID)
+		return expiredSessionResponse(sessionID, "Session credentials are no longer valid"), nil
 	}
 
 	return b.successResponse(session), nil
@@ -569,21 +633,23 @@ func (b *Broker) RefreshSession(sessionID string) (*AuthResponse, error) {
 			"Session has reached the maximum permitted age"), nil
 	}
 
-	// The token is what the session authorizes the use of. If it no longer
-	// resolves it has been revoked or has aged out of the store, and the session
-	// is a shell that must not be reported as authorized — let alone extended.
+	// The token is what the session authorizes the use of. If it is no longer in
+	// the store it has been revoked or has aged out, and the session is a shell
+	// that must not be reported as authorized — let alone extended.
 	//
 	// This is deliberately a second, independent check on the same fact the
 	// compare-and-set below establishes: it is the one that catches a session
 	// that was resurrected, or was never torn down properly, by some path other
 	// than the window between the read above and the write below.
-	if session.TokenID != "" {
-		if _, err := b.tokenManager.GetDecryptedAccessToken(session.TokenID); err != nil {
-			log.Warn().Err(err).Str("session_id", sessionID).
-				Msg("Authorized session has no usable token; refusing to refresh")
-			b.removeSession(sessionID)
-			return expiredSessionResponse(sessionID, "Session credentials are no longer valid"), nil
-		}
+	//
+	// TokenManager.Has rather than GetDecryptedAccessToken: the question is
+	// whether the credential exists, and answering it by decrypting put a
+	// plaintext access token in the heap, once per refresh, only to discard it.
+	if session.TokenID != "" && !b.tokenManager.Has(session.TokenID) {
+		log.Warn().Str("session_id", sessionID).
+			Msg("Authorized session has no usable token; refusing to refresh")
+		b.removeSession(sessionID)
+		return expiredSessionResponse(sessionID, "Session credentials are no longer valid"), nil
 	}
 
 	if time.Until(session.ExpiresAt) > b.config.Authentication.RefreshThreshold {
@@ -592,7 +658,7 @@ func (b *Broker) RefreshSession(sessionID string) (*AuthResponse, error) {
 
 	// Extend the session lifetime, but only if it is still the same authorized
 	// session that was read above.
-	expiresAt := now.Add(b.config.Authentication.TokenLifetime)
+	expiresAt := b.extendedExpiry(session, now)
 	if !b.extendSession(sessionID, session.CreatedAt, func(s *Session) {
 		s.ExpiresAt = expiresAt
 		s.LastAccessed = now
@@ -670,14 +736,47 @@ func (b *Broker) RevokeSession(sessionID string) error {
 
 	b.removeSession(sessionID)
 
-	b.auditLogger.LogAuthEvent(security.AuditEvent{
+	// What this record claims has to match what was actually revoked — #69.
+	//
+	// A session that never completed its device flow has no authenticated user:
+	// LocalUser is empty, because it is only ever written by activateSession. This
+	// used to be recorded as Success: true with UserID "", which reads as
+	// "someone's session was revoked successfully" and names nobody — a line an
+	// incident review cannot correlate with anything, and worse than no line at
+	// all, because it looks like a resolved fact.
+	//
+	// So Success here means "an authenticated session belonging to UserID was
+	// destroyed", and it is true only when there was such a user to name. For a
+	// pending or terminally failed session the empty UserID is the honest answer,
+	// and the record says which state it was in and which account the login had
+	// asked for. requested_user travels in the metadata rather than in UserID: the
+	// client chose it and the broker never confirmed it, so it must not sit in the
+	// field that elsewhere means "the identity the broker mapped".
+	//
+	// Not a grant path: LogAuthEvent, as a revocation stands whether or not it can
+	// be written down. Withholding the revocation because the sink is full would
+	// leave a live session and a live token instead.
+	authenticated := session.IsActive && session.LocalUser != ""
+	event := security.AuditEvent{
 		EventType: "session_revoked",
 		UserID:    session.LocalUser,
 		SessionID: sessionID,
 		Provider:  session.Provider,
-		Success:   true,
+		Success:   authenticated,
 		Timestamp: time.Now(),
-	})
+		Metadata: map[string]interface{}{
+			"session_status": session.Status,
+		},
+	}
+	if !authenticated {
+		// Success is false for a reason that is not a failure of the revocation, so
+		// say which it is; otherwise the record reads as "revocation failed".
+		event.ErrorMessage = "session was revoked before it authenticated anyone; no local user to name"
+		if session.RequestedLocalUser != "" {
+			event.Metadata["requested_user"] = session.RequestedLocalUser
+		}
+	}
+	b.auditLogger.LogAuthEvent(event)
 
 	return nil
 }
@@ -688,15 +787,15 @@ func (b *Broker) RevokeSession(sessionID string) error {
 // It takes sessionID (not a *Session pointer) to avoid data races; all
 // session reads/writes go through getSession/setSession under the mutex.
 //
-// ctx is cancelled when the session is evicted, revoked, or fails, so the
-// goroutine and its provider traffic stop with it. deadline is when the broker
-// gives up waiting, which may be earlier than the provider's own code expiry.
+// ctx is cancelled when the session is evicted, revoked, or fails, and carries
+// the deadline at which the broker gives up waiting — which may be earlier than
+// the provider's own code expiry. Both endings are read through pollFinished, so
+// there is one deadline rather than a context and a timer that can disagree.
 func (b *Broker) pollDeviceAuthorization(
 	ctx context.Context,
 	sessionID string,
 	prov provider.Provider,
 	df *provider.DeviceFlow,
-	deadline time.Time,
 ) {
 	defer b.wg.Done()
 	defer b.forgetPoll(sessionID)
@@ -708,8 +807,6 @@ func (b *Broker) pollDeviceAuthorization(
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	timeout := time.NewTimer(time.Until(deadline))
-	defer timeout.Stop()
 
 	for {
 		select {
@@ -717,21 +814,15 @@ func (b *Broker) pollDeviceAuthorization(
 			return
 
 		case <-ctx.Done():
-			// The session this poll belonged to is gone. Whatever removed it has
-			// already recorded why, so there is nothing to report here.
-			log.Debug().Str("session_id", sessionID).Msg("Device flow poll cancelled")
-			return
-
-		case <-timeout.C:
-			log.Warn().
-				Str("session_id", sessionID).
-				Msg("Device flow expired")
-			b.failSession(sessionID, StatusExpired, "Device authorization expired")
+			b.pollFinished(ctx, sessionID)
 			return
 
 		case <-ticker.C:
 			token, err := prov.PollDeviceAuthorization(ctx, df.DeviceCode)
 			if err != nil {
+				if b.pollFinished(ctx, sessionID) {
+					return
+				}
 				// errors.Is, not equality: an implementation is entitled to wrap
 				// a sentinel with context ("poll acme-sso: %w"), and treating
 				// that as an unknown error would fail a login that is merely
@@ -747,6 +838,9 @@ func (b *Broker) pollDeviceAuthorization(
 					b.failSession(sessionID, StatusExpired, "Device code expired before authorization")
 					return
 				case errors.Is(err, provider.ErrAccessDenied):
+					// A denial, not a grant: LogAuthEvent. The login is refused
+					// whatever the audit sink does, so there is no decision left for
+					// the write error to turn on.
 					b.auditLogger.LogAuthEvent(security.AuditEvent{
 						EventType:    "authentication_denied",
 						SessionID:    sessionID,
@@ -771,9 +865,13 @@ func (b *Broker) pollDeviceAuthorization(
 				if err == nil {
 					break
 				}
+				if b.pollFinished(ctx, sessionID) {
+					return
+				}
 				if !isTransientError(err) || attempt == 3 {
 					log.Error().Err(err).Int("attempt", attempt).
 						Str("session_id", sessionID).Msg("Failed to resolve provider identity")
+					// A failure, not a grant: LogAuthEvent.
 					b.auditLogger.LogAuthEvent(security.AuditEvent{
 						EventType:    "authentication_failed",
 						SessionID:    sessionID,
@@ -807,11 +905,15 @@ func (b *Broker) pollDeviceAuthorization(
 					if err == nil {
 						break
 					}
+					if b.pollFinished(ctx, sessionID) {
+						return
+					}
 					if !isTransientError(err) || attempt == 3 {
 						log.Error().Err(err).Int("attempt", attempt).
 							Str("session_id", sessionID).
 							Str("provider_login", identity.Login).
 							Msg("Identity mapping failed")
+						// A failure, not a grant: LogAuthEvent.
 						b.auditLogger.LogAuthEvent(security.AuditEvent{
 							EventType:    "authentication_failed",
 							UserID:       identity.Login,
@@ -856,6 +958,9 @@ func (b *Broker) pollDeviceAuthorization(
 						Str("mapped_user", mapResult.LocalUser).
 						Str("provider_login", identity.Login).
 						Msg("Mapped local user does not match requested login; denying")
+					// A denial, not a grant: LogAuthEvent. The session is still
+					// pending and is about to be failed, so nothing is handed out
+					// however the write goes.
 					b.auditLogger.LogAuthEvent(security.AuditEvent{
 						EventType:    "authentication_denied",
 						UserID:       current.RequestedLocalUser,
@@ -924,7 +1029,21 @@ func (b *Broker) pollDeviceAuthorization(
 					return
 				}
 
-				b.auditLogger.LogAuthEvent(security.AuditEvent{
+				// The only grant path in this file, and so the only audit write whose
+				// failure has to fail the login — #69. The session is active as of the
+				// line above: the next check_session hands out an authenticated user.
+				// LogAuthEvent would log the write failure and grant anyway, which is
+				// a full disk turning into a successful login with no record of who
+				// was let in, and that record is the one an incident is reconstructed
+				// from. So the error is taken, and the grant is withdrawn if the
+				// record did not reach a sink.
+				//
+				// Written after activation rather than before, deliberately: before,
+				// the record would claim a success that activateSession might still
+				// refuse. The order here can only produce a session that existed for
+				// microseconds and was then destroyed, which is what the client is
+				// told.
+				if err := b.auditLogger.LogAuthEventErr(security.AuditEvent{
 					EventType:  "authentication_success",
 					UserID:     mapResult.LocalUser,
 					Email:      identity.Email,
@@ -939,7 +1058,15 @@ func (b *Broker) pollDeviceAuthorization(
 						"provider_subject": identity.Subject,
 						"claims":           identity.Claims,
 					},
-				})
+				}); err != nil {
+					log.Error().Err(err).
+						Str("session_id", sessionID).
+						Str("local_user", mapResult.LocalUser).
+						Msg("Could not record the authentication; withdrawing the grant rather than allowing an unlogged login")
+					b.withdrawGrant(sessionID, current.CreatedAt, tokenID,
+						"Internal error recording the authentication")
+					return
+				}
 
 				log.Info().
 					Str("session_id", sessionID).
@@ -950,6 +1077,35 @@ func (b *Broker) pollDeviceAuthorization(
 			} // end inner block
 		}
 	}
+}
+
+// pollFinished reports whether the poll context has ended, recording the expiry
+// on the session when it ended because the flow's deadline passed. Every
+// failure branch in the loop above consults it first, so a provider or mapper
+// call aborted mid-flight is reported as what it is.
+//
+// Without it, the deadline on the context would change the answer a client gets:
+// context.DeadlineExceeded satisfies net.Error, so isTransientError calls it
+// transient, and a poll or identity attempt cut short by the deadline would be
+// retried twice more and then land in the default arm as StatusError — telling a
+// client the provider broke when what happened is that the broker stopped
+// waiting.
+func (b *Broker) pollFinished(ctx context.Context, sessionID string) bool {
+	err := ctx.Err()
+	switch {
+	case err == nil:
+		return false
+	case errors.Is(err, context.DeadlineExceeded):
+		log.Warn().
+			Str("session_id", sessionID).
+			Msg("Device flow expired")
+		b.failSession(sessionID, StatusExpired, "Device authorization expired")
+	default:
+		// The session this poll belonged to is gone. Whatever removed it has
+		// already recorded why, so there is nothing to report here.
+		log.Debug().Str("session_id", sessionID).Msg("Device flow poll cancelled")
+	}
+	return true
 }
 
 // identityFailureStatus classifies a GetIdentity failure. A provider-level
@@ -1001,18 +1157,30 @@ func (b *Broker) getSession(sessionID string) *Session {
 
 // activateSession promotes a pending session to authorized under a single lock,
 // applying mutate to the stored entry. It returns false — changing nothing — if
-// the session is gone, is no longer pending, or is not the same one the caller
-// started with: CreatedAt distinguishes a session that was removed and had its
-// ID reused from the one still in flight.
+// the session is gone, is no longer pending, has passed its own deadline, or is
+// not the same one the caller started with: CreatedAt distinguishes a session
+// that was removed and had its ID reused from the one still in flight.
 //
 // This is the only place a session becomes active, so it is the only place the
-// invariant "an authorized session was pending a moment ago" has to hold.
+// invariants "an authorized session was pending a moment ago" and "an authorized
+// session was approved before its deadline" have to hold.
+//
+// The expiry is checked here and not left to the poller's deadline because the
+// mutate below rewrites ExpiresAt to the session lifetime: an activation a
+// moment too late is indistinguishable afterwards, and nothing downstream
+// catches it. CheckSession's expiry branch only runs while !IsActive, so a
+// session activated past the flow deadline answered "authorized" with an hour on
+// it — the only clock bounding an unapproved flow, defeated by a slow mapper or
+// a provider that stalls on authorization_pending.
 func (b *Broker) activateSession(sessionID string, createdAt time.Time, mutate func(*Session)) bool {
 	b.sessionMutex.Lock()
 	defer b.sessionMutex.Unlock()
 
 	s, ok := b.sessions[sessionID]
 	if !ok || s.IsActive || s.Status != StatusPending || !s.CreatedAt.Equal(createdAt) {
+		return false
+	}
+	if !s.ExpiresAt.After(time.Now()) {
 		return false
 	}
 	mutate(s)
@@ -1058,6 +1226,25 @@ func (b *Broker) pastMaxTokenAge(s *Session, now time.Time) bool {
 		return false
 	}
 	return now.Sub(s.CreatedAt) > max
+}
+
+// extendedExpiry is how far a refresh may push a session's expiry: one
+// authentication.token_lifetime from now, or the security.max_token_age ceiling
+// measured from CreatedAt, whichever comes first.
+//
+// Refusing a refresh at the ceiling is not enough on its own. A refresh granted a
+// moment before it hands out authorization that reaches past it — measured at 59
+// minutes past — and nothing revisits that until the five-minute cleanup sweep,
+// so the ceiling was routinely overshot by a session that never asked to be
+// extended twice.
+func (b *Broker) extendedExpiry(s *Session, now time.Time) time.Time {
+	expiresAt := now.Add(b.config.Authentication.TokenLifetime)
+	if max := b.config.Security.MaxTokenAge; max > 0 {
+		if ceiling := s.CreatedAt.Add(max); ceiling.Before(expiresAt) {
+			return ceiling
+		}
+	}
+	return expiresAt
 }
 
 // baseContext is the parent for per-session polling contexts. Start records the
@@ -1110,16 +1297,118 @@ func (b *Broker) forgetPoll(sessionID string) {
 	delete(b.pollCancel, sessionID)
 }
 
-// countUserSessions returns the number of *established* sessions for userID.
+// reserveSession enforces the concurrency caps and inserts the pending entry
+// under a single write lock, returning nil if the slot was taken or the refusal
+// to send back if it was not.
+//
+// One lock, because the two counts and the insert are one decision. Authenticate
+// used to read them under RLock, release it, start the device flow, and only then
+// insert — so every request in flight decided against a session map that did not
+// yet contain any of the others. Measured: 40 concurrent calls against a cap of 3
+// produced 17 accepted sessions and 17 pending flows. The sequential test passed
+// throughout, because sequentially there is no window.
+//
+// The overshoot was bounded (by simultaneous Authenticate calls, roughly sshd's
+// MaxStartups) and safe in direction, since both counts are derived from the
+// session map rather than maintained alongside it and so cannot drift into a
+// persistent lockout. It is fixed anyway: a cap that a burst walks past is not a
+// cap, and the reservation is also what gives the eviction below a view of the
+// map that includes the request it is making room for.
+func (b *Broker) reserveSession(session *Session) *AuthResponse {
+	// Cancels for the flows evicted below are collected under the lock and invoked
+	// after it, for the reason evictExcessPendingFlows documents: cancel() must
+	// never be able to re-enter sessionMutex.
+	var cancels []context.CancelFunc
+
+	b.sessionMutex.Lock()
+
+	// The per-user limit on *established* sessions. Pending flows are counted
+	// separately, below: an abandoned SSH attempt must not consume a session slot.
+	//
+	// StatusError, via errorResponse, and not StatusDenied — see #84. Both capacity
+	// refusals are statements about the broker's load, not judgements about the
+	// identity presenting itself: nobody was denied, the broker declined to try. It
+	// answered StatusDenied here and StatusError for AUTH_LIMIT_REACHED below, which
+	// meant the same condition — this host is full — reached a client as a decision
+	// about the user down one path and an operational failure down the other. The
+	// consequence was visible in the reference client: "denied" is PAM_AUTH_ERR,
+	// so a user at their session cap was told their identity had been refused,
+	// while the identically-shaped AUTH_LIMIT_REACHED got PAM_AUTHINFO_UNAVAIL
+	// and a chance at the rest of the stack.
+	if max := b.config.Authentication.MaxConcurrentSessions; max > 0 {
+		if b.countUserSessionsLocked(session.RequestedLocalUser) >= max {
+			b.sessionMutex.Unlock()
+			return errorResponse("SESSION_LIMIT_REACHED", "Maximum concurrent sessions reached")
+		}
+	}
+
+	// Global cap on device flows awaiting authorization. Each one holds a
+	// goroutine polling the provider, so this bounds the work a burst of login
+	// attempts can create broker-wide.
+	//
+	// Checked before eviction, not after. The other order made the cap
+	// unreachable for a single username: eviction keeps that user's pending count
+	// at maxPendingFlowsPerUser, so the pending count never climbed toward the
+	// global limit however many requests arrived. Verified before the fix: a cap
+	// of 10 accepted 30 requests.
+	if max := b.config.Security.RateLimiting.MaxConcurrentAuths; max > 0 {
+		if n := b.countPendingFlowsLocked(); n >= max {
+			b.sessionMutex.Unlock()
+			log.Warn().Int("pending", n).Int("max", max).
+				Msg("Concurrent device flow limit reached; rejecting authentication")
+			return errorResponse("AUTH_LIMIT_REACHED",
+				"Too many authentications in progress; try again shortly")
+		}
+	}
+
+	// Bound in-flight device flows for this user, evicting the oldest.
+	cancels = b.evictExcessPendingFlowsLocked(session.RequestedLocalUser)
+
+	b.sessions[session.ID] = session
+	b.sessionMutex.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+	return nil
+}
+
+// reservationLifetime is how long a reserved slot lives before the real
+// device-flow deadline replaces it. It only has to outlast one StartDeviceFlow
+// round trip; a provider that never answers then loses its slot to the cleanup
+// sweep rather than holding it against the caps for as long as the broker runs.
+const reservationLifetime = time.Minute
+
+// armFlowDeadline replaces a reservation's provisional expiry with the real
+// device-flow deadline, which is not known until the provider has answered.
+//
+// It returns false if the reservation is no longer there — this user's own newer
+// flows can evict it while the provider is answering — because re-inserting it
+// would put back a session eviction had deliberately dropped, and returning a
+// session ID that is not in the map would leave the client polling for something
+// that does not exist.
+func (b *Broker) armFlowDeadline(sessionID string, expiresAt time.Time) bool {
+	b.sessionMutex.Lock()
+	defer b.sessionMutex.Unlock()
+
+	s, ok := b.sessions[sessionID]
+	if !ok || s.IsActive || s.Status != StatusPending {
+		return false
+	}
+	s.ExpiresAt = expiresAt
+	return true
+}
+
+// countUserSessionsLocked returns the number of *established* sessions for
+// userID. Callers hold sessionMutex, so that the count and whatever is decided
+// on it are one atomic step; see reserveSession.
 //
 // Pending device flows are excluded deliberately. Counting them meant that
 // three abandoned SSH attempts (a user who closed the terminal without
 // visiting GitHub) exhausted max_concurrent_sessions and locked the account out
 // until the five-minute cleanup ticker ran. Pending state is bounded by
 // maxPendingFlowsPerUser instead.
-func (b *Broker) countUserSessions(userID string) int {
-	b.sessionMutex.RLock()
-	defer b.sessionMutex.RUnlock()
+func (b *Broker) countUserSessionsLocked(userID string) int {
 	count := 0
 	for _, s := range b.sessions {
 		if !s.IsActive {
@@ -1132,11 +1421,10 @@ func (b *Broker) countUserSessions(userID string) int {
 	return count
 }
 
-// countPendingFlows returns the number of device flows awaiting authorization
-// across all users.
-func (b *Broker) countPendingFlows() int {
-	b.sessionMutex.RLock()
-	defer b.sessionMutex.RUnlock()
+// countPendingFlowsLocked returns the number of device flows awaiting
+// authorization across all users, including slots reserved by an Authenticate
+// call that has not heard back from the provider yet. Callers hold sessionMutex.
+func (b *Broker) countPendingFlowsLocked() int {
 	count := 0
 	for _, s := range b.sessions {
 		if s.Status == StatusPending && !s.IsActive {
@@ -1195,18 +1483,48 @@ func (b *Broker) failSession(sessionID, status, message string) {
 		Msg("Session marked terminally failed")
 }
 
-// evictExcessPendingFlows drops the oldest pending flows for userID until at
-// most maxPendingFlowsPerUser-1 remain, leaving room for the flow about to
+// withdrawGrant takes back an activation: it destroys the token this flow stored,
+// marks the session terminally errored, and retains it for terminalGrace so the
+// client polling check_session is told the login failed rather than being handed
+// the session that was authorized a moment ago.
+//
+// failSession cannot do this. It refuses to rewrite a session that is no longer
+// pending — right for a cancelled poller's late failure, which must not overwrite
+// an outcome a client has already been given, and wrong here, where the caller is
+// the goroutine that made the session authorized in the first place and is
+// deciding, before anyone has seen it, that it must not stand.
+//
+// createdAt identifies the session that was activated: if the entry is gone or is
+// a different session that reused the ID, only the token is destroyed, because
+// there is nothing left of the grant to withdraw.
+func (b *Broker) withdrawGrant(sessionID string, createdAt time.Time, tokenID, message string) {
+	b.sessionMutex.Lock()
+	if s, ok := b.sessions[sessionID]; ok && s.CreatedAt.Equal(createdAt) {
+		s.Status = StatusError
+		s.ErrorMessage = message
+		s.IsActive = false
+		s.TokenID = ""
+		s.ExpiresAt = time.Now().Add(terminalGrace)
+	}
+	b.sessionMutex.Unlock()
+
+	if tokenID != "" {
+		b.tokenManager.RevokeToken(tokenID)
+	}
+}
+
+// evictExcessPendingFlowsLocked drops the oldest pending flows for userID until
+// at most maxPendingFlowsPerUser-1 remain, leaving room for the flow about to
 // start. Evicting rather than rejecting means a user with several terminals
 // open always gets a usable prompt in the newest one.
-func (b *Broker) evictExcessPendingFlows(userID string) {
-	// Cancels are collected under the lock and invoked after it, so an evicted
-	// flow's goroutine stops talking to the provider. Without this, eviction
-	// deleted the session and left the poller running to the device code's
-	// expiry — untracked traffic against the provider's per-app rate limit.
+//
+// Callers hold sessionMutex and must call every returned cancel func once they
+// have released it, so an evicted flow's goroutine stops talking to the
+// provider. Without that, eviction deleted the session and left the poller
+// running to the device code's expiry — untracked traffic against the provider's
+// per-app rate limit — and calling cancel under the lock risks re-entering it.
+func (b *Broker) evictExcessPendingFlowsLocked(userID string) []context.CancelFunc {
 	var cancels []context.CancelFunc
-
-	b.sessionMutex.Lock()
 
 	var pending []*Session
 	for _, s := range b.sessions {
@@ -1215,8 +1533,7 @@ func (b *Broker) evictExcessPendingFlows(userID string) {
 		}
 	}
 	if len(pending) < maxPendingFlowsPerUser {
-		b.sessionMutex.Unlock()
-		return
+		return nil
 	}
 
 	sort.Slice(pending, func(i, j int) bool {
@@ -1233,11 +1550,7 @@ func (b *Broker) evictExcessPendingFlows(userID string) {
 			Str("user_id", userID).
 			Msg("Evicted oldest pending device flow")
 	}
-	b.sessionMutex.Unlock()
-
-	for _, cancel := range cancels {
-		cancel()
-	}
+	return cancels
 }
 
 // generateSessionID creates a 16-byte cryptographically random session ID.

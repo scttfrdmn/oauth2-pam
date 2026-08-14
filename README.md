@@ -44,12 +44,15 @@ Every request and reply carries a `protocol_version`, so the next change has som
 
 ## Requirements
 
-- Go 1.25+ (1.24 is end-of-life and no longer receives security backports)
+- Go 1.25+ for the broker and the CLIs (1.24 is end-of-life and no longer receives security backports)
+- A C compiler for the PAM module — it is plain C and needs no Go at all
 - Linux with PAM (`libpam0g-dev`)
 - `libjson-c-dev`
 - A GitHub OAuth App with Device Flow enabled
 
 The PAM module is Linux-only. `go build ./...` and the test suite work on macOS for development; `make build-pam` requires Linux.
+
+The module is built by a direct `cc -shared -fPIC` invocation rather than with `go build -buildmode=c-shared`, which is what it used to be. The Go build linked the entire Go runtime into every process that loads the module — including `sshd`, where it also installed the runtime's signal handlers over the ones sshd had set. The module has no Go logic to justify that, so it no longer pays for it: the object went from 1.2 MB to 73 KB, and `sshd` keeps its own signal handling ([#65](https://github.com/scttfrdmn/oauth2-pam/issues/65)).
 
 ## Quick Start
 
@@ -63,7 +66,30 @@ Go to **GitHub → Settings → Developer settings → OAuth Apps → New OAuth 
 
 Copy the **Client ID** and generate a **Client Secret**.
 
-### 2. Build
+### 2. Get the software
+
+Either a published release archive — which carries a checksum, an installer, and a
+`.so` built on a native runner for its architecture — or a source build.
+
+**From a release archive:**
+
+```bash
+VERSION=v0.3.0
+ARCH=amd64        # or arm64
+BASE=https://github.com/scttfrdmn/oauth2-pam/releases/download/$VERSION
+curl -fLO "$BASE/oauth2-pam-$VERSION-linux-$ARCH.tar.gz"
+curl -fLO "$BASE/oauth2-pam-$VERSION-linux-$ARCH.tar.gz.sha256"
+
+sha256sum -c "oauth2-pam-$VERSION-linux-$ARCH.tar.gz.sha256"
+tar xzf "oauth2-pam-$VERSION-linux-$ARCH.tar.gz"
+```
+
+Run the `sha256sum -c` before unpacking, and stop if it fails. What it proves is
+that the download arrived intact; it is not a signature, and the checksum comes
+from the same place as the tarball, so it says nothing about who built either.
+Signing and provenance are [#40](https://github.com/scttfrdmn/oauth2-pam/issues/40).
+
+**From source:**
 
 ```bash
 git clone https://github.com/scttfrdmn/oauth2-pam
@@ -71,25 +97,60 @@ cd oauth2-pam
 make build
 ```
 
+`make build` checks with `nm` that the module it just built exports all six
+`pam_sm_*` entry points, and fails if `nm` is not there to ask — v0.1.1 shipped a
+module with none of them and nothing noticed for a month.
+
 ### 3. Install
+
+**From the unpacked archive:**
+
+```bash
+cd "oauth2-pam-$VERSION-linux-$ARCH"
+sudo ./install.sh
+```
+
+It re-checks the archive's `sha256` if the tarball is still next to the directory,
+re-checks the module's entry points, asks the package manager where this
+distribution keeps its PAM modules rather than assuming, and writes
+`/etc/oauth2-pam/broker.yaml` from the example with a generated
+`token_encryption_key`. It does not touch `/etc/pam.d` — that is step 6, and it is
+the step that can lock you out.
+
+**From a source build:**
 
 ```bash
 sudo make install
 ```
 
 This installs:
-- `/lib/security/oauth2_pam.so`
+- `oauth2_pam.so` into this distribution's PAM module directory — asked for with
+  `scripts/pam-module-dir.sh`, not assumed. It is `/lib64/security` on RHEL and
+  `/usr/lib/<triplet>/security` on Debian/Ubuntu multiarch, and a module in the
+  wrong one is a module PAM silently never loads. Override with
+  `PAMDIR=/path make install`.
 - `/usr/local/bin/oauth2-pam-broker`
 - `/usr/local/bin/oauth2-pam-admin`
 - `/usr/local/bin/oauth2-pam-enroll`
 - `/etc/systemd/system/oauth2-pam-broker.service`
 
+Unlike `install.sh`, it does not write a config: that is the next step.
+
 ### 4. Configure
 
+The release installer has already done this — skip to editing the file. From a
+source build:
+
 ```bash
+sudo install -d -m 0750 -o root -g root /etc/oauth2-pam
 sudo install -m 0600 -o root -g root configs/example.yaml /etc/oauth2-pam/broker.yaml
 sudo $EDITOR /etc/oauth2-pam/broker.yaml
 ```
+
+The directory is created explicitly, and `0750`. The broker checks the mode and
+owner of the file that holds the secret; nothing checks the directory around it,
+and a directory another user can write is a config file that user can *replace* —
+which would let them choose the OAuth app this host authenticates against.
 
 Minimal config:
 
@@ -124,13 +185,20 @@ Three sources, highest precedence first:
 | File | `client_secret_file:` — an absolute path, or a bare [systemd credential](https://systemd.io/CREDENTIALS/) name resolved under `$CREDENTIALS_DIRECTORY` |
 | Config file | `client_secret:` inline, as above |
 
-Whichever file holds the secret — the secret file, or `broker.yaml` itself when
-the secret is inline — must have no group or other permission bits and be owned
-by root or by the broker's own uid. The broker refuses to start otherwise,
-naming the file and the `chmod`/`chown` that fixes it: a secret in a
-world-readable config is a secret every local user on the host already has, and
-a 0600 file owned by another user is a secret that user can *replace*, which
-would let them choose the OAuth app the broker authenticates against.
+`broker.yaml` and any file holding the secret must have no group or other
+permission bits and be owned by root or by the broker's own uid. The broker
+refuses to start otherwise, naming the file and the `chmod`/`chown` that fixes
+it: a secret in a world-readable config is a secret every local user on the host
+already has, and a 0600 file owned by another user is a secret that user can
+*replace*, which would let them choose the OAuth app the broker authenticates
+against.
+
+`broker.yaml` is checked in all three cases, not only when it carries an inline
+secret. It used to be checked only in that case, so the one permission check the
+config file ever got disappeared the moment an operator did the recommended thing
+and moved the secret into a credential — while the file went on holding the token
+encryption key, the org and team allowlists, and the mapping rules that decide
+which provider login becomes which Unix user.
 
 Under systemd the recommended form is a credential, which keeps the secret's
 location out of the config entirely:
@@ -271,12 +339,14 @@ Every tier's answer passes the same gate, so no rule, script, or identity servic
 |---|---|---|
 | Must be a valid POSIX username | always | — |
 | Not a system account by name (`root`, `www-data`, `postgres`, `nobody`, `systemd-*`, anything starting with `_`, …) | always | exempt one with `mapper.allow_system_users` |
-| UID at or above the floor | 1000 | `mapper.min_uid` (negative disables) |
+| UID at or above the floor | 1000 | `mapper.min_uid` — lower it, but it cannot be switched off |
 | **Never UID 0** | always | not overridable |
 
 The two mechanisms cover for each other. The floor is authoritative — it asks the host what the UID is — but it needs the account to resolve, and a broker built without cgo reads only `/etc/passwd`, so on an LDAP/SSSD host it cannot be applied. The name denylist needs no lookup. An account that does not resolve at all is allowed past the floor with a warning, because it cannot become a login anyway: sshd resolves the account itself before it starts a session.
 
 This matters because `local_user: "{{ .Login }}"` gated only on org membership delegates the choice of local username to whoever can create or rename an account in that org. Without a floor, a member who renamed themselves `postgres` logged in as `postgres`.
+
+There is no setting that removes the floor. A negative `mapper.min_uid` used to disable it and is now a startup error: a site with real people below UID 1000 sets `min_uid` to the lowest UID it means to allow, and a site whose real person is named after a service account names them in `mapper.allow_system_users`, which exempts a name from the denylist and not from the floor. Those two cover the cases that motivated the switch, and neither of them requires a host to run with no floor at all.
 
 Root is refused by UID, not by name, and neither setting can permit it: a device flow has no cryptographic binding to the SSH connection it authorises, which makes it the weakest route to the most privilege. OpenSSH's own default `PermitRootLogin prohibit-password` already rules it out. Use an ordinary account and `sudo`.
 
@@ -403,7 +473,9 @@ make test-cbridge-mutations      # put each fixed bridge defect back; the C test
 make test-integration-mutations  # put the v0.1.x bypass back; the harness must refuse the login
 ```
 
-Those two are the check on the checks, and CI runs each as its own job. A green suite proves the code does what the tests say; it does not prove the tests would notice if it stopped — so each of the six C bridge defects fixed in v0.2.0, and the v0.1.x authentication bypass itself, is reintroduced in a copy of the tree and the suite is required to fail. A mutation that survives means that regression test is decoration.
+Those two are the check on the checks, and CI runs both on every push and pull
+request — the harness mutation check as its own job, the C bridge one as a step in
+the Linux job, next to the suite it mutates. A green suite proves the code does what the tests say; it does not prove the tests would notice if it stopped — so each of the six C bridge defects fixed in v0.2.0, and the v0.1.x authentication bypass itself, is reintroduced in a copy of the tree and the suite is required to fail. A mutation that survives means that regression test is decoration.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for how work is tracked (labels, milestones, the roadmap board), what to run before pushing, and the two invariants that are easy to break.
 
@@ -413,7 +485,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for how work is tracked (labels, mileston
 oauth2-pam/
 ├── cmd/
 │   ├── broker/              # Broker daemon (oauth2-pam-broker)
-│   ├── pam-module/          # PAM shared library (oauth2_pam.so) + C bridge
+│   ├── pam-module/          # PAM shared library (oauth2_pam.so) — plain C, no Go
 │   ├── oauth2-pam-admin/    # Admin CLI
 │   └── oauth2-pam-enroll/   # Self-enrollment CLI
 ├── internal/
@@ -444,7 +516,7 @@ oauth2-pam/
 - Audit records go to `file`, `stdout`, or `syslog`; anything else is a startup error. An unrecognised type used to become `stdout`, so a typo moved the whole trail somewhere nobody was watching.
 - The broker socket is `0660` in a `0750` directory. The PAM module runs as root and so can reach it; other local users cannot, which matters because anything that can talk to the socket can start device flows.
 - The broker rate-limits per calling UID and caps request bodies at 64 KB. The UID comes from the socket's peer credentials (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED` on macOS/FreeBSD); if a platform cannot supply them the broker logs `peer_credentials=false` at startup and every caller shares one window, rather than all being recorded as root.
-- The client secret can be kept out of the config entirely — a systemd credential, a file, or an environment variable ([above](#where-the-client-secret-comes-from)). Whichever file holds it must be 0600 and owned by root or the broker's uid, including `broker.yaml` itself when the secret is inline; the broker refuses to start rather than treat a world-readable secret as confidential.
+- The client secret can be kept out of the config entirely — a systemd credential, a file, or an environment variable ([above](#where-the-client-secret-comes-from)). Whichever file holds it must be 0600 and owned by root or the broker's uid, and `broker.yaml` is checked the same way whether or not the secret is inline; the broker refuses to start rather than treat a world-readable secret — or a world-readable set of mapping rules — as confidential.
 - Session IDs are generated by the broker with `crypto/rand`; a client-supplied `session_id` on an `authenticate` request is ignored.
 - Org and team membership is checked server-side in the broker, before mapping.
 - Enrollment records name the provider they were created against, so on a host with two providers an account with the same login at the other one cannot claim an enrollment. Records written before v0.3.0 name no provider and match any; re-enroll to scope them.

@@ -3,10 +3,16 @@
 
 server:
   socket_path: /var/run/oauth2-pam/broker.sock
-  log_level: info                          # debug | info | warn | error
+  # debug | info | warn | error. Anything else is a startup error. The broker's
+  # --log-level flag overrides this when it is given, so a debugging run does not
+  # need this file edited; with no flag, this is what applies.
+  log_level: info
 
   # Deadlines applied to each IPC connection. Raise read_timeout if a slow
-  # identity-mapping service makes the PAM module's calls time out.
+  # identity-mapping service makes the PAM module's calls time out. Both are
+  # capped at 5 minutes: a connection holds one of the server's handler slots for
+  # as long as its deadline allows, and no login the module is still waiting for
+  # lasts that long anyway (its own default timeout is 90s).
   read_timeout: 30s
   write_timeout: 30s
 
@@ -103,8 +109,8 @@ mapper:
   # min_uid is the lowest UID an identity may be mapped to. 1000 is UID_MIN on
   # every mainstream distribution, so the default keeps identities off every
   # system and service account the host has. Lower it if you have real human
-  # accounts below 1000; a negative value turns the floor off entirely and leaves
-  # only the name denylist.
+  # accounts below 1000 — by naming the lowest UID you mean to allow. A negative
+  # value, which used to turn the floor off entirely, is rejected at startup.
   #
   # UID 0 is refused unconditionally — not by name, by UID, and neither of these
   # settings can permit it. A device flow has no cryptographic binding to the SSH
@@ -206,6 +212,11 @@ mapper:
   # a {"local_user": "...", "groups": [...]} JSON object to stdout.
   # Exit non-zero or emit empty/missing local_user to skip to next tier.
   #
+  # This one runs as root on every login that reaches it, so the broker checks it
+  # at startup and refuses to start unless it is an absolute path (not a bare name
+  # found on PATH) to a regular, executable file that only root can replace —
+  # no group or other write bit, on the file or on the directory holding it.
+  #
   # external_script: /usr/local/lib/oauth2-pam/map-user.sh
   # external_script_timeout: 5s
 
@@ -292,8 +303,11 @@ security:
 
 audit:
   enabled: true
-  format: json
 
+  # There is no format key. Records are JSON, always: the old one was parsed,
+  # defaulted to json, and read by nothing, so `format: text` was accepted and
+  # ignored. It is now rejected instead.
+  #
   # type is one of file, stdout or syslog. An unrecognised one is a startup
   # error: it used to fall back to stdout, so `type: fille` gave a broker that
   # started cleanly and wrote its audit trail somewhere nobody was watching.

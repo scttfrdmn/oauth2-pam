@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -42,6 +44,27 @@ var SupportedProviderTypes = []string{"github"}
 // mode is discovering it during an incident, when the records are wanted.
 var SupportedAuditOutputTypes = []string{"stdout", "file", "syslog"}
 
+// maxServerTimeout bounds server.read_timeout and server.write_timeout.
+//
+// Only negative values were rejected, so `read_timeout: 24h` validated cleanly —
+// and each of the IPC server's bounded handler slots is held for as long as its
+// read takes, which turns a handful of idle half-written requests into a stall
+// that outlasts the day. Nothing legitimate needs more than this either: every
+// caller is a PAM module inside sshd's pre-auth child with a timeout of its own
+// (90s by default), so a deadline beyond a couple of minutes can only be waited
+// out by a login nobody is still waiting for.
+const maxServerTimeout = 5 * time.Minute
+
+// SupportedLogLevels lists the values server.log_level may take. They are
+// zerolog's own names, because cmd/broker hands the value to zerolog.ParseLevel.
+//
+// Validate checks against it so that a misspelled level is a startup error
+// naming the four that exist. zerolog would otherwise reject it after the
+// broker had already logged its startup lines, and "trace" — which it accepts,
+// and which this project does not use — would quietly turn on a level nothing
+// documents.
+var SupportedLogLevels = []string{"debug", "info", "warn", "error"}
+
 // Config represents the complete configuration for the oauth2-pam broker
 type Config struct {
 	Server         ServerConfig         `mapstructure:"server"`
@@ -59,7 +82,13 @@ type Config struct {
 // but was ignored was worse than no setting at all.
 type ServerConfig struct {
 	SocketPath string `mapstructure:"socket_path"`
-	LogLevel   string `mapstructure:"log_level"`
+
+	// LogLevel is one of SupportedLogLevels. cmd/broker applies it once the config
+	// is read, and --log-level overrides it when that flag is actually given — for
+	// the length of one debugging run, without editing the file. It was parsed and
+	// read by nothing until v0.4.0, so the broker logged at the flag's default
+	// whatever this said.
+	LogLevel string `mapstructure:"log_level"`
 
 	// ReadTimeout bounds how long the broker waits for a complete request
 	// from a connected client; WriteTimeout bounds sending the response.
@@ -140,6 +169,10 @@ type MapperConfig struct {
 	// ExternalScript is the path to an external mapping script (Tier 2).
 	// The script receives an Identity JSON object on stdin and must write
 	// a MappingResult JSON object to stdout.
+	//
+	// It runs as root on every tier-2 login, so Validate requires an absolute path
+	// to a regular, executable file that only root can replace — see
+	// checkMapperScript.
 	ExternalScript string `mapstructure:"external_script"`
 
 	// ExternalScriptTimeout is how long to wait for the script (default 5s)
@@ -155,8 +188,9 @@ type MapperConfig struct {
 	// MinUID is the lowest UID an identity may be mapped to (default 1000, the
 	// UID_MIN of every mainstream distribution). It applies to every tier.
 	//
-	// A negative value disables the floor, leaving only the system-account name
-	// denylist. UID 0 is refused either way.
+	// 0 means unset. A negative value would disable the floor entirely, and
+	// Validate rejects one: a site with real accounts below 1000 names the lowest
+	// UID it means to allow instead. UID 0 is refused whatever this says.
 	MinUID int `mapstructure:"min_uid"`
 
 	// AllowSystemUsers exempts named accounts from the built-in system-account
@@ -239,10 +273,15 @@ type RateLimiting struct {
 	MaxConcurrentAuths   int `mapstructure:"max_concurrent_auths"`
 }
 
-// AuditConfig contains audit logging configuration
+// AuditConfig contains audit logging configuration.
+//
+// There is deliberately no format field. It was parsed, defaulted to "json", and
+// read by nothing: pkg/security marshals every record as JSON whatever it said,
+// so `format: text` was accepted, ignored, and believed. One format is the honest
+// number of formats this broker has, and a key that can only hold the value it
+// already has is a choice that does not exist.
 type AuditConfig struct {
 	Enabled bool          `mapstructure:"enabled"`
-	Format  string        `mapstructure:"format"`
 	Outputs []AuditOutput `mapstructure:"outputs"`
 	Events  []string      `mapstructure:"events"`
 }
@@ -352,7 +391,6 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("mapper.min_uid", 1000)
 
 	v.SetDefault("audit.enabled", true)
-	v.SetDefault("audit.format", "json")
 	v.SetDefault("audit.events", KnownAuditEvents)
 }
 
@@ -360,6 +398,24 @@ func setDefaults(v *viper.Viper) {
 func (c *Config) Validate() error {
 	if c.Server.SocketPath == "" {
 		return fmt.Errorf("server.socket_path is required")
+	}
+	// A relative socket path is resolved against the broker's working directory,
+	// which under systemd is / and is nothing an operator chose. The PAM module
+	// has its own compiled-in path and would look somewhere else entirely, so the
+	// symptom would be logins failing against a broker that started cleanly.
+	if !filepath.IsAbs(c.Server.SocketPath) {
+		return fmt.Errorf("server.socket_path must be an absolute path (got %q)", c.Server.SocketPath)
+	}
+
+	// Empty means "unset": LoadConfig always supplies the default, so an empty
+	// value is a Config built in code, which keeps the level cmd/broker's flag
+	// chose rather than being an error. A non-empty one is a promise to honour, and
+	// this setting spent three releases being read, ignored, and believed — an
+	// operator who sets info to keep debug out of syslog, or debug during an
+	// incident, changed nothing.
+	if c.Server.LogLevel != "" && !isSupportedLogLevel(c.Server.LogLevel) {
+		return fmt.Errorf("server.log_level %q is not supported (supported: %s)",
+			c.Server.LogLevel, strings.Join(SupportedLogLevels, ", "))
 	}
 
 	if len(c.Providers) == 0 {
@@ -418,8 +474,18 @@ func (c *Config) Validate() error {
 	if c.Server.ReadTimeout < 0 {
 		return fmt.Errorf("server.read_timeout must not be negative")
 	}
+	if c.Server.ReadTimeout > maxServerTimeout {
+		return fmt.Errorf("server.read_timeout (%s) must not exceed %s: it is the deadline on one "+
+			"connection, and a connection holds one of the server's handler slots for as long as it "+
+			"lasts", c.Server.ReadTimeout, maxServerTimeout)
+	}
 	if c.Server.WriteTimeout < 0 {
 		return fmt.Errorf("server.write_timeout must not be negative")
+	}
+	if c.Server.WriteTimeout > maxServerTimeout {
+		return fmt.Errorf("server.write_timeout (%s) must not exceed %s: it is the deadline on one "+
+			"connection, and a connection holds one of the server's handler slots for as long as it "+
+			"lasts", c.Server.WriteTimeout, maxServerTimeout)
 	}
 	if c.Security.RateLimiting.MaxConcurrentAuths < 0 {
 		return fmt.Errorf("security.rate_limiting.max_concurrent_auths must be non-negative (0 = unlimited)")
@@ -465,8 +531,20 @@ func (c *Config) Validate() error {
 
 	// No check on MinUID == 0: it means "unset, use the default", so that a Config
 	// built in code rather than loaded from a file gets the floor rather than an
-	// error. Disabling the floor is a negative value, which is deliberately harder
-	// to type by accident.
+	// error.
+	//
+	// A negative value turns the floor off entirely — pkg/mapper's check is
+	// `minUID >= 0 && uid < minUID` — leaving only the system-account name
+	// denylist, which on an LDAP/SSSD host a broker built without cgo cannot even
+	// resolve names against. That is not a setting worth having: a site with real
+	// accounts below 1000 says so by naming the lowest UID it means to allow, and
+	// nothing else needs the floor gone.
+	if c.Mapper.MinUID < 0 {
+		return fmt.Errorf("mapper.min_uid must not be negative (got %d): a negative value disables "+
+			"the UID floor for every tier; to allow accounts below 1000, set the lowest UID you "+
+			"mean to allow", c.Mapper.MinUID)
+	}
+
 	for i, name := range c.Mapper.AllowSystemUsers {
 		if strings.EqualFold(name, "root") {
 			return fmt.Errorf("mapper.allow_system_users[%d]: root cannot be allowed", i)
@@ -476,6 +554,16 @@ func (c *Config) Validate() error {
 	// Require HTTPS for the mapper HTTP endpoint to protect identity data in transit.
 	if c.Mapper.HTTPEndpoint != "" && !strings.HasPrefix(c.Mapper.HTTPEndpoint, "https://") {
 		return fmt.Errorf("mapper.http_endpoint must use HTTPS (got %q)", c.Mapper.HTTPEndpoint)
+	}
+
+	// The asymmetry this closes: http_endpoint, the tier that cannot execute
+	// anything, has been checked since the beginning, and external_script — which
+	// pkg/mapper hands to exec.CommandContext as root on every tier-2 login — was
+	// not checked at all.
+	if c.Mapper.ExternalScript != "" {
+		if err := checkMapperScript(c.Mapper.ExternalScript); err != nil {
+			return fmt.Errorf("mapper.external_script: %w", err)
+		}
 	}
 
 	// Validate mapper has at least one tier configured
@@ -490,6 +578,53 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+// checkMapperScript refuses a tier-2 mapping script that a user other than root
+// could choose the contents of.
+//
+// The reasoning is the one in secrets.go, with the consequence turned up: for a
+// secret file the question is who can read or replace it, and for this file it is
+// only who can replace it — because whoever can is choosing what runs as root on
+// this host, on every tier-2 login. So the mode check is for group and other
+// write rather than for any access at all, and the directory and the ownership
+// matter for exactly the reasons they do there.
+func checkMapperScript(path string) error {
+	// A bare name with no separator would be resolved through the broker's PATH at
+	// exec time, which makes what runs as root depend on the unit's environment
+	// rather than on this file.
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("%q must be an absolute path", path)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&fs.ModeSymlink != 0 {
+		return fmt.Errorf("%s is a symlink; name the file itself, so that the file checked "+
+			"here is the file that runs", path)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", path)
+	}
+	if perm := info.Mode().Perm(); perm&0o022 != 0 {
+		return fmt.Errorf("%s is writable by group or other (mode %04o), and it runs as root on "+
+			"every tier-2 login; run: chmod 755 %s", path, perm, path)
+	}
+	// Not executable is a different failure and a quiet one: exec fails, the mapper
+	// falls through to the next tier, and tier 2 is simply never consulted again.
+	if perm := info.Mode().Perm(); perm&0o111 == 0 {
+		return fmt.Errorf("%s is not executable (mode %04o), so every tier-2 lookup would fail "+
+			"and fall through; run: chmod 755 %s", path, perm, path)
+	}
+	if uid, ok := fileOwner(info); ok {
+		if euid := os.Geteuid(); uid != 0 && uid != uint32(euid) { // #nosec G115 -- a uid fits a uid
+			return fmt.Errorf("%s is owned by uid %d, which is neither root nor this process "+
+				"(uid %d), so that user chooses what runs as root here; run: chown root %s",
+				path, uid, euid, path)
+		}
+	}
+	return checkDirPerms(filepath.Dir(path))
+}
+
 func isSupportedProviderType(t string) bool {
 	for _, s := range SupportedProviderTypes {
 		if s == t {
@@ -502,6 +637,15 @@ func isSupportedProviderType(t string) bool {
 func isSupportedAuditOutputType(t string) bool {
 	for _, s := range SupportedAuditOutputTypes {
 		if s == t {
+			return true
+		}
+	}
+	return false
+}
+
+func isSupportedLogLevel(l string) bool {
+	for _, s := range SupportedLogLevels {
+		if s == l {
 			return true
 		}
 	}

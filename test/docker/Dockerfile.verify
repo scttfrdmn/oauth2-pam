@@ -1,7 +1,12 @@
-# The image behind `make verify-linux`: the vet/test/lint sweep CI runs, but with
-# the PAM and json-c headers present, so cmd/pam-module is genuinely included
-# rather than skipped. On macOS `go build ./...` cannot link against libpam, so
-# without this the only way to compile the C locally is to push and read CI.
+# The image behind `make verify-linux`: the vet/test/lint sweep CI runs, plus the
+# things that only exist on Linux — the PAM module's C and the suite that tests it.
+#
+# The headers are here for the C, not for Go. They used to be needed by `go build
+# ./...` itself, because cmd/pam-module was a cgo package and Go compiled the bridge
+# as part of it. Since #65 the module is plain C with no Go in the package at all, so
+# a Go-only sweep would no longer touch the C in any way — which is why this target
+# now invokes the compiler and the C suite explicitly. Without that, "verify-linux
+# passed" would have quietly stopped meaning the C compiles.
 #
 # The source is not copied in — the Makefile target mounts the working tree, so
 # an edit is picked up without rebuilding the image.

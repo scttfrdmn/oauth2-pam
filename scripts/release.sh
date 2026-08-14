@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Cut a release: stamp the README badge, roll [Unreleased] into a dated section,
-# commit, tag, and (after confirmation) push.
+# Cut a release: stamp the README badge and SECURITY.md's version claims, roll
+# [Unreleased] into a dated section, commit, tag, and (after confirmation) push.
 #
 # The Release workflow re-checks that the tag, the README badge and the CHANGELOG
 # all agree. This script exists so that check is never the thing that tells you
@@ -43,11 +43,24 @@ else
     die "README.md has no version badge; the Release workflow's check needs one"
 fi
 
-# 2. Roll [Unreleased] into a dated section, leaving a fresh empty one behind.
+# 2. SECURITY.md's supported-versions row, and the version its "what is verified"
+# section is stated as of. Both were hand-maintained and both spent a release cycle
+# wrong — v0.3.0 shipped while the policy document called the newest supported
+# version 0.2.x, i.e. declared the release being cut unsupported. A version claim
+# stays true only if whatever changes the version rewrites it.
+MINOR="${VERSION%.*}"
+grep -qE '^\| [0-9]+\.[0-9]+\.x \| yes \|' SECURITY.md \
+    || die "SECURITY.md has no '| X.Y.x | yes |' row to update"
+perl -pi -e "s{^\| [0-9]+\.[0-9]+\.x \| yes \|.*}{| ${MINOR}.x | yes | the current release |}" SECURITY.md
+
+grep -q 'as of v[0-9]' SECURITY.md || die "SECURITY.md has no 'as of vX.Y.Z' to update"
+perl -pi -e "s{as of v[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.-]*}{as of v$VERSION}" SECURITY.md
+
+# 3. Roll [Unreleased] into a dated section, leaving a fresh empty one behind.
 DATE="$(date -u +%Y-%m-%d)"
 perl -0pi -e "s{^## \[Unreleased\]\n}{## [Unreleased]\n\n## [$VERSION] - $DATE\n}m" CHANGELOG.md
 
-# 3. Show the operator what will be published before anything is committed.
+# 4. Show the operator what will be published before anything is committed.
 echo
 echo "--- release notes for $TAG ---"
 awk -v v="$VERSION" '
@@ -60,9 +73,9 @@ echo
 
 git --no-pager diff --stat
 read -r -p "Commit, tag $TAG and push? [y/N] " reply
-[ "$reply" = "y" ] || [ "$reply" = "Y" ] || { git checkout -- README.md CHANGELOG.md; die "aborted"; }
+[ "$reply" = "y" ] || [ "$reply" = "Y" ] || { git checkout -- README.md CHANGELOG.md SECURITY.md; die "aborted"; }
 
-git add README.md CHANGELOG.md
+git add README.md CHANGELOG.md SECURITY.md
 git commit -m "chore(release): $TAG"
 git tag -a "$TAG" -m "oauth2-pam $TAG"
 git push origin main

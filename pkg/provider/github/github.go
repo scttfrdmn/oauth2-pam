@@ -11,8 +11,11 @@ package github
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -63,9 +66,9 @@ func EnterpriseEndpoints(baseURL string) Endpoints {
 }
 
 // validate checks that every endpoint is set and parses, and returns the set of
-// hostnames redirects may target.
+// origins redirects may target.
 func (e Endpoints) validate() (map[string]struct{}, error) {
-	hosts := make(map[string]struct{}, 3)
+	origins := make(map[string]struct{}, 3)
 	for name, raw := range map[string]string{
 		"device_auth": e.DeviceAuth,
 		"token":       e.Token,
@@ -81,9 +84,16 @@ func (e Endpoints) validate() (map[string]struct{}, error) {
 		if u.Host == "" {
 			return nil, fmt.Errorf("github endpoints: %s must be absolute (got %q)", name, raw)
 		}
-		hosts[u.Hostname()] = struct{}{}
+		origins[redirectOrigin(u)] = struct{}{}
 	}
-	return hosts, nil
+	return origins, nil
+}
+
+// redirectOrigin is the key an endpoint and a redirect target are compared by:
+// scheme and hostname, without the port. The scheme is part of it because
+// dropping it permits a downgrade — see CheckRedirect in NewWithEndpoints.
+func redirectOrigin(u *url.URL) string {
+	return u.Scheme + "://" + u.Hostname()
 }
 
 // Provider is a GitHub OAuth2 provider that supports Device Flow auth. It
@@ -134,6 +144,57 @@ type gitHubTeam struct {
 	Organization gitHubOrg `json:"organization"`
 }
 
+// Response body bounds. Every body below arrives from the GitHub instance an
+// operator pointed the broker at — on a GHES, a machine this host does not
+// control — and nothing on the wire says how long a response will be until it
+// has already been buffered. A broker that runs out of memory takes every OAuth
+// login on the host down with it, so each decode gets a ceiling. Both figures
+// are orders of magnitude above what a real response needs: reaching one means
+// the peer is broken or hostile, not that a large site was unlucky.
+const (
+	// maxAuthResponseSize bounds the device authorization and token endpoint
+	// bodies. Each is a handful of short fields — github.com's are under 512
+	// bytes, and the longest value either can carry is an error_description — so
+	// 64 KB is the same "generous but bounded" figure the IPC server allows for a
+	// PAM request.
+	maxAuthResponseSize = 64 * 1024
+
+	// maxAPIResponseSize bounds one REST API page. The largest real body is a
+	// per_page=100 page of /user/teams, where every entry carries a full team
+	// object and its parent organization: a few hundred KB. 1 MB leaves room for a
+	// GHES that is more verbose than github.com, and keeps the worst case of a
+	// paginated walk at maxAPIPages × 1 MB of transient decode buffer.
+	maxAPIResponseSize = 1024 * 1024
+)
+
+// Device flow bounds. expires_in and interval are numbers the provider chooses,
+// and they become a session deadline and a poll sleep in the broker, so neither
+// is taken as given.
+const (
+	// defaultDeviceCodeLifetime is github.com's own expires_in, applied when the
+	// response omits the field or sends a value that cannot be a lifetime.
+	// Without it, a missing expires_in produced an ExpiresAt of "now" and the
+	// login was dead before the user could read the code.
+	defaultDeviceCodeLifetime = 15 * time.Minute
+
+	// maxDeviceCodeLifetime caps how long a pending session may sit waiting for a
+	// user to approve. It also removes an overflow: time.Duration(expires_in) *
+	// time.Second wraps past int64 nanoseconds above ~9.2e9 seconds, so an absurd
+	// expires_in became an ExpiresAt in the *past*. The broker applies
+	// authentication.device_flow_timeout on top of this; 30 minutes is the bound
+	// that still holds when that setting is unset.
+	maxDeviceCodeLifetime = 30 * time.Minute
+
+	// defaultPollInterval is RFC 8628 §3.5's default for a missing interval.
+	defaultPollInterval = 5
+
+	// maxPollInterval bounds the interval upward, in seconds. A provider that
+	// answers "poll me in a year" is a slow-loris: the pending session and its
+	// polling goroutine stay alive while the flow makes no progress. At 60s a
+	// flow still gets many attempts inside maxDeviceCodeLifetime.
+	maxPollInterval = 60
+)
+
 // New creates a new GitHub provider from the given config. It targets
 // github.com unless the config names a GitHub Enterprise Server base_url.
 func New(cfg config.ProviderConfig) (*Provider, error) {
@@ -156,7 +217,7 @@ func NewWithEndpoints(cfg config.ProviderConfig, endpoints Endpoints) (*Provider
 		return nil, fmt.Errorf("github provider: client_secret is required")
 	}
 
-	allowedHosts, err := endpoints.validate()
+	allowedOrigins, err := endpoints.validate()
 	if err != nil {
 		return nil, err
 	}
@@ -167,13 +228,22 @@ func NewWithEndpoints(cfg config.ProviderConfig, endpoints Endpoints) (*Provider
 		endpoints: endpoints,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
-			// Only follow redirects back to a host we were configured to talk
+			// Only follow redirects back to an origin we were configured to talk
 			// to. A redirect anywhere else indicates a misconfiguration or a
 			// MITM attempt, and would leak the bearer token if followed.
+			//
+			// The scheme is half of that origin, and comparing hostnames alone
+			// was the hole: net/http's own shouldCopyHeaderOnRedirect compares
+			// hostnames and ignores the scheme, so an https→http redirect to the
+			// same host kept the Authorization header and put a live access token
+			// on the wire in cleartext. nextPageURL pins scheme and host for the
+			// pagination cursor, which is the same threat by another route; the
+			// two disagreeing is what made this a bug rather than a style
+			// difference.
 			CheckRedirect: func(req *http.Request, _ []*http.Request) error {
-				h := req.URL.Hostname()
-				if _, ok := allowedHosts[h]; !ok {
-					return fmt.Errorf("redirect to unconfigured host %q rejected", h)
+				origin := redirectOrigin(req.URL)
+				if _, ok := allowedOrigins[origin]; !ok {
+					return fmt.Errorf("redirect to unconfigured origin %q rejected", origin)
 				}
 				return nil
 			},
@@ -213,7 +283,7 @@ func (p *Provider) StartDeviceFlow(ctx context.Context) (*provider.DeviceFlow, e
 	}
 
 	var dar deviceAuthResponse
-	if err := json.NewDecoder(resp.Body).Decode(&dar); err != nil {
+	if err := decodeJSONBody(resp.Body, maxAuthResponseSize, &dar); err != nil {
 		return nil, fmt.Errorf("github device flow: decode response: %w", err)
 	}
 
@@ -222,16 +292,30 @@ func (p *Provider) StartDeviceFlow(ctx context.Context) (*provider.DeviceFlow, e
 		verifyURL = dar.VerificationURIComplete
 	}
 
+	// Clamp both provider-supplied numbers here, where they are read, rather than
+	// leaving the broker to defend itself against a deadline in the past or a
+	// poll interval measured in weeks.
+	lifetimeSeconds := dar.ExpiresIn
+	switch {
+	case lifetimeSeconds <= 0:
+		lifetimeSeconds = int(defaultDeviceCodeLifetime / time.Second)
+	case lifetimeSeconds > int(maxDeviceCodeLifetime/time.Second):
+		lifetimeSeconds = int(maxDeviceCodeLifetime / time.Second)
+	}
+
 	interval := dar.Interval
-	if interval <= 0 {
-		interval = 5
+	switch {
+	case interval <= 0:
+		interval = defaultPollInterval
+	case interval > maxPollInterval:
+		interval = maxPollInterval
 	}
 
 	df := &provider.DeviceFlow{
 		DeviceCode:      dar.DeviceCode,
 		UserCode:        dar.UserCode,
 		DeviceURL:       verifyURL,
-		ExpiresAt:       time.Now().Add(time.Duration(dar.ExpiresIn) * time.Second),
+		ExpiresAt:       time.Now().Add(time.Duration(lifetimeSeconds) * time.Second),
 		PollingInterval: interval,
 	}
 
@@ -270,7 +354,7 @@ func (p *Provider) PollDeviceAuthorization(ctx context.Context, deviceCode strin
 	defer func() { _ = resp.Body.Close() }()
 
 	var tr tokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
+	if err := decodeJSONBody(resp.Body, maxAuthResponseSize, &tr); err != nil {
 		return nil, fmt.Errorf("github poll: decode response: %w", err)
 	}
 
@@ -297,7 +381,7 @@ func (p *Provider) PollDeviceAuthorization(ctx context.Context, deviceCode strin
 		AccessToken: tr.AccessToken,
 		TokenType:   tr.TokenType,
 		Scope:       tr.Scope,
-		Fingerprint: tokenDisplayLabel(tr.AccessToken),
+		Fingerprint: tokenFingerprint(tr.AccessToken),
 	}
 
 	// Fail fast if any required scope is absent. Missing scopes cause silent
@@ -434,10 +518,26 @@ func (p *Provider) checkAccess(id *provider.Identity) error {
 
 // GitHub API helpers
 
+// getUser fetches GET /user, the call every later decision is built on.
+//
+// An empty login is refused here, at the point the value enters the system. There
+// is no such thing as a GitHub account without one, so a /user response missing it
+// is a malformed reply — from a GHES that answered with an error body, a proxy that
+// rewrote it, or a decode that produced the zero value — and not an identity.
+//
+// Refusing it downstream is not enough, which is the lesson of #80: an empty login
+// is not merely useless, it is a wildcard. It matched an enrollment record whose
+// own login was missing, in the most authoritative mapping tier, so the pair
+// ("", "") granted whichever local account that record named. Store.Find, Store.Add
+// and the mapper each refuse it now, and each of those is a different reader of the
+// same value; the provider is where it stops being possible to produce.
 func (p *Provider) getUser(ctx context.Context, accessToken string) (*gitHubUser, error) {
 	var user gitHubUser
 	if err := p.apiGet(ctx, accessToken, "/user", &user); err != nil {
 		return nil, err
+	}
+	if user.Login == "" {
+		return nil, fmt.Errorf("GET /user returned no login; the response is not a GitHub user")
 	}
 	return &user, nil
 }
@@ -474,10 +574,17 @@ const (
 	// a member whose org fell off page one was denied the login.
 	apiPageSize = 100
 
-	// maxAPIPages bounds the walk at 2,000 entries. The cursor comes from the
-	// server, so a loop that only stops when it says to is a loop a broken or
-	// hostile API can hold a login open in.
+	// maxAPIPages bounds the number of requests one walk may make. The cursor comes
+	// from the server, so a loop that only stops when it says to is a loop a broken
+	// or hostile API can hold a login open in.
 	maxAPIPages = 20
+
+	// maxAPIEntries bounds what a walk accumulates. maxAPIPages alone does not:
+	// nothing obliges a server to honour per_page, so twenty pages of minimal
+	// objects — `{"login":"a"}` is fourteen bytes — fit hundreds of thousands of
+	// entries inside maxAPIResponseSize each, and those are retained rather than
+	// transient. 2,000 is the count maxAPIPages was always meant to imply.
+	maxAPIEntries = maxAPIPages * apiPageSize
 )
 
 // apiGetAll fetches every page of a paginated GitHub list endpoint, following the
@@ -500,6 +607,9 @@ func apiGetAll[T any](ctx context.Context, p *Provider, accessToken, path string
 			return nil, err
 		}
 		all = append(all, batch...)
+		if len(all) > maxAPIEntries {
+			return nil, fmt.Errorf("GET %s: more than %d entries", path, maxAPIEntries)
+		}
 
 		// An empty page with a next cursor is how a server could keep this loop
 		// going for free; maxAPIPages is the real bound, but stopping here means
@@ -602,21 +712,47 @@ func (p *Provider) apiGetURL(ctx context.Context, accessToken, rawURL string, de
 		return "", fmt.Errorf("GET %s: unexpected status %d", rawURL, resp.StatusCode)
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(dest); err != nil {
+	if err := decodeJSONBody(resp.Body, maxAPIResponseSize, dest); err != nil {
 		return "", fmt.Errorf("decode %s: %w", rawURL, err)
 	}
 
 	return resp.Header.Get("Link"), nil
 }
 
-// tokenDisplayLabel returns a human-readable prefix…suffix label for audit logs.
-// It is NOT cryptographic — use the SHA-256 fingerprint in TokenManager for
-// collision-resistant identification.
-func tokenDisplayLabel(accessToken string) string {
-	if len(accessToken) < 16 {
-		return accessToken
+// decodeJSONBody decodes a JSON response body into dest, refusing a body longer
+// than limit instead of buffering it.
+//
+// The reader is allowed limit+1 bytes so that the two cases stay
+// distinguishable: a body at or under the limit decodes as it always did, and
+// one over it is reported as too large rather than as the "unexpected end of
+// JSON input" a bare truncation would produce — an operator reading that in a
+// log would go looking for the wrong fault.
+func decodeJSONBody(body io.Reader, limit int64, dest interface{}) error {
+	limited := &io.LimitedReader{R: body, N: limit + 1}
+	err := json.NewDecoder(limited).Decode(dest)
+	if limited.N <= 0 {
+		return fmt.Errorf("response exceeds the %d byte limit", limit)
 	}
-	return accessToken[:8] + "..." + accessToken[len(accessToken)-8:]
+	return err
+}
+
+// tokenFingerprint returns a label that identifies an access token in logs and
+// audit records without containing any of it: the first 16 bytes of its SHA-256
+// digest, hex-encoded.
+//
+// It replaces a prefix…suffix elision that carried 16 bytes of the live secret
+// into Session.TokenFingerprint. That was not being written anywhere, but "for
+// audit logs" is an invitation to write it later, and by the time someone does
+// the decision has already been made.
+//
+// An unkeyed digest is enough here: the input is a high-entropy secret, so there
+// is no dictionary to walk back from the digest, and an HMAC would only add a key
+// to manage and rotate. Truncating to 16 bytes matches TokenManager's
+// fingerprintToken, so a session and its stored token show the same value and can
+// be lined up in an audit trail.
+func tokenFingerprint(accessToken string) string {
+	sum := sha256.Sum256([]byte(accessToken))
+	return hex.EncodeToString(sum[:16])
 }
 
 // RevokeAccessToken revokes an OAuth2 access token via the GitHub API.

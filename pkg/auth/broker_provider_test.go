@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -38,6 +40,20 @@ type fakeProvider struct {
 	// codeLifetime is how long an issued device code stays valid at the provider.
 	// Deliberately much longer than any login, like github.com's 15 minutes.
 	codeLifetime time.Duration
+
+	// identityGate, when non-nil, holds GetIdentity until it is closed, and
+	// identityCtxErr records what the poll context said once it was released. A
+	// completed flow really can stall here — GetIdentity retries two seconds
+	// apart, and the mapper's NSS lookup takes no context at all — and holding
+	// that window open is the only way a test outside the broker can arrange for a
+	// flow to finish after its own deadline.
+	identityGate   chan struct{}
+	identityCtxErr error
+
+	// startDelay is how long StartDeviceFlow takes to answer. A real one is an
+	// HTTPS round trip, and a test that wants concurrent Authenticate calls to
+	// actually overlap has to make it cost something.
+	startDelay time.Duration
 }
 
 func newFakeProvider(name string) *fakeProvider {
@@ -62,7 +78,12 @@ func (f *fakeProvider) StartDeviceFlow(context.Context) (*provider.DeviceFlow, e
 	f.flows++
 	code := fmt.Sprintf("device-code-%s-%d", f.name, f.flows)
 	lifetime := f.codeLifetime
+	delay := f.startDelay
 	f.mu.Unlock()
+
+	if delay > 0 {
+		time.Sleep(delay)
+	}
 
 	return &provider.DeviceFlow{
 		DeviceCode:      code,
@@ -84,16 +105,45 @@ func (f *fakeProvider) PollDeviceAuthorization(_ context.Context, deviceCode str
 		return nil, fmt.Errorf("acme-sso poll: %w", provider.ErrAuthorizationPending)
 	}
 	return &provider.Token{
-		AccessToken: "acme-token",
+		AccessToken: fakeAccessToken,
 		TokenType:   "bearer",
 		Scope:       "openid profile groups",
-		Fingerprint: "acme-to...ken",
+		Fingerprint: fakeTokenFingerprint(fakeAccessToken),
 	}, nil
 }
 
-func (f *fakeProvider) GetIdentity(context.Context, *provider.Token) (*provider.Identity, error) {
+// fakeAccessToken is the token this provider issues. Short and obviously fake, so
+// a log line containing any of it is recognisable as a leak.
+const fakeAccessToken = "acme-token"
+
+// fakeTokenFingerprint produces what provider.Token.Fingerprint is specified to
+// carry: hex(sha256(token)[:16]), the same value pkg/provider/github and
+// TokenManager compute, which is what lets a session be lined up with its stored
+// token in an audit trail.
+//
+// Computed rather than written out, and deliberately not the old
+// "acme-to...ken" — that elision is the format this field used to have, and it
+// carried bytes of the live secret. A fixture imitating it teaches the next
+// reader an obsolete and unsafe shape.
+func fakeTokenFingerprint(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:16])
+}
+
+func (f *fakeProvider) GetIdentity(ctx context.Context, _ *provider.Token) (*provider.Identity, error) {
+	f.mu.Lock()
+	gate := f.identityGate
+	f.mu.Unlock()
+
+	// Waited on outside the lock: pollCount and authorize are what a test uses
+	// while the flow is held here.
+	if gate != nil {
+		<-gate
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.identityCtxErr = ctx.Err()
 	return f.identity, nil
 }
 
@@ -114,6 +164,26 @@ func (f *fakeProvider) failWith(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pollErr = err
+}
+
+// blockIdentity holds every GetIdentity call until the returned func is called,
+// so a test can choose when a flow that is already approved at the provider
+// finishes at the broker.
+func (f *fakeProvider) blockIdentity() (release func()) {
+	gate := make(chan struct{})
+	f.mu.Lock()
+	f.identityGate = gate
+	f.mu.Unlock()
+	return func() { close(gate) }
+}
+
+// identityContextErr reports the state of the poll context as GetIdentity last
+// saw it, which is how a test observes whether the flow's deadline reached the
+// work rather than only the session record.
+func (f *fakeProvider) identityContextErr() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.identityCtxErr
 }
 
 // pollCount reports how many times the nth issued device code (1-based) has been
@@ -176,6 +246,25 @@ func awaitStatus(t *testing.T, b *Broker, sessionID string) *AuthResponse {
 	}
 	t.Fatalf("session %s never left %q", sessionID, StatusPending)
 	return nil
+}
+
+// awaitPollerExit waits for a session's polling goroutine to finish. The poller
+// drops its cancel entry as its last act, so this is how a test knows the flow
+// reached its conclusion — including a conclusion that changes nothing, which no
+// session field records and no sleep can be trusted to cover.
+func awaitPollerExit(t *testing.T, b *Broker, sessionID string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		b.sessionMutex.RLock()
+		_, polling := b.pollCancel[sessionID]
+		b.sessionMutex.RUnlock()
+		if !polling {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("the poller for session %s never finished", sessionID)
 }
 
 // TestNonGitHubProviderAuthenticatesEndToEnd is the validation for the provider
