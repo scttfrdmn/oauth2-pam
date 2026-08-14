@@ -7,3 +7,6 @@ coverage.html
 /oauth2-pam-admin
 /oauth2-pam-broker
 /oauth2-pam-enroll
+
+# agent scratch worktrees
+/.claude/worktrees/
