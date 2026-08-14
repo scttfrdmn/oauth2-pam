@@ -233,6 +233,15 @@ run "every terminal status is a successful login" fail \
 run "an unknown broker status grants the login" fail \
     '$n = s/(    log_pam_message\(LOG_ERR, "Unknown broker status .*\n.*\n)    return PAM_AUTH_ERR;/$1    return PAM_SUCCESS;/g'
 
+# The "error" status losing its own branch, so RATE_LIMITED, AUTH_LIMIT_REACHED and
+# SESSION_LIMIT_REACHED all fall through to the unknown-status branch and report
+# PAM_AUTH_ERR. Not a fail-open, which is why a suite asserting only "no terminal
+# status is a login" would call it equivalent — it is a host that is busy, or a user
+# who is already logged in as often as the operator allows, told that their
+# credential was wrong.
+run "a capacity refusal is reported as a bad credential" fail \
+    '$n = s/if \(strcmp\(r->status, STATUS_ERROR\) == 0\) \{/if (0) {/'
+
 # The account stage (issue #75). Its whole reason to exist is that authorization can
 # be withdrawn after authentication succeeded, so every mutation below is a version
 # of the stage this module shipped before: one that answers "fine, decided earlier".

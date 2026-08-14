@@ -963,6 +963,20 @@ static int terminal_status_to_pam(const struct broker_response *r, const char *u
                             "refusing %s (max_concurrent_auths)", username);
             return PAM_AUTHINFO_UNAVAIL;
         }
+        /* The other capacity refusal, and the one that names a limit the operator
+           set per user rather than per host — so it needs a message of its own or
+           "logins are being refused" has two indistinguishable causes. It reached
+           this branch only after issue #84: the broker used to send it as
+           status "denied", which lands on the PAM_AUTH_ERR branch above and tells
+           the user their credentials were wrong when the truth is that they are
+           already logged in elsewhere. Both capacity codes are status "error" now,
+           so both answer PAM_AUTHINFO_UNAVAIL. */
+        if (strcmp(r->error_code, "SESSION_LIMIT_REACHED") == 0) {
+            log_pam_message(LOG_WARNING,
+                            "%s already holds the maximum number of active sessions; "
+                            "refusing this one (max_concurrent_sessions)", username);
+            return PAM_AUTHINFO_UNAVAIL;
+        }
         log_pam_message(LOG_ERR, "Broker error authenticating %s: %s (%s)",
                         username, r->error_message, r->error_code);
         return PAM_AUTHINFO_UNAVAIL;

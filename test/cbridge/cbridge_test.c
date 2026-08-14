@@ -917,6 +917,24 @@ static void test_terminal_status_to_pam(void) {
         free(r);
     }
 
+    /* The other capacity refusal. It used to arrive as status "denied", which is
+       the PAM_AUTH_ERR branch — telling a user their credentials were wrong when
+       what happened is that they are already logged in as many times as the
+       operator allows. Since issue #84 both capacity codes are status "error",
+       which is the same shape as AUTH_LIMIT_REACHED above and the same answer. */
+    r = parsed("{\"status\":\"error\",\"error_code\":\"SESSION_LIMIT_REACHED\","
+               "\"error_message\":\"Maximum concurrent sessions reached\"}");
+    CHECK(r != NULL, "a session-limit reply did not parse");
+    if (r != NULL) {
+        rc = terminal_status_to_pam(r, "alice");
+        CHECK(rc == PAM_AUTHINFO_UNAVAIL,
+              "SESSION_LIMIT_REACHED mapped to %d, want PAM_AUTHINFO_UNAVAIL (%d)",
+              rc, PAM_AUTHINFO_UNAVAIL);
+        CHECK(rc != PAM_AUTH_ERR,
+              "a full session table was reported to the user as a bad credential");
+        free(r);
+    }
+
     r = parsed("{\"status\":\"error\",\"error_code\":\"DEVICE_FLOW_FAILED\","
                "\"error_message\":\"provider unreachable\"}");
     CHECK(r != NULL, "an error reply did not parse");
