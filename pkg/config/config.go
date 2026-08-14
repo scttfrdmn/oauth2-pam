@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -156,6 +158,10 @@ type MapperConfig struct {
 	// ExternalScript is the path to an external mapping script (Tier 2).
 	// The script receives an Identity JSON object on stdin and must write
 	// a MappingResult JSON object to stdout.
+	//
+	// It runs as root on every tier-2 login, so Validate requires an absolute path
+	// to a regular, executable file that only root can replace — see
+	// checkMapperScript.
 	ExternalScript string `mapstructure:"external_script"`
 
 	// ExternalScriptTimeout is how long to wait for the script (default 5s)
@@ -171,8 +177,9 @@ type MapperConfig struct {
 	// MinUID is the lowest UID an identity may be mapped to (default 1000, the
 	// UID_MIN of every mainstream distribution). It applies to every tier.
 	//
-	// A negative value disables the floor, leaving only the system-account name
-	// denylist. UID 0 is refused either way.
+	// 0 means unset. A negative value would disable the floor entirely, and
+	// Validate rejects one: a site with real accounts below 1000 names the lowest
+	// UID it means to allow instead. UID 0 is refused whatever this says.
 	MinUID int `mapstructure:"min_uid"`
 
 	// AllowSystemUsers exempts named accounts from the built-in system-account
@@ -381,6 +388,13 @@ func (c *Config) Validate() error {
 	if c.Server.SocketPath == "" {
 		return fmt.Errorf("server.socket_path is required")
 	}
+	// A relative socket path is resolved against the broker's working directory,
+	// which under systemd is / and is nothing an operator chose. The PAM module
+	// has its own compiled-in path and would look somewhere else entirely, so the
+	// symptom would be logins failing against a broker that started cleanly.
+	if !filepath.IsAbs(c.Server.SocketPath) {
+		return fmt.Errorf("server.socket_path must be an absolute path (got %q)", c.Server.SocketPath)
+	}
 
 	// Empty means "unset": LoadConfig always supplies the default, so an empty
 	// value is a Config built in code, which keeps the level cmd/broker's flag
@@ -496,8 +510,20 @@ func (c *Config) Validate() error {
 
 	// No check on MinUID == 0: it means "unset, use the default", so that a Config
 	// built in code rather than loaded from a file gets the floor rather than an
-	// error. Disabling the floor is a negative value, which is deliberately harder
-	// to type by accident.
+	// error.
+	//
+	// A negative value turns the floor off entirely — pkg/mapper's check is
+	// `minUID >= 0 && uid < minUID` — leaving only the system-account name
+	// denylist, which on an LDAP/SSSD host a broker built without cgo cannot even
+	// resolve names against. That is not a setting worth having: a site with real
+	// accounts below 1000 says so by naming the lowest UID it means to allow, and
+	// nothing else needs the floor gone.
+	if c.Mapper.MinUID < 0 {
+		return fmt.Errorf("mapper.min_uid must not be negative (got %d): a negative value disables "+
+			"the UID floor for every tier; to allow accounts below 1000, set the lowest UID you "+
+			"mean to allow", c.Mapper.MinUID)
+	}
+
 	for i, name := range c.Mapper.AllowSystemUsers {
 		if strings.EqualFold(name, "root") {
 			return fmt.Errorf("mapper.allow_system_users[%d]: root cannot be allowed", i)
@@ -507,6 +533,16 @@ func (c *Config) Validate() error {
 	// Require HTTPS for the mapper HTTP endpoint to protect identity data in transit.
 	if c.Mapper.HTTPEndpoint != "" && !strings.HasPrefix(c.Mapper.HTTPEndpoint, "https://") {
 		return fmt.Errorf("mapper.http_endpoint must use HTTPS (got %q)", c.Mapper.HTTPEndpoint)
+	}
+
+	// The asymmetry this closes: http_endpoint, the tier that cannot execute
+	// anything, has been checked since the beginning, and external_script — which
+	// pkg/mapper hands to exec.CommandContext as root on every tier-2 login — was
+	// not checked at all.
+	if c.Mapper.ExternalScript != "" {
+		if err := checkMapperScript(c.Mapper.ExternalScript); err != nil {
+			return fmt.Errorf("mapper.external_script: %w", err)
+		}
 	}
 
 	// Validate mapper has at least one tier configured
@@ -519,6 +555,53 @@ func (c *Config) Validate() error {
 	}
 
 	return nil
+}
+
+// checkMapperScript refuses a tier-2 mapping script that a user other than root
+// could choose the contents of.
+//
+// The reasoning is the one in secrets.go, with the consequence turned up: for a
+// secret file the question is who can read or replace it, and for this file it is
+// only who can replace it — because whoever can is choosing what runs as root on
+// this host, on every tier-2 login. So the mode check is for group and other
+// write rather than for any access at all, and the directory and the ownership
+// matter for exactly the reasons they do there.
+func checkMapperScript(path string) error {
+	// A bare name with no separator would be resolved through the broker's PATH at
+	// exec time, which makes what runs as root depend on the unit's environment
+	// rather than on this file.
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("%q must be an absolute path", path)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&fs.ModeSymlink != 0 {
+		return fmt.Errorf("%s is a symlink; name the file itself, so that the file checked "+
+			"here is the file that runs", path)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", path)
+	}
+	if perm := info.Mode().Perm(); perm&0o022 != 0 {
+		return fmt.Errorf("%s is writable by group or other (mode %04o), and it runs as root on "+
+			"every tier-2 login; run: chmod 755 %s", path, perm, path)
+	}
+	// Not executable is a different failure and a quiet one: exec fails, the mapper
+	// falls through to the next tier, and tier 2 is simply never consulted again.
+	if perm := info.Mode().Perm(); perm&0o111 == 0 {
+		return fmt.Errorf("%s is not executable (mode %04o), so every tier-2 lookup would fail "+
+			"and fall through; run: chmod 755 %s", path, perm, path)
+	}
+	if uid, ok := fileOwner(info); ok {
+		if euid := os.Geteuid(); uid != 0 && uid != uint32(euid) { // #nosec G115 -- a uid fits a uid
+			return fmt.Errorf("%s is owned by uid %d, which is neither root nor this process "+
+				"(uid %d), so that user chooses what runs as root here; run: chown root %s",
+				path, uid, euid, path)
+		}
+	}
+	return checkDirPerms(filepath.Dir(path))
 }
 
 func isSupportedProviderType(t string) bool {

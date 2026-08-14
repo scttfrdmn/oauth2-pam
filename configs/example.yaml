@@ -106,8 +106,8 @@ mapper:
   # min_uid is the lowest UID an identity may be mapped to. 1000 is UID_MIN on
   # every mainstream distribution, so the default keeps identities off every
   # system and service account the host has. Lower it if you have real human
-  # accounts below 1000; a negative value turns the floor off entirely and leaves
-  # only the name denylist.
+  # accounts below 1000 — by naming the lowest UID you mean to allow. A negative
+  # value, which used to turn the floor off entirely, is rejected at startup.
   #
   # UID 0 is refused unconditionally — not by name, by UID, and neither of these
   # settings can permit it. A device flow has no cryptographic binding to the SSH
@@ -208,6 +208,11 @@ mapper:
   # The script receives an Identity JSON object on stdin and must write
   # a {"local_user": "...", "groups": [...]} JSON object to stdout.
   # Exit non-zero or emit empty/missing local_user to skip to next tier.
+  #
+  # This one runs as root on every login that reaches it, so the broker checks it
+  # at startup and refuses to start unless it is an absolute path (not a bare name
+  # found on PATH) to a regular, executable file that only root can replace —
+  # no group or other write bit, on the file or on the directory holding it.
   #
   # external_script: /usr/local/lib/oauth2-pam/map-user.sh
   # external_script_timeout: 5s
