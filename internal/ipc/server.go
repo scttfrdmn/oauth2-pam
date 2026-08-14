@@ -18,8 +18,14 @@ import (
 )
 
 // maxRequestSize is the largest JSON body accepted from a PAM client.
-// Requests larger than this are rejected before decoding to prevent
-// memory exhaustion attacks.
+//
+// The read is capped at this many bytes, so a caller cannot make the broker
+// allocate without bound. It is a cap on the allocation rather than a check that
+// happens before any decoding: a request is a bare JSON object with no length
+// prefix, so nothing on the wire announces its size in advance and the only way
+// to learn a body is too big is to reach the cap while reading it. See
+// handleConnection, and the note in docs/wire-protocol.md that used to claim the
+// refusal came first.
 const maxRequestSize = 64 * 1024 // 64 KB
 
 // ErrorCodeRateLimited is returned when a request was refused by the rate
@@ -365,6 +371,23 @@ func (s *Server) acceptConnections(ctx context.Context) {
 	}
 }
 
+// countingReader records how many bytes were actually consumed from the wire.
+//
+// It exists so the request-size limit can be reported as a size limit. Wrapping
+// the connection in an io.LimitReader bounds the allocation but says nothing
+// about why the decode failed, and the client is left to guess from "unexpected
+// EOF" whether it sent bad JSON or too much of it.
+type countingReader struct {
+	r io.Reader
+	n int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += n
+	return n, err
+}
+
 func (s *Server) handleConnection(conn net.Conn) {
 	defer s.wg.Done()
 	defer func() { <-s.handlerSlots }()
@@ -372,12 +395,30 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	_ = conn.SetReadDeadline(time.Now().Add(s.readTimeout))
 
-	// Reject requests that exceed the size limit before JSON decoding.
-	limited := io.LimitReader(conn, maxRequestSize+1)
+	// The read stops one byte past the cap: reaching that byte is how an
+	// oversized request is recognised, since there is nothing to check before
+	// decoding starts. counted is what turns that into an answer the caller can
+	// act on — a truncated body makes the decoder report "unexpected EOF", which
+	// tells a client its JSON is malformed when in fact it was too long.
+	counted := &countingReader{r: io.LimitReader(conn, maxRequestSize+1)}
 
 	var req Request
-	if err := json.NewDecoder(limited).Decode(&req); err != nil {
-		log.Error().Err(err).Msg("Decode IPC request")
+	decodeErr := json.NewDecoder(counted).Decode(&req)
+
+	// Checked before decodeErr, and checked even when the decode succeeded: a body
+	// whose closing brace lands exactly on the last byte the limiter allows parses
+	// cleanly and is still over the cap. Refusing here rather than only on the
+	// error path keeps the limit and the behaviour the same number.
+	if counted.n > maxRequestSize {
+		log.Warn().Int("bytes_read", counted.n).Int("max", maxRequestSize).
+			Msg("Refusing an oversized IPC request")
+		_ = conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
+		s.sendError(conn, "INVALID_REQUEST",
+			fmt.Sprintf("Request exceeds the %d-byte limit", maxRequestSize))
+		return
+	}
+	if decodeErr != nil {
+		log.Error().Err(decodeErr).Msg("Decode IPC request")
 		_ = conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
 		s.sendError(conn, "INVALID_REQUEST", "Failed to decode request")
 		return
@@ -421,6 +462,106 @@ func (s *Server) handleConnection(conn net.Conn) {
 		Msg("IPC request handled")
 }
 
+// The byte ceilings on the strings a request may carry. Each one is also a row in
+// the request table of docs/wire-protocol.md, which is what other implementations
+// build against, so the two are changed together.
+//
+// The whole request is already capped at maxRequestSize, so these are not what
+// keeps the broker from allocating without bound. What they bound is where the
+// values *go*: source_ip and target_host are copied verbatim into an audit event
+// (pkg/auth/broker.go), user_agent and device_id are carried into the audit
+// trail, and any of them can reach a log line. Before this list existed a 64 KB
+// user_agent was accepted, which is a 64 KB audit record written by whatever
+// reached the socket.
+//
+// Every ceiling is sized so that nothing a real client sends is refused. The two
+// that are not round numbers are the ones the wire contract sized for a specific
+// value: 45 bytes is an IPv6 literal with a zone, 253 a DNS name.
+const (
+	maxUserIDLen     = 256
+	maxSessionIDLen  = 128
+	maxProviderLen   = 256
+	maxSourceIPLen   = 45
+	maxTargetHostLen = 253
+	maxUserAgentLen  = 512
+	maxDeviceIDLen   = 256
+)
+
+// metadata is a map, so it needs a ceiling on the map as well as on the strings
+// inside it — 3000 keys were accepted before these existed, and the count is the
+// half that a per-value bound does not cover.
+//
+// The reference client sends four entries (service, tty, pid, rhost) and a
+// consumer's extension fields are audit context of the same shape, so 64 entries
+// of a 128-byte key and a 1 KB value is far above anything a real client sends
+// while still bounding one audit record to something a log can hold.
+const (
+	maxMetadataEntries  = 64
+	maxMetadataKeyLen   = 128
+	maxMetadataValueLen = 1024
+)
+
+// requestField is one string from a request together with the ceiling the wire
+// contract puts on it: a name for the error message, the value, and the maximum.
+type requestField struct {
+	name  string
+	value string
+	max   int
+}
+
+// requestFields is every string a request carries.
+//
+// It is a list rather than a run of ifs because the checks used to be written by
+// hand per field, and so which checks a field got depended on who added it:
+// user_agent and device_id arrived with neither a length bound nor a NUL check,
+// while session_id, source_ip and target_host had a length and no NUL check. A
+// field added to Request now gets both by being listed here, and one that is
+// missing is a visible omission in a single place —
+// TestEveryRequestStringIsBounded fails if the list falls behind the struct.
+//
+// type and login_type are deliberately absent: both are whitelisted against a
+// fixed set of values in validateRequest, which bounds them more tightly than a
+// length could.
+func requestFields(req *Request) []requestField {
+	return []requestField{
+		{"user_id", req.UserID, maxUserIDLen},
+		{"session_id", req.SessionID, maxSessionIDLen},
+		// A provider name is only ever compared against the configured ones, but it
+		// reaches the log and the error message, so bound it like the rest.
+		{"provider", req.Provider, maxProviderLen},
+		// Length-bounded and deliberately not parsed. docs/wire-protocol.md
+		// requires a receiver to accept a zoned IPv6 literal, which is exactly what
+		// net.ParseIP refuses, so validating harder here would refuse link-local
+		// logins the contract sized this field for.
+		{"source_ip", req.SourceIP, maxSourceIPLen},
+		{"target_host", req.TargetHost, maxTargetHostLen},
+		{"user_agent", req.UserAgent, maxUserAgentLen},
+		{"device_id", req.DeviceID, maxDeviceIDLen},
+	}
+}
+
+// checkRequestField is the two things every request string has to satisfy.
+//
+// The NUL check is not cosmetic, and it is why it applies to fields nothing here
+// interprets. The other end of this contract is C, where a NUL ends the string:
+// "alice\x00bob" can be audited as one value and acted on as another, and
+// source_ip and target_host reach an audit event unaltered. The PAM module never
+// sends one, so nothing legitimate is refused — this is the last line of defence
+// declining to fail open.
+//
+// The error names the field and its length and never its contents, because it is
+// written to the broker's log. What goes back on the wire stays the generic
+// INVALID_REQUEST.
+func checkRequestField(f requestField) error {
+	if len(f.value) > f.max {
+		return fmt.Errorf("%s too long (%d bytes, max %d)", f.name, len(f.value), f.max)
+	}
+	if strings.ContainsRune(f.value, '\x00') {
+		return fmt.Errorf("%s contains NUL byte", f.name)
+	}
+	return nil
+}
+
 // validateRequest checks that all fields are within expected bounds.
 // Returns a non-nil error if any field is out of range.
 func validateRequest(req *Request) error {
@@ -441,28 +582,10 @@ func validateRequest(req *Request) error {
 	if req.Type == "authenticate" && req.UserID == "" {
 		return fmt.Errorf("authenticate requires a non-empty user_id")
 	}
-	if len(req.UserID) > 256 {
-		return fmt.Errorf("user_id too long (%d bytes)", len(req.UserID))
-	}
-	if strings.ContainsRune(req.UserID, '\x00') {
-		return fmt.Errorf("user_id contains NUL byte")
-	}
-	if len(req.SessionID) > 128 {
-		return fmt.Errorf("session_id too long (%d bytes)", len(req.SessionID))
-	}
-	// A provider name is only ever compared against the configured ones, but it
-	// reaches the log and the error message, so bound it like the rest.
-	if len(req.Provider) > 256 {
-		return fmt.Errorf("provider too long (%d bytes)", len(req.Provider))
-	}
-	if strings.ContainsRune(req.Provider, '\x00') {
-		return fmt.Errorf("provider contains NUL byte")
-	}
-	if len(req.SourceIP) > 45 {
-		return fmt.Errorf("source_ip too long (%d bytes)", len(req.SourceIP))
-	}
-	if len(req.TargetHost) > 253 {
-		return fmt.Errorf("target_host too long (%d bytes)", len(req.TargetHost))
+	for _, f := range requestFields(req) {
+		if err := checkRequestField(f); err != nil {
+			return err
+		}
 	}
 	if req.LoginType != "" &&
 		req.LoginType != "ssh" &&
@@ -470,9 +593,18 @@ func validateRequest(req *Request) error {
 		req.LoginType != "gui" {
 		return fmt.Errorf("invalid login_type %q", req.LoginType)
 	}
+	if len(req.Metadata) > maxMetadataEntries {
+		return fmt.Errorf("metadata has too many entries (%d, max %d)", len(req.Metadata), maxMetadataEntries)
+	}
 	for k, v := range req.Metadata {
-		if strings.ContainsRune(k, '\x00') || strings.ContainsRune(v, '\x00') {
-			return fmt.Errorf("metadata contains NUL byte")
+		if err := checkRequestField(requestField{"metadata key", k, maxMetadataKeyLen}); err != nil {
+			return err
+		}
+		// The offending key is not named in the error for the same reason a value's
+		// contents are not: the error is a log line, and both halves of a metadata
+		// entry are chosen by the caller.
+		if err := checkRequestField(requestField{"metadata value", v, maxMetadataValueLen}); err != nil {
+			return err
 		}
 	}
 	return nil

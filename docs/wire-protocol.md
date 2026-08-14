@@ -81,7 +81,18 @@ Every other paragraph here is in service of that sentence. In particular:
   one JSON object, reads exactly one JSON object, and the connection is closed by
   the broker. There is no framing beyond that: the reply ends at EOF. There is no
   multiplexing, no keep-alive, and no server-initiated message.
-- **A request is at most 64 KiB.** Larger is refused before it is decoded.
+- **A request is at most 64 KiB.** A receiver caps the read at that size instead
+  of growing a buffer to fit, and refuses a larger request with
+  `INVALID_REQUEST`.
+
+  This used to say "refused before it is decoded", which no implementation of
+  this framing can honour and none did: a request is a bare JSON object with no
+  length prefix, so nothing on the wire announces its size in advance and a
+  receiver learns a body is too long only by reaching the cap while reading it.
+  What the cap guarantees is the **allocation**, not the ordering — and a receiver
+  should say which of the two failed, because a body truncated at the cap looks
+  to a JSON parser like malformed input, and a client told its serialization is
+  broken will not go looking at the size of what it sent.
 - **Both ends apply deadlines to every send and receive.** A broker that accepts
   a connection and then says nothing must not be able to hang a login: the client
   is inside `sshd`'s `LoginGraceTime` and has no other timer for a blocked
@@ -173,13 +184,34 @@ with `status`.
 | `protocol_version` | int | Optional. Absent means 1. |
 | `type` | string | `authenticate`, `check_session`, `refresh_session`, `revoke_session`. Anything else is refused. |
 | `user_id` | string | The **local account being logged into** — the PAM username, not the provider's. Required and non-empty for `authenticate`. Max 256 bytes, no NUL. |
-| `session_id` | string | Required for the session verbs. Max 128 bytes. |
+| `session_id` | string | Required for the session verbs. Max 128 bytes, no NUL. |
 | `provider` | string | Optional. Names a configured provider; absent means the broker's default. A name that is not configured is refused rather than replaced by the default. Max 256 bytes, no NUL. |
-| `source_ip` | string | The client address, if the login has one and it really is an address. Max 45 bytes (an IPv6 literal with a scope). A resolved hostname does not belong here. See below: a receiver **must** accept a zone, and an absent value means *origin unknown*. |
-| `target_host` | string | The host being logged **into** — this host. Max 253 bytes. |
+| `source_ip` | string | The client address, if the login has one and it really is an address. Max 45 bytes (an IPv6 literal with a scope), no NUL. A resolved hostname does not belong here. See below: a receiver **must** accept a zone, and an absent value means *origin unknown*. |
+| `target_host` | string | The host being logged **into** — this host. Max 253 bytes, no NUL. |
 | `login_type` | string | `ssh`, `console`, or `gui`. Optional; empty is treated as `ssh`. Any other value is refused. It selects how instructions are formatted, nothing more. |
-| `user_agent`, `device_id` | string | Optional, carried into the audit trail. |
-| `metadata` | object of string→string | Optional. Free-form context for the audit trail: this client sends `service`, `tty`, `pid`, and the unabridged `rhost`. No NUL in keys or values. |
+| `user_agent` | string | Optional, carried into the audit trail. Max 512 bytes, no NUL. |
+| `device_id` | string | Optional, carried into the audit trail. Max 256 bytes, no NUL. |
+| `metadata` | object of string→string | Optional. Free-form context for the audit trail: this client sends `service`, `tty`, `pid`, and the unabridged `rhost`. At most 64 entries, keys max 128 bytes, values max 1024 bytes. No NUL in keys or values. |
+
+Every string above is bounded, including the fields a broker only stores: a
+maximum length *and* no embedded NUL, except for `type` and `login_type`, where
+the enumeration is a tighter bound than either. Both halves of that were missing
+here before v0.4.0 — `user_agent` and `device_id` had no maximum stated and none
+enforced, so a 64 KiB `user_agent` became a 64 KiB audit record written by
+whatever reached the socket, and `metadata` had no bound on its entry count at
+all.
+
+The NUL rule matters most for the fields nothing interprets. The reference client
+is C, where a NUL ends a string, so a value carrying one can be audited as one
+thing and acted on as another; `source_ip` and `target_host` in particular are
+copied into an audit event unaltered. A conformant client never sends one, which
+is the point: refusing it is a receiver declining to fail open, not a constraint
+on anybody's client.
+
+The maxima are ceilings on what reaches an audit record and a log line, not a
+budget a client is expected to manage. They are sized well above anything a real
+client sends — the reference client's `metadata` has four entries — so a receiver
+that has to refuse one is looking at something that is not a login.
 
 Note the two easily-confused fields. `user_id` in a *request* is the local account
 being asked for; `user_id` in a *reply* is the local account the broker
@@ -444,8 +476,16 @@ A **broker**:
    does no work for it.
 5. Keeps a terminal session queryable long enough for one more poll to see the
    outcome.
-6. Bounds every request field, and rejects an oversized request before decoding
-   it.
+6. Bounds every request field — a maximum length *and* no embedded NUL, for each
+   one, including the fields it only stores — and caps the request read at 64 KiB
+   so an oversized request is refused rather than buffered. This item is written
+   as "every field" rather than a list because that is how it was got wrong: the
+   broker here bounded the fields somebody thought to bound, and `user_agent`,
+   `device_id` and the `metadata` entry count were not among them. Test it
+   against the struct the request decodes into, not against the table above.
+   ("Before decoding" is what this item used to require of the size cap; see
+   Transport for why that is not achievable for this framing, and what is
+   required instead.)
 7. Never puts internal error detail on the wire. `error_code` is a category;
    the detail belongs in the broker's log.
 8. Accepts a zoned IPv6 `source_ip` — a validator that rejects `fe80::1%eth0`
