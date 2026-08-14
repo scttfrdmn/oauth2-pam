@@ -1,4 +1,4 @@
-.PHONY: build test test-unit test-integration verify-linux install clean lint fmt vet tidy help
+.PHONY: build test test-unit test-cbridge test-integration verify-linux install clean lint fmt vet tidy help
 
 # Build variables
 BINARY_DIR := bin
@@ -81,6 +81,16 @@ test:
 test-unit:
 	@echo "Running unit tests..."
 	go test $(GO_TEST_FLAGS) ./pkg/... ./internal/...
+
+## Run the C unit tests for the PAM module bridge
+##
+## `go test ./...` cannot see this code at all: the bridge is C, and on macOS
+## cmd/pam-module is not even compiled. These cover the boundaries the container
+## harness cannot provoke — a reply exactly the size of the buffer, a broker that
+## accepts a connection and then goes silent, a broker that hangs up mid-request.
+test-cbridge:
+	@echo "Running C bridge tests..."
+	test/cbridge/run.sh
 
 ## Run the container integration harness (real sshd + PAM vs a real broker)
 test-integration:

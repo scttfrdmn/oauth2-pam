@@ -188,7 +188,7 @@ UsePAM yes
 
 | Argument | Default | Meaning |
 |---|---|---|
-| `socket=PATH` | `/var/run/oauth2-pam/broker.sock` | Broker socket. Must be under `/var/run/oauth2-pam/` and at most 103 bytes. |
+| `socket=PATH` | `/var/run/oauth2-pam/broker.sock` | Broker socket. Must be under `/run/oauth2-pam/` or `/var/run/oauth2-pam/` — the same directory under both names — and at most 103 bytes. |
 | `provider=NAME` | the broker's default | Which configured provider (`providers[].name`) to authenticate against. Omit it and the broker uses the first one configured; a name it does not have is refused rather than substituted. |
 | `poll_interval=N` | 5 (1–60) | Seconds between `check_session` calls. The broker's requested interval wins when it supplies one. |
 | `timeout=N` | 90 (10–900) | Seconds to wait for the user to approve before giving up. |
@@ -340,12 +340,15 @@ oauth2-pam-admin revoke-session <session-id>
 
 ```bash
 make test              # Go suite
+make test-cbridge      # C unit tests for the PAM module bridge
 make test-integration  # container harness: real sshd + PAM vs a real broker
 ```
 
 The end-to-end tests in `internal/ipc` drive a real broker behind a real IPC server over a real Unix socket, with only GitHub itself faked, and they pin the contract that a started device flow is *not* an authentication.
 
 `make test-integration` covers the other half of the protocol, which Go tests cannot reach: two containers, one running `sshd` with `oauth2_pam.so` in `/etc/pam.d/sshd` and one running the broker, with logins driven over a real ssh connection. It needs Docker and nothing else — no OAuth app, no credentials, no network. See [test/integration/README.md](test/integration/README.md) for the cases and how a device-flow prompt is answered without a human.
+
+`make test-cbridge` covers what neither can: the boundaries. The harness drives the C, but it cannot make the broker misbehave in a specific way, so a reply exactly the size of the read buffer, a broker that accepts a connection and then goes silent, and a broker that hangs up mid-request are all tested directly over a `socketpair`. See [test/cbridge/README.md](test/cbridge/README.md).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for how work is tracked (labels, milestones, the roadmap board), what to run before pushing, and the two invariants that are easy to break.
 
@@ -361,6 +364,7 @@ oauth2-pam/
 ├── internal/
 │   └── ipc/                 # Unix socket IPC server
 ├── test/
+│   ├── cbridge/             # C unit tests for the PAM module bridge
 │   └── integration/         # Container harness (sshd + PAM vs broker)
 ├── pkg/
 │   ├── auth/                # Broker, session state machine, token manager
@@ -393,7 +397,7 @@ oauth2-pam/
 - **The local Unix account must already exist**, and the mapping must resolve to the account being logged into.
 - **Supplementary `groups` from the mapper are not applied** to the session ([#12](https://github.com/scttfrdmn/oauth2-pam/issues/12)).
 - **The login requires an interactive terminal**, because the user has to acknowledge the prompt. `scp`, `rsync`, and non-interactive `ssh` cannot complete this flow; keep a key-based or password path available for automation.
-- **A full `sshd` login against real GitHub has not been verified by the test suite**; the broker half of the protocol is covered end to end, the C client half is not.
+- **No test talks to real GitHub.** Every layer below that is exercised on every push: the broker end to end against a fake GitHub (`internal/ipc`), the C bridge's own boundaries (`test/cbridge`), and real `ssh` logins through a real `sshd` with `oauth2_pam.so` in its PAM stack against a real broker (`test/integration`). What none of them prove is behaviour against the live device endpoint — its actual `slow_down` and rate-limit responses, and a real interactive terminal — so treat a first deployment as the thing that verifies that.
 
 ## License
 

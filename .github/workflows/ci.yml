@@ -70,6 +70,19 @@ jobs:
       - run: go vet ./...
       - run: go test -race ./...
 
+      # The Go tests cannot reach the bridge: it is C. This compiles it with
+      # -Werror -Wconversion and exercises the boundaries the container harness
+      # cannot provoke — a reply exactly the size of the buffer, a broker that
+      # accepts and then goes silent, a broker that hangs up mid-request.
+      #
+      # Under sudo because one case binds a socket in /run/oauth2-pam, which is
+      # the only directory validate_socket_path accepts. A skipped case is a
+      # failure unless CBRIDGE_ALLOW_SKIP is set, so this cannot quietly degrade
+      # into "ran everything except the check that needed privileges".
+      # NATIVE=1 keeps it out of Docker — the headers are installed above.
+      - name: C bridge tests
+        run: sudo env NATIVE=1 test/cbridge/run.sh
+
       # `make build` verifies with nm that all six pam_sm_* entry points made it
       # into the .so. v0.1.1 shipped a module with none, and nothing failed.
       - name: Build all binaries and verify PAM entry points

@@ -22,6 +22,8 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <time.h>
+#include <arpa/inet.h>
+#include <sys/time.h>
 #include <json-c/json.h>
 
 static int debug_enabled = 0;
@@ -44,26 +46,82 @@ void log_pam_message_string(int priority, const char *message) {
 }
 
 /* validate_socket_path returns 0 if path is safe, -1 otherwise.
-   Paths must be under /var/run/oauth2-pam/ and must not contain "..". */
+ *
+ * The path must sit directly under a root-owned runtime directory for the
+ * broker, and must not contain "..". Both spellings of that directory are
+ * accepted: /run/oauth2-pam/ is where systemd's RuntimeDirectory= creates it,
+ * and /var/run/oauth2-pam/ is the traditional name for the same place — on every
+ * systemd host /var/run is a symlink to /run. Accepting only the /var/run
+ * spelling meant a perfectly correct socket=/run/oauth2-pam/broker.sock was
+ * refused as unsafe, and the module failed closed with "Invalid socket path"
+ * against a broker it could see.
+ *
+ * The trailing slash in each prefix is load-bearing: without it, a path under an
+ * attacker-created /run/oauth2-pam-evil/ would match.
+ */
 int validate_socket_path(const char *path) {
-    const char *required_prefix = "/var/run/oauth2-pam/";
+    static const char *const allowed_prefixes[] = {
+        "/run/oauth2-pam/",
+        "/var/run/oauth2-pam/",
+    };
+    size_t i;
+    int prefix_ok = 0;
+
     if (path == NULL) return -1;
     /* sun_path is 104 bytes on macOS, 108 on Linux; 103 leaves room for NUL */
     if (strlen(path) > 103) return -1;
-    if (strncmp(path, required_prefix, strlen(required_prefix)) != 0) return -1;
+
+    for (i = 0; i < sizeof(allowed_prefixes) / sizeof(allowed_prefixes[0]); i++) {
+        if (strncmp(path, allowed_prefixes[i], strlen(allowed_prefixes[i])) == 0) {
+            prefix_ok = 1;
+            break;
+        }
+    }
+    if (!prefix_ok) return -1;
     if (strstr(path, "..") != NULL) return -1;
     return 0;
 }
 
-int connect_to_broker(const char *socket_path) {
+/* set_io_timeout bounds every send and receive on sock.
+ *
+ * SO_SNDTIMEO also bounds connect() on a blocking Linux socket, which matters
+ * when the broker's listen backlog is full: without it connect() waits
+ * indefinitely for a slot. */
+static int set_io_timeout(int sock, int seconds) {
+    struct timeval tv;
+
+    tv.tv_sec  = seconds;
+    tv.tv_usec = 0;
+
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == -1 ||
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == -1) {
+        log_pam_message(LOG_ERR, "Failed to set socket timeout: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+int connect_to_broker(const char *socket_path, int io_timeout) {
     int sock;
     struct sockaddr_un addr;
 
-    log_pam_message(LOG_DEBUG, "Connecting to broker at %s", socket_path);
+    log_pam_message(LOG_DEBUG, "Connecting to broker at %s (io timeout %ds)",
+                    socket_path, io_timeout);
+
+    if (io_timeout <= 0) {
+        log_pam_message(LOG_ERR, "Refusing to connect without an I/O timeout");
+        return -1;
+    }
 
     sock = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sock == -1) {
         log_pam_message(LOG_ERR, "Failed to create socket: %s", strerror(errno));
+        return -1;
+    }
+
+    /* Before connect(), so the timeout covers it too. */
+    if (set_io_timeout(sock, io_timeout) != 0) {
+        close(sock);
         return -1;
     }
 
@@ -97,10 +155,15 @@ int get_user_info(pam_handle_t *pamh, const char **username, const char **servic
 
     if (pam_get_item(pamh, PAM_SERVICE, (const void**)service) != PAM_SUCCESS || *service == NULL)
         *service = "unknown";
-    if (pam_get_item(pamh, PAM_RHOST,   (const void**)rhost)   != PAM_SUCCESS || *rhost == NULL)
-        *rhost = "localhost";
     if (pam_get_item(pamh, PAM_TTY,     (const void**)tty)     != PAM_SUCCESS || *tty == NULL)
         *tty = "unknown";
+
+    /* Empty, not "localhost", when PAM_RHOST is unset. A console or cron login
+       has no remote host, and substituting "localhost" put a fabricated origin
+       into the audit record — the one field an investigator reads to answer
+       "where did this login come from". */
+    if (pam_get_item(pamh, PAM_RHOST,   (const void**)rhost)   != PAM_SUCCESS || *rhost == NULL)
+        *rhost = "";
 
     log_pam_message(LOG_DEBUG, "user=%s service=%s rhost=%s tty=%s",
                     *username, *service, *rhost, *tty);
@@ -108,19 +171,78 @@ int get_user_info(pam_handle_t *pamh, const char **username, const char **servic
 }
 
 /* send_json sends a serialized request and reports whether the whole thing
-   went out. json-c does the escaping, so no field needs sanitizing here. */
+   went out. json-c does the escaping, so no field needs sanitizing here.
+
+   MSG_NOSIGNAL is not optional here. If the broker has closed its end — it was
+   restarted, or it hung up on a request it refused — a plain send() raises
+   SIGPIPE, whose default disposition terminates the process. That process is
+   sshd's pre-auth child, so a broker restart mid-login would kill the connection
+   outright instead of failing the module. A PAM module cannot fix this by
+   installing a handler: the signal disposition belongs to the host application,
+   and quietly changing it would leak out of the module for the life of the
+   process. Suppressing the signal per call is the only correct scope.
+
+   The loop exists because a short send is legal on a stream socket. The old code
+   treated one as a failure, which is at least fail-closed, but a partial request
+   also leaves the broker parsing a truncated JSON object. */
 static int send_json(int sock, json_object *req) {
     const char *req_str = json_object_to_json_string(req);
     size_t req_len = strlen(req_str);
+    size_t total = 0;
 
     log_pam_message(LOG_DEBUG, "Sending request: %s", req_str);
 
-    ssize_t sent = send(sock, req_str, req_len, 0);
-    if (sent == -1 || (size_t)sent != req_len) {
-        log_pam_message(LOG_ERR, "Failed to send request: %s", strerror(errno));
-        return -1;
+    while (total < req_len) {
+        ssize_t sent = send(sock, req_str + total, req_len - total, MSG_NOSIGNAL);
+        if (sent <= 0) {
+            if (sent == -1 && errno == EINTR) continue;
+            log_pam_message(LOG_ERR, "Failed to send request after %zu of %zu bytes: %s",
+                            total, req_len, strerror(errno));
+            return -1;
+        }
+        total += (size_t)sent;
     }
     return 0;
+}
+
+/* copy_source_ip fills dst with rhost when rhost is an IP address literal, and
+   with an empty string otherwise.
+ *
+ * PAM_RHOST is an address only when sshd was not asked to resolve it; with
+ * `UseDNS yes` it is a hostname, and a fully qualified one can exceed the 45
+ * bytes the broker allows for source_ip — which would make it reject the entire
+ * request and fail the login. So the field carries an address or nothing, and the
+ * raw value travels in metadata.rhost either way. */
+static void copy_source_ip(const char *rhost, char *dst, size_t dst_size) {
+    unsigned char v4[4];
+    unsigned char v6[16];
+
+    dst[0] = '\0';
+    if (rhost == NULL || rhost[0] == '\0') return;
+    if (strlen(rhost) >= dst_size) return;
+
+    if (inet_pton(AF_INET, rhost, v4) != 1 && inet_pton(AF_INET6, rhost, v6) != 1)
+        return;
+
+    strncpy(dst, rhost, dst_size - 1);
+    dst[dst_size - 1] = '\0';
+}
+
+/* copy_target_host fills dst with this host's name — the host being logged into,
+   which is what target_host means. The module used to send PAM_RHOST here, so
+   every audit record named the *client* as the target and left source_ip empty:
+   both fields were populated, and both were wrong. */
+static void copy_target_host(char *dst, size_t dst_size) {
+    dst[0] = '\0';
+    if (gethostname(dst, dst_size) != 0) {
+        /* Not fatal. An unnamed host is a worse audit record, not a reason to
+           refuse a login. */
+        log_pam_message(LOG_WARNING, "gethostname failed: %s", strerror(errno));
+        dst[0] = '\0';
+        return;
+    }
+    /* POSIX allows truncation without a NUL when the name does not fit. */
+    dst[dst_size - 1] = '\0';
 }
 
 int send_auth_request(int sock, const char *username, const char *service,
@@ -143,11 +265,20 @@ int send_auth_request(int sock, const char *username, const char *service,
     json_object_object_add(metadata, "service", json_object_new_string(service));
     json_object_object_add(metadata, "tty",     json_object_new_string(tty));
     json_object_object_add(metadata, "pid",     json_object_new_string(pid_str));
+    /* The unabridged PAM_RHOST, whether or not it is an address; source_ip below
+       takes it only when it is one. */
+    json_object_object_add(metadata, "rhost",   json_object_new_string(rhost ? rhost : ""));
+
+    char source_ip[MAX_SOURCE_IP_LEN];
+    char target_host[MAX_HOSTNAME_LEN];
+    copy_source_ip(rhost, source_ip, sizeof(source_ip));
+    copy_target_host(target_host, sizeof(target_host));
 
     json_object_object_add(req, "type",        json_object_new_string("authenticate"));
     json_object_object_add(req, "user_id",     json_object_new_string(username));
     json_object_object_add(req, "login_type",  json_object_new_string(login_type));
-    json_object_object_add(req, "target_host", json_object_new_string(rhost));
+    json_object_object_add(req, "source_ip",   json_object_new_string(source_ip));
+    json_object_object_add(req, "target_host", json_object_new_string(target_host));
     json_object_object_add(req, "metadata",    metadata);
     /* Omitted rather than sent empty when no provider= argument is given: the
        broker reads an absent field as "your default", and an empty string means
@@ -173,6 +304,10 @@ int send_check_session_request(int sock, const char *session_id) {
 
 int receive_auth_response(int sock, char *response, size_t response_size) {
     size_t total = 0;
+    int filled = 0;
+
+    if (response == NULL || response_size < 2) return -1;
+
     /* Loop until the broker closes the connection (n==0) or an error occurs.
        The broker writes one JSON object then immediately closes the connection,
        so reading until EOF guarantees we have the complete response even when
@@ -181,22 +316,54 @@ int receive_auth_response(int sock, char *response, size_t response_size) {
     while (total < response_size - 1) {
         ssize_t n = recv(sock, response + total, response_size - 1 - total, 0);
         if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* SO_RCVTIMEO elapsed: the broker accepted the connection and
+                   then stopped talking. Fail closed rather than wait for sshd's
+                   LoginGraceTime to kill the session. */
+                log_pam_message(LOG_ERR,
+                                "Broker stopped responding after %zu bytes; timed out", total);
+                return -1;
+            }
             log_pam_message(LOG_ERR, "Failed to receive response: %s", strerror(errno));
             return -1;
         }
-        if (n == 0) break;  /* broker closed connection — full response received */
-        total += n;
+        if (n == 0) goto done;  /* broker closed connection — full response received */
+        total += (size_t)n;
     }
+
+    /* The buffer is full but no EOF has been seen, so the response is either
+       exactly response_size - 1 bytes long or longer than we accept. One more
+       read answers which — without it, a complete response that happens to be
+       exactly this length was rejected as too large. */
+    filled = 1;
+    for (;;) {
+        char extra;
+        ssize_t n = recv(sock, &extra, 1, 0);
+        if (n > 0) {
+            log_pam_message(LOG_ERR,
+                            "Auth response larger than the %zu bytes we accept; rejecting",
+                            response_size - 1);
+            return -1;
+        }
+        if (n == 0) break;  /* exactly response_size - 1 bytes, and complete */
+        if (errno == EINTR) continue;
+        /* Neither more data nor a clean close: we cannot tell whether what we
+           hold is the whole response, so do not act on it. */
+        log_pam_message(LOG_ERR,
+                        "Broker neither closed nor continued after %zu bytes; rejecting",
+                        total);
+        return -1;
+    }
+
+done:
     if (total == 0) {
         log_pam_message(LOG_ERR, "Auth response: broker closed connection with no data");
         return -1;
     }
-    if (total == response_size - 1) {
-        log_pam_message(LOG_ERR, "Auth response too large (>= %zu bytes); rejecting", total);
-        return -1;
-    }
     response[total] = '\0';
-    log_pam_message(LOG_DEBUG, "Received response (%zu bytes)", total);
+    log_pam_message(LOG_DEBUG, "Received response (%zu bytes%s)", total,
+                    filled ? ", at the size limit" : "");
     return 0;
 }
 
@@ -296,6 +463,7 @@ int parse_broker_response(const char *json_text, struct broker_response **out) {
     copy_json_field(root, "status",        r->status,        sizeof(r->status));
     copy_json_field(root, "session_id",    r->session_id,    sizeof(r->session_id));
     copy_json_field(root, "user_id",       r->user_id,       sizeof(r->user_id));
+    copy_json_field(root, "error_code",    r->error_code,    sizeof(r->error_code));
     copy_json_field(root, "error_message", r->error_message, sizeof(r->error_message));
     copy_json_field(root, "instructions",  r->instructions,  sizeof(r->instructions));
 
@@ -390,13 +558,15 @@ static void sleep_seconds(long seconds) {
 }
 
 /* broker_roundtrip opens a connection, sends one request and reads the reply.
-   send_fn does the request-specific serialization. Returns 0 on success with
-   *out set (caller frees), -1 on any transport or parse failure. */
-static int broker_roundtrip(const struct module_options *opts,
+   send_fn does the request-specific serialization. io_timeout bounds every
+   operation on the socket; see AUTH_IO_TIMEOUT and POLL_IO_TIMEOUT for why the
+   two phases differ. Returns 0 on success with *out set (caller frees), -1 on
+   any transport or parse failure. */
+static int broker_roundtrip(const struct module_options *opts, int io_timeout,
                             int (*send_fn)(int sock, void *ctx), void *ctx,
                             struct broker_response **out) {
-    char buf[MAX_RESPONSE_SIZE];
-    int sock = connect_to_broker(opts->socket_path);
+    char buf[RESPONSE_BUF_SIZE];
+    int sock = connect_to_broker(opts->socket_path, io_timeout);
     if (sock == -1) return -1;
 
     if (send_fn(sock, ctx) != 0) {
@@ -452,6 +622,16 @@ static int authorized_for(const struct broker_response *r, const char *username)
     return 1;
 }
 
+/* is_rate_limited reports whether a reply is the broker asking to slow down
+   rather than answering. It arrives as status "error" with error_code
+   RATE_LIMITED, which is indistinguishable from a real failure unless the code is
+   read — and reading it is part of the wire contract (see
+   internal/ipc.ErrorCodeRateLimited). Treating it as terminal failed logins that
+   were only being throttled. */
+static int is_rate_limited(const struct broker_response *r) {
+    return strcmp(r->error_code, ERROR_CODE_RATE_LIMITED) == 0;
+}
+
 /* terminal_status_to_pam maps a terminal broker status to a PAM result.
    A decision about the user is PAM_AUTH_ERR; an operational failure is
    PAM_AUTHINFO_UNAVAIL so that a later module in the stack may still run. */
@@ -467,8 +647,28 @@ static int terminal_status_to_pam(const struct broker_response *r, const char *u
         return PAM_AUTH_ERR;
     }
     if (strcmp(r->status, STATUS_ERROR) == 0) {
-        log_pam_message(LOG_ERR, "Broker error authenticating %s: %s",
-                        username, r->error_message);
+        /* Capacity conditions are not decisions about the user, and an operator
+           reading the log needs to be able to tell them apart from a broker that
+           is broken. Both already map to PAM_AUTHINFO_UNAVAIL — "ask someone
+           else, or try again" — which is the right answer for a host that is
+           merely busy. Neither is retried here: the rate limiter's window is a
+           fixed minute, and the concurrency cap is held by other logins for as
+           long as their device flows live, so a retry inside this login would
+           just spend the user's remaining time to fail again. */
+        if (is_rate_limited(r)) {
+            log_pam_message(LOG_WARNING,
+                            "Broker rate-limited the authenticate request for %s; "
+                            "the host's per-caller budget is exhausted", username);
+            return PAM_AUTHINFO_UNAVAIL;
+        }
+        if (strcmp(r->error_code, "AUTH_LIMIT_REACHED") == 0) {
+            log_pam_message(LOG_WARNING,
+                            "Too many device flows already in progress on this host; "
+                            "refusing %s (max_concurrent_auths)", username);
+            return PAM_AUTHINFO_UNAVAIL;
+        }
+        log_pam_message(LOG_ERR, "Broker error authenticating %s: %s (%s)",
+                        username, r->error_message, r->error_code);
         return PAM_AUTHINFO_UNAVAIL;
     }
     log_pam_message(LOG_ERR, "Unknown broker status '%s' for %s; failing closed",
@@ -484,12 +684,17 @@ static int poll_for_authorization(pam_handle_t *pamh, const struct module_option
     long deadline = monotonic_seconds() + opts->auth_timeout;
     int consecutive_failures = 0;
     const int max_consecutive_failures = 3;
+    /* Grows only while the broker is throttling us, and resets as soon as it
+       answers again. */
+    int backoff = poll_interval;
 
     (void)pamh;
 
     for (;;) {
+        int wait = poll_interval;
         struct broker_response *r = NULL;
-        if (broker_roundtrip(opts, send_check_cb, (void *)session_id, &r) != 0) {
+
+        if (broker_roundtrip(opts, POLL_IO_TIMEOUT, send_check_cb, (void *)session_id, &r) != 0) {
             /* Transport hiccup or a broker restart mid-flow. Tolerate a few in
                a row — the user is waiting and a single failed connect should
                not end the login — then give up. */
@@ -499,8 +704,25 @@ static int poll_for_authorization(pam_handle_t *pamh, const struct module_option
                                 consecutive_failures);
                 return PAM_AUTHINFO_UNAVAIL;
             }
+        } else if (is_rate_limited(r)) {
+            /* Not a failure and not an answer: the broker is asking for a slower
+               poll. Back off geometrically instead of hammering the same closed
+               window, and do not spend the transport-failure budget on it — three
+               tries at the normal interval would be over in fifteen seconds, well
+               inside the limiter's one-minute window, and the login would die for
+               a condition that clears on its own. The deadline below is what
+               bounds this; a throttled poll costs the broker nothing. */
+            backoff *= 2;
+            if (backoff > MAX_POLL_INTERVAL) backoff = MAX_POLL_INTERVAL;
+            wait = backoff;
+            log_pam_message(LOG_WARNING,
+                            "Broker rate-limited a session poll for %s; retrying in %ds",
+                            username, wait);
+            free(r);
+            r = NULL;
         } else {
             consecutive_failures = 0;
+            backoff = poll_interval;
 
             if (strcmp(r->status, STATUS_AUTHORIZED) == 0) {
                 int ok = authorized_for(r, username);
@@ -517,13 +739,13 @@ static int poll_for_authorization(pam_handle_t *pamh, const struct module_option
             free(r);
         }
 
-        if (monotonic_seconds() + poll_interval > deadline) {
+        if (monotonic_seconds() + wait > deadline) {
             log_pam_message(LOG_NOTICE,
                             "Timed out after %ds waiting for %s to authorize",
                             opts->auth_timeout, username);
             return PAM_AUTH_ERR;
         }
-        sleep_seconds(poll_interval);
+        sleep_seconds(wait);
     }
 }
 
@@ -553,7 +775,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
 
     /* Phase 1: start the device flow. */
     struct auth_ctx actx = { username, service, rhost, tty, opts.provider };
-    if (broker_roundtrip(&opts, send_auth_cb, &actx, &r) != 0) {
+    if (broker_roundtrip(&opts, AUTH_IO_TIMEOUT, send_auth_cb, &actx, &r) != 0) {
         return PAM_AUTHINFO_UNAVAIL;
     }
 

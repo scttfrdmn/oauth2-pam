@@ -53,6 +53,7 @@ go test -race ./...
 golangci-lint run ./... # version pinned in .github/workflows/ci.yml
 gofmt -l ./cmd ./pkg ./internal ./test
 make verify-linux       # the same sweep under Linux, with the cgo packages included
+make test-cbridge       # C unit tests for the bridge; see test/cbridge/README.md
 make test-integration   # needs Docker; see test/integration/README.md
 ```
 
@@ -79,6 +80,12 @@ the container harness.
 
 `make test-integration` is the only thing that exercises the PAM module in a real
 PAM stack. Any change to `cmd/pam-module/` or to the IPC contract needs it.
+
+`make test-cbridge` is the only thing that reaches the bridge's edge cases. The
+harness runs real logins, but it cannot make the broker misbehave in a specific
+way — go there for a reply that exactly fills the read buffer, a broker that
+accepts and then goes silent, or one that hangs up mid-request. It compiles with
+`-Werror -Wconversion`, and a skipped case counts as a failure.
 
 ## Two things that are easy to break
 

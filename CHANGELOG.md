@@ -123,6 +123,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   has answered, and asking the next one for something more convenient would turn a
   refusal into a retry.
 
+- **C unit tests for the PAM module bridge** (`test/cbridge`, `make
+  test-cbridge`), compiled with `-Werror -Wall -Wextra -Wconversion`. `go test`
+  cannot see this code — it is C, and on macOS `cmd/pam-module` is not compiled at
+  all — and the container harness, which does drive it, cannot make the broker
+  misbehave in a specific way. These provoke the boundaries directly over a
+  `socketpair`: a reply exactly the size of the read buffer, a reply one byte
+  over, a broker that accepts a connection and then goes silent, a broker that
+  hangs up mid-request, and the exact fields the `authenticate` request puts on
+  the wire. Every case was verified to fail against the unfixed code. A skipped
+  case counts as a failure, so the one test that needs root cannot quietly stop
+  running in CI.
+
 ### Fixed
 
 Four defects found by a security review that reproduced each one against a
@@ -181,6 +193,71 @@ regression test in `pkg/auth/broker_limits_test.go` or
   `SIGWINCH` from a terminal resize shortened the interval and polled GitHub
   faster than configured; it now finishes the interval with `nanosleep`.
   ([#22](https://github.com/scttfrdmn/oauth2-pam/issues/22))
+
+Six more in the C bridge, each with a regression test in `test/cbridge`:
+
+- **A wedged broker hung the login instead of failing it.** The module's socket had
+  no deadline of its own, so a broker that accepted the connection and then never
+  answered — deadlocked, or stopped between `accept()` and `write()` — left the
+  module blocked in `recv()` indefinitely. `timeout=` could not help: it is only
+  consulted between polls. The login hung until sshd's `LoginGraceTime` killed the
+  whole session. Every connection now carries `SO_RCVTIMEO`/`SO_SNDTIMEO`: 35s for
+  the `authenticate` round trip, which waits on the broker's provider call (whose
+  own HTTP timeout is 30s), and 10s for a `check_session` poll, which never leaves
+  the host. `SO_SNDTIMEO` also bounds `connect()`, so a full listen backlog no
+  longer blocks forever either.
+
+- **A broker restart mid-login killed the ssh connection.** `send()` was called
+  without `MSG_NOSIGNAL`, so writing to a socket whose peer had closed raised
+  SIGPIPE — and its default disposition terminates the process, which here is
+  sshd's pre-auth child. The connection dropped instead of the module failing. A
+  PAM module cannot fix this with a signal handler; the disposition belongs to the
+  host application. Suppressing it per call is the only correct scope. `send_json`
+  also now loops on a short write rather than reporting failure while leaving the
+  broker parsing a truncated request.
+
+- **A complete response exactly 16383 bytes long was rejected as too large.** The
+  read loop stopped when the buffer was full, which was indistinguishable from
+  "there is more to come". The buffer is now one byte larger than the largest
+  response accepted, and the ambiguous case is resolved by asking: one more read
+  distinguishes a clean close from a truncated response. Anything genuinely
+  oversized is still refused rather than truncated — a truncated JSON object is not
+  a parse error, it is a document that might still parse into something with a
+  plausible `status` field.
+
+- **`socket=/run/oauth2-pam/broker.sock` was refused as unsafe.** Only the
+  `/var/run` spelling was accepted, though `/var/run` is a symlink to `/run` on
+  every systemd host and `/run/oauth2-pam` is exactly what `RuntimeDirectory=` in
+  the shipped unit creates. Both prefixes are now accepted; the trailing slash in
+  each is what still keeps a path under an attacker-created
+  `/run/oauth2-pam-evil/` out.
+
+- **The audit trail recorded the wrong host and no source at all.** The module sent
+  `PAM_RHOST` as `target_host` and never sent `source_ip`, so every record named
+  the *client* as the host being logged into and left blank the one field an
+  investigator reads to answer "where did this login come from". `source_ip` now
+  carries the client address and `target_host` this host's name. `source_ip` takes
+  `PAM_RHOST` only when it parses as an IP literal — with `UseDNS yes` it is a
+  name, and a fully qualified one can exceed the 45 bytes the broker allows, which
+  would make it reject the whole request and fail the login — so the unabridged
+  value always travels in `metadata.rhost` as well. Relatedly, an absent
+  `PAM_RHOST` is now reported as empty rather than as `localhost`: a console login
+  has no remote host, and substituting one put a fabricated origin in the record.
+  **Anything parsing these audit fields needs updating.**
+
+- **A throttled poll failed the login.** `RATE_LIMITED` arrives as
+  `status: "error"`, and the module never read `error_code`, so the broker asking
+  it to slow down was indistinguishable from the broker being broken — the exact
+  case `internal/ipc.ErrorCodeRateLimited` documents as retryable. A rate-limited
+  `check_session` now backs off geometrically (capped at 60s) and keeps polling
+  until the login's own deadline, without spending the transport-failure budget:
+  three tries at the normal interval would be over in fifteen seconds, well inside
+  the limiter's one-minute window, and the login would have died for a condition
+  that clears on its own. At `authenticate` time neither `RATE_LIMITED` nor
+  `AUTH_LIMIT_REACHED` is retried — the window is a fixed minute and the
+  concurrency cap is held by other logins for as long as their flows live, so a
+  retry would just spend the user's remaining time to fail again — but both are now
+  logged as the capacity conditions they are rather than as a broker error.
 
 ### Changed
 
