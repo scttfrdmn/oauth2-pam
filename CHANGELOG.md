@@ -353,6 +353,93 @@ And four more in the broker's own defaults:
   an administrator, not by this unit. Removed, leaving `ProtectSystem=strict` to
   keep `/etc` read-only.
 
+- **`refresh_session` extended expired sessions and re-inserted revoked ones.**
+  `RefreshSession` had no expiry check at all — `time.Until` of a past instant is
+  simply negative, so an expired session fell through to the extend branch and
+  came back `success: true`, `status: "authorized"`, with the mapped `user_id` and
+  a fresh hour on it. `check_session` has always refused that, so the two verbs
+  disagreed and a client could route around its own expiry by choosing which one
+  to send. An expired session is now removed and answered `SESSION_EXPIRED`, the
+  same as `check_session`.
+
+  The extension also wrote a whole snapshot back into the session map with no
+  compare-and-set, so a `revoke_session` or a cleanup pass that deleted the
+  session between the read and the write was silently undone — resurrecting a
+  session whose token had already been destroyed at the provider, with no poller
+  and nothing left to clean it up before its brand-new expiry. Measured: 1 of 200
+  unassisted attempts, and `-race` reports nothing, because every access is
+  correctly locked and the wrong value is written. Extension now goes through a
+  compare-and-set shaped like the one that guards activation: it takes the lock,
+  re-reads the live entry, and refuses unless it is still the same authorized
+  session. A refresh also re-checks that the session's token still resolves, which
+  catches the same fact independently. Both proofs are in-tree —
+  `TestRefreshRefusesExpiredAuthorizedSession`,
+  `TestExtendSessionRefusesUnlessStillTheSameAuthorizedSession` and
+  `TestRefreshDoesNotResurrectRevokedSession` in
+  `pkg/auth/refresh_test.go`, plus `TestRefreshRefusesExpiredSessionOnTheWire`
+  over a real socket — and each one was checked against the unfixed code.
+
+  No in-tree client sends `refresh_session`: the PAM module sends only
+  `authenticate` and `check_session`, so this was not a live privilege escalation.
+  It was a latent authorization defect in a verb
+  [docs/wire-protocol.md](docs/wire-protocol.md) makes normative for other
+  implementations, which is why the spec now states both refusals.
+  ([#41](https://github.com/scttfrdmn/oauth2-pam/issues/41))
+
+- **`security.max_token_age` was validated and never enforced.** It was parsed,
+  defaulted to 24h, documented in `configs/example.yaml`, and read in exactly one
+  place: a startup check that `token_lifetime` does not exceed it. Nothing ever
+  compared a session's age against it, so an operator reading it as a hard cap on
+  how old a session may get had a lint rule on their config file. Measured with
+  the ceiling at 2s: fifty consecutive refreshes all succeeded, and the session's
+  `expires_at` ended an hour past a `created_at` that never moved. A session past
+  the ceiling is now revoked rather than extended — in the refresh path and in the
+  periodic session sweep, since nothing calls `refresh_session` on most sessions
+  and a ceiling enforced only there would not be one. Measured from `CreatedAt`,
+  which no extension moves; `0` still means unset. The boundary is asserted in
+  both directions so the comparison cannot be quietly inverted.
+  ([#43](https://github.com/scttfrdmn/oauth2-pam/issues/43))
+
+- **A provider could draw on the pre-authentication terminal.** A device flow's
+  `verification_uri` and `user_code` are chosen by the provider, travel over IPC,
+  and are printed to the tty by a root process before anyone has authenticated —
+  unfiltered. For `github.com` that is theoretical; for a configured Enterprise
+  `base_url` it is not, because that server picks what every host configured
+  against it draws on screen. A payload of `ESC[2J ESC[H` and a fake `Password:`
+  prompt is enough to harvest a Unix password from a user who believes they are
+  still talking to `sshd`.
+
+  Provider-supplied strings are now stripped of C0, DEL, C1 (including U+009B,
+  where CSI hides in UTF-8) and U+2028/9 as they enter a response, and an altered
+  value is marked so the operator can see something was removed rather than
+  silently receiving a mangled URL. Stripping rather than escaping is deliberate:
+  the module copies `instructions` into a fixed 16 KiB buffer that truncates
+  silently, so an escaping filter — up to 6× expansion — would let a provider pad
+  the prompt until the trusted trailer fell off the end. `TestSanitizingCannotAmplify`
+  pins that. Sanitizing happens at the point the values enter an `AuthResponse`,
+  not in the prompt formatters, because `device_url` and `device_code` also go on
+  the wire as their own fields that
+  [docs/wire-protocol.md](docs/wire-protocol.md) offers to "a client that wants to
+  format its own prompt" — cleaning only this implementation's formatters would
+  have left a consumer holding raw bytes. Bidi and zero-width characters are
+  deliberately not filtered: they cannot move a cursor, and denying them would
+  break legitimate non-Latin text.
+  ([#45](https://github.com/scttfrdmn/oauth2-pam/issues/45))
+
+- **The session rate limiter grew without bound, and session requests cost an
+  unknown caller nothing.** The five-minute eviction sweep cleaned only the
+  per-UID limiter — the one whose key space is the host's own UIDs, and therefore
+  tiny. The one it missed is keyed on the `session_id` in the request, which a
+  caller chooses: `allow` allocates a window on first sight of any key and never
+  required the session to exist, so 3000 requests naming 3000 invented sessions
+  left 3000 permanent windows, none of them refused, at roughly 14k requests a
+  second. The sweep now reaches every limiter, and *introducing* a previously
+  unseen session ID is charged to the calling UID — introducing one is the only
+  part of a session request whose cost outlives the reply. Polling an established
+  session stays free to the caller, which is what keeps the fix for the host-wide
+  polling DoS above intact. A key ceiling backstops both.
+  ([#42](https://github.com/scttfrdmn/oauth2-pam/issues/42))
+
 ### Changed
 
 - **Mapper `groups` stay advisory, and are no longer advisory *quietly*.** The
@@ -527,6 +614,37 @@ And four more in the broker's own defaults:
   advisories reachable from this code, and no 1.24.x pin could ever clear them.
   govulncheck reports zero under 1.25. The pin is the language version rather than
   a patch release, so any 1.25.x toolchain satisfies it.
+- **`oauth2-pam-enroll` refuses a local account the mapper would refuse anyway.**
+  Enrollment is tier 0 of the mapping chain and its answer has always passed the
+  same gate as every other tier, so a record naming `root` or a system account
+  failed closed at login — this was never a bypass. It was a bad error at a bad
+  time: the operator learned of it as a denied login rather than as a refusal when
+  they typed the name. The check now runs *before* the device flow, so nobody
+  authorizes in a browser for a name that cannot work. `pkg/enrollment` cannot
+  import `pkg/mapper` (the dependency runs the other way), so the rules are
+  injected rather than copied — a copy could drift from the mapper's silently — and
+  `Add` takes the validator as a **required** parameter with a named `Unvalidated`
+  sentinel, so a future caller has to choose to skip the gate rather than default
+  into it. A store that already contains a forbidden record still loads and can
+  still be repaired; validating on load would turn one unusable enrollment into an
+  unrepairable file. ([#46](https://github.com/scttfrdmn/oauth2-pam/issues/46))
+- **The socket's trust boundary is stated instead of implied.** `internal/ipc`
+  described a group-based access model — "root-owned, group oauth2-pam", "must run
+  as a member of the oauth2-pam group" — that nothing implements: there is no
+  `os.Chown` in the repository, no packaging artifact creates the group, and the
+  unit runs `User=root`/`Group=root`. Reality was *safer* than the comment, which
+  is what made it worth fixing: a reader following the comment would have created
+  the group and widened the boundary without the ownership work that model needs.
+  The comments, the systemd unit and `docs/wire-protocol.md` now say what is true —
+  the broker socket is reachable by root and nobody else, the PAM module qualifies
+  because it runs inside `sshd`'s pre-auth child, and several accepted risks in this
+  project are accepted *only* because that caller can only be root. Anyone who
+  changes that has to re-rate those findings first, and the note says so.
+  `TestSocketPermissions` now asserts the containing directory as well as the
+  socket. ([#44](https://github.com/scttfrdmn/oauth2-pam/issues/44))
+- **Spec correction:** `refresh_session` never exchanged an OAuth2 refresh token,
+  and no implementation ever did; earlier revisions of `docs/wire-protocol.md` said
+  it did. It moves the broker's own `expires_at`, with no provider round trip.
 
 ## [0.2.0] - 2026-08-13
 
