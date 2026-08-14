@@ -142,6 +142,29 @@ func (tm *TokenManager) StoreToken(sessionID, userID, accessToken, refreshToken 
 	return tokenID, nil
 }
 
+// Has reports whether a token is present and still within its own expiry.
+//
+// It exists because that is the whole question a caller asks when it needs to
+// know if a session's credential is still there: GetDecryptedAccessToken answers
+// it too, but at the price of an AES-GCM open and a plaintext access token in the
+// heap for an answer that is thrown away. See #50.
+//
+// A pure read. It does not touch LastUsed and does not evict the expired record
+// it may find — a predicate that mutates would make asking the question change
+// the answer, and the callers are deciding whether to report a session
+// authorized.
+func (tm *TokenManager) Has(tokenID string) bool {
+	if tokenID == "" {
+		return false
+	}
+
+	tm.tokenStore.mutex.RLock()
+	defer tm.tokenStore.mutex.RUnlock()
+
+	stored, ok := tm.tokenStore.tokens[tokenID]
+	return ok && stored.ExpiresAt.After(time.Now())
+}
+
 // RevokeToken removes a token from the store.
 func (tm *TokenManager) RevokeToken(tokenID string) {
 	tm.tokenStore.mutex.Lock()

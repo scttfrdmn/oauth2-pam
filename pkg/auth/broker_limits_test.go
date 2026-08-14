@@ -1,6 +1,10 @@
 package auth
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -45,6 +49,83 @@ func TestGlobalConcurrentAuthCapIsReachableForOneUser(t *testing.T) {
 	}
 	if refused != 5 {
 		t.Errorf("refused %d requests, want 5 — the cap was not reachable for one username", refused)
+	}
+}
+
+// TestConcurrentAuthenticateDoesNotOvershootTheAuthCap is the other half of the
+// cap, and the half a sequential test cannot see.
+//
+// The caps were read under RLock, the lock released, the device flow started, and
+// the session inserted only then — so every request in flight decided against a
+// session map containing none of the others. Measured before the fix: 40
+// concurrent calls against a cap of 3 accepted 17.
+//
+// One username per caller, so per-user eviction cannot hold the pending count
+// down and hide the overshoot the way it did in
+// TestGlobalConcurrentAuthCapIsReachableForOneUser. StartDeviceFlow is given a
+// delay because the window is exactly the provider round trip: with an instant
+// provider the calls barely overlap and the unfixed code can look correct.
+func TestConcurrentAuthenticateDoesNotOvershootTheAuthCap(t *testing.T) {
+	const (
+		limit   = 3
+		callers = 40
+	)
+
+	cfg := brokerConfig(t)
+	cfg.Security.RateLimiting.MaxConcurrentAuths = limit
+	fake := newFakeProvider("acme")
+	fake.startDelay = 20 * time.Millisecond
+	b := startBroker(t, cfg, fake)
+
+	var mu sync.Mutex
+	var accepted, refused int
+	var unexpected []string
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < callers; i++ {
+		user := fmt.Sprintf("user%02d", i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			resp, err := b.Authenticate(&AuthRequest{UserID: user, LoginType: "ssh"})
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err != nil:
+				unexpected = append(unexpected, err.Error())
+			case resp.ErrorCode == "":
+				accepted++
+			case resp.ErrorCode == "AUTH_LIMIT_REACHED":
+				refused++
+			default:
+				unexpected = append(unexpected, resp.ErrorCode)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if len(unexpected) > 0 {
+		t.Fatalf("unexpected outcomes: %v", unexpected)
+	}
+	if accepted != limit {
+		t.Errorf("%d of %d concurrent requests were accepted against a cap of %d", accepted, callers, limit)
+	}
+	if refused != callers-limit {
+		t.Errorf("%d requests were refused, want %d", refused, callers-limit)
+	}
+
+	// The reply count and the broker's own state have to agree: a request that was
+	// told yes holds a pending flow, and it is the flows that cost a goroutine and
+	// provider traffic.
+	b.sessionMutex.RLock()
+	pending := b.countPendingFlowsLocked()
+	b.sessionMutex.RUnlock()
+	if pending != accepted {
+		t.Errorf("%d pending flows for %d accepted requests; the count the cap is enforced on is not the state that resulted",
+			pending, accepted)
 	}
 }
 
@@ -95,11 +176,11 @@ func TestEvictedPendingFlowStopsPollingTheProvider(t *testing.T) {
 // session had expired resurrected it as authorized. Reproduced before the fix as
 // "check_session at t+4s → expired, at t+10s → authorized", leaving a live
 // 8-hour session holding a real provider token and attached to no login. This
-// test asserts the outcome from outside; the compare-and-set that guarantees it
-// is exercised arm by arm in
-// TestActivateSessionRefusesUnlessStillTheSamePendingSession, because once the
-// poller is cancelled promptly there is no longer a reliable way to schedule a
-// completion after the expiry from out here.
+// test asserts the outcome from outside for a flow nobody ever approves; the
+// compare-and-set that guarantees it is exercised arm by arm in
+// TestActivateSessionRefusesUnlessStillTheSamePendingSession, and end to end for
+// a flow that really does complete late in
+// TestLateApprovalDoesNotActivateAnExpiredFlow.
 func TestExpiredFlowIsFinalAndStopsPolling(t *testing.T) {
 	cfg := brokerConfig(t)
 	cfg.Authentication.DeviceFlowTimeout = 2500 * time.Millisecond
@@ -136,6 +217,84 @@ func TestExpiredFlowIsFinalAndStopsPolling(t *testing.T) {
 	if after := fake.pollCount(1); after != pollsAtExpiry {
 		t.Errorf("expired flow polled %d more times (%d then %d); its goroutine outlived the session",
 			after-pollsAtExpiry, pollsAtExpiry, after)
+	}
+}
+
+// TestLateApprovalDoesNotActivateAnExpiredFlow is the end-to-end coverage the
+// test above could not give, and the reason it could not is the defect: a flow
+// that completes after the broker's deadline was activated anyway, and the
+// activation rewrote ExpiresAt to the session lifetime, so nothing afterwards
+// could tell it had been late. Measured before the fix as a session activated
+// with expires_at an hour past the flow deadline, answering status="authorized"
+// success=true and counting against max_concurrent_sessions.
+//
+// The window is opened by holding GetIdentity, which is a window the real code
+// has: the identity fetch retries two seconds apart and the mapper's NSS lookup
+// takes no context and no timeout, so on an LDAP or SSSD host it is bounded by
+// nothing this project controls.
+//
+// Nothing polls check_session while the deadline passes, deliberately. A poll
+// would mark the session expired itself, and then the compare-and-set would
+// refuse on the status — which was always checked — rather than on the expiry,
+// which was not. This test has to reach activation with the session still
+// pending or it proves nothing.
+func TestLateApprovalDoesNotActivateAnExpiredFlow(t *testing.T) {
+	cfg := brokerConfig(t)
+	// Comfortably longer than the fake's 1s polling interval, so the first poll
+	// happens before the deadline and the flow is already inside GetIdentity when
+	// the deadline passes. A timeout shorter than the interval would let the poll
+	// loop notice the deadline before reaching any of the work, which is the case
+	// TestExpiredFlowIsFinalAndStopsPolling already covers.
+	cfg.Authentication.DeviceFlowTimeout = 1500 * time.Millisecond
+	fake := newFakeProvider("acme")
+	fake.authorize() // approved at the provider from the first poll
+	release := fake.blockIdentity()
+	b := startBroker(t, cfg, fake)
+
+	start, err := b.Authenticate(&AuthRequest{UserID: "alice", LoginType: "ssh"})
+	if err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+	deadline := start.ExpiresAt
+
+	// Let the flow reach GetIdentity and stall there until well past the deadline.
+	time.Sleep(2500 * time.Millisecond)
+	release()
+	awaitPollerExit(t, b, start.SessionID)
+
+	// The deadline has to reach the work, not only the session record: without it
+	// on the context, a stalled provider or mapper call runs to completion however
+	// long that takes, because the poll loop's select is not re-entered until it
+	// returns.
+	if err := fake.identityContextErr(); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("the poll context reported %v after the flow's deadline passed, want context.DeadlineExceeded", err)
+	}
+
+	if live := b.getSession(start.SessionID); live != nil && (live.IsActive || live.Status == StatusAuthorized) {
+		t.Errorf("a flow approved %s after its deadline became an active session (status=%q active=%v expires_at=%s, deadline was %s)",
+			time.Since(deadline).Round(time.Millisecond), live.Status, live.IsActive, live.ExpiresAt, deadline)
+	}
+
+	resp, err := b.CheckSession(start.SessionID)
+	if err != nil {
+		t.Fatalf("CheckSession: %v", err)
+	}
+	if resp.Success || resp.Status == StatusAuthorized {
+		t.Errorf("check_session says status=%q success=%v user_id=%q for a flow that expired before it was approved",
+			resp.Status, resp.Success, resp.UserID)
+	}
+	if resp.Status != StatusExpired {
+		t.Errorf("status = %q, want %q", resp.Status, StatusExpired)
+	}
+
+	// The access token the late completion fetched must not be left behind either:
+	// a refused activation that keeps its credential is the same live-token-with-
+	// no-login outcome by another route.
+	b.tokenManager.tokenStore.mutex.RLock()
+	tokens := len(b.tokenManager.tokenStore.tokens)
+	b.tokenManager.tokenStore.mutex.RUnlock()
+	if tokens != 0 {
+		t.Errorf("%d token(s) remain in the store after a refused activation, want none", tokens)
 	}
 }
 
@@ -195,6 +354,22 @@ func TestActivateSessionRefusesUnlessStillTheSamePendingSession(t *testing.T) {
 		newPending("reused")
 		if b.activateSession("reused", created.Add(-time.Second), func(*Session) {}) {
 			t.Error("activateSession accepted a stale CreatedAt; a finished flow could activate a different session")
+		}
+	})
+
+	t.Run("past its own deadline", func(t *testing.T) {
+		s := newPending("late")
+		s.ExpiresAt = time.Now().Add(-time.Second)
+		if b.activateSession("late", created, func(*Session) {}) {
+			t.Error("activateSession activated a flow whose deadline had passed; the mutation rewrites ExpiresAt, so nothing downstream can tell")
+		}
+	})
+
+	t.Run("exactly at its deadline is over", func(t *testing.T) {
+		s := newPending("boundary")
+		s.ExpiresAt = time.Now()
+		if b.activateSession("boundary", created, func(*Session) {}) {
+			t.Error("activateSession activated a flow at its deadline; the deadline is when the broker has stopped waiting")
 		}
 	})
 }
