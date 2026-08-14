@@ -106,6 +106,34 @@ func NewAuditLogger(cfg config.AuditConfig) (*AuditLogger, error) {
 	}, nil
 }
 
+// NewAuditLoggerWithOutputs creates an AuditLogger that writes to sinks the caller
+// supplies, instead of to the ones audit.outputs describes. cfg still supplies the
+// event allowlist; it must have Enabled set, and at least one output is required,
+// because a logger with neither would discard everything in silence.
+//
+// It exists for the reason auth.NewBrokerWithProviders exists: the behaviour worth
+// testing here is what a *caller* does when an access decision cannot be written
+// down, and no audit.outputs value can express a sink that fails. Every output type
+// the config can name either works, or fails when the logger is constructed and so
+// never reaches a caller at all. A broker that must fail a login when the audit
+// record does not land needs a sink that accepts the logger and then refuses the
+// write.
+func NewAuditLoggerWithOutputs(cfg config.AuditConfig, outputs ...AuditOutput) (*AuditLogger, error) {
+	if !cfg.Enabled {
+		return nil, fmt.Errorf("audit logger with explicit outputs requires audit.enabled")
+	}
+	if len(outputs) == 0 {
+		return nil, fmt.Errorf("at least one audit output is required")
+	}
+	return &AuditLogger{
+		config:        cfg,
+		enabledEvents: buildEventFilter(cfg.Events),
+		outputs:       outputs,
+		eventChan:     make(chan AuditEvent, 1000),
+		stopChan:      make(chan struct{}),
+	}, nil
+}
+
 // buildEventFilter turns the configured event list into a lookup set, or nil
 // when no list is configured (meaning: log everything).
 func buildEventFilter(events []string) map[string]struct{} {

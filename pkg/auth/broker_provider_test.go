@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -103,11 +105,29 @@ func (f *fakeProvider) PollDeviceAuthorization(_ context.Context, deviceCode str
 		return nil, fmt.Errorf("acme-sso poll: %w", provider.ErrAuthorizationPending)
 	}
 	return &provider.Token{
-		AccessToken: "acme-token",
+		AccessToken: fakeAccessToken,
 		TokenType:   "bearer",
 		Scope:       "openid profile groups",
-		Fingerprint: "acme-to...ken",
+		Fingerprint: fakeTokenFingerprint(fakeAccessToken),
 	}, nil
+}
+
+// fakeAccessToken is the token this provider issues. Short and obviously fake, so
+// a log line containing any of it is recognisable as a leak.
+const fakeAccessToken = "acme-token"
+
+// fakeTokenFingerprint produces what provider.Token.Fingerprint is specified to
+// carry: hex(sha256(token)[:16]), the same value pkg/provider/github and
+// TokenManager compute, which is what lets a session be lined up with its stored
+// token in an audit trail.
+//
+// Computed rather than written out, and deliberately not the old
+// "acme-to...ken" — that elision is the format this field used to have, and it
+// carried bytes of the live secret. A fixture imitating it teaches the next
+// reader an obsolete and unsafe shape.
+func fakeTokenFingerprint(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:16])
 }
 
 func (f *fakeProvider) GetIdentity(ctx context.Context, _ *provider.Token) (*provider.Identity, error) {

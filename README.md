@@ -182,13 +182,20 @@ Three sources, highest precedence first:
 | File | `client_secret_file:` — an absolute path, or a bare [systemd credential](https://systemd.io/CREDENTIALS/) name resolved under `$CREDENTIALS_DIRECTORY` |
 | Config file | `client_secret:` inline, as above |
 
-Whichever file holds the secret — the secret file, or `broker.yaml` itself when
-the secret is inline — must have no group or other permission bits and be owned
-by root or by the broker's own uid. The broker refuses to start otherwise,
-naming the file and the `chmod`/`chown` that fixes it: a secret in a
-world-readable config is a secret every local user on the host already has, and
-a 0600 file owned by another user is a secret that user can *replace*, which
-would let them choose the OAuth app the broker authenticates against.
+`broker.yaml` and any file holding the secret must have no group or other
+permission bits and be owned by root or by the broker's own uid. The broker
+refuses to start otherwise, naming the file and the `chmod`/`chown` that fixes
+it: a secret in a world-readable config is a secret every local user on the host
+already has, and a 0600 file owned by another user is a secret that user can
+*replace*, which would let them choose the OAuth app the broker authenticates
+against.
+
+`broker.yaml` is checked in all three cases, not only when it carries an inline
+secret. It used to be checked only in that case, so the one permission check the
+config file ever got disappeared the moment an operator did the recommended thing
+and moved the secret into a credential — while the file went on holding the token
+encryption key, the org and team allowlists, and the mapping rules that decide
+which provider login becomes which Unix user.
 
 Under systemd the recommended form is a credential, which keeps the secret's
 location out of the config entirely:
@@ -329,12 +336,14 @@ Every tier's answer passes the same gate, so no rule, script, or identity servic
 |---|---|---|
 | Must be a valid POSIX username | always | — |
 | Not a system account by name (`root`, `www-data`, `postgres`, `nobody`, `systemd-*`, anything starting with `_`, …) | always | exempt one with `mapper.allow_system_users` |
-| UID at or above the floor | 1000 | `mapper.min_uid` (negative disables) |
+| UID at or above the floor | 1000 | `mapper.min_uid` — lower it, but it cannot be switched off |
 | **Never UID 0** | always | not overridable |
 
 The two mechanisms cover for each other. The floor is authoritative — it asks the host what the UID is — but it needs the account to resolve, and a broker built without cgo reads only `/etc/passwd`, so on an LDAP/SSSD host it cannot be applied. The name denylist needs no lookup. An account that does not resolve at all is allowed past the floor with a warning, because it cannot become a login anyway: sshd resolves the account itself before it starts a session.
 
 This matters because `local_user: "{{ .Login }}"` gated only on org membership delegates the choice of local username to whoever can create or rename an account in that org. Without a floor, a member who renamed themselves `postgres` logged in as `postgres`.
+
+There is no setting that removes the floor. A negative `mapper.min_uid` used to disable it and is now a startup error: a site with real people below UID 1000 sets `min_uid` to the lowest UID it means to allow, and a site whose real person is named after a service account names them in `mapper.allow_system_users`, which exempts a name from the denylist and not from the floor. Those two cover the cases that motivated the switch, and neither of them requires a host to run with no floor at all.
 
 Root is refused by UID, not by name, and neither setting can permit it: a device flow has no cryptographic binding to the SSH connection it authorises, which makes it the weakest route to the most privilege. OpenSSH's own default `PermitRootLogin prohibit-password` already rules it out. Use an ordinary account and `sudo`.
 
@@ -504,7 +513,7 @@ oauth2-pam/
 - Audit records go to `file`, `stdout`, or `syslog`; anything else is a startup error. An unrecognised type used to become `stdout`, so a typo moved the whole trail somewhere nobody was watching.
 - The broker socket is `0660` in a `0750` directory. The PAM module runs as root and so can reach it; other local users cannot, which matters because anything that can talk to the socket can start device flows.
 - The broker rate-limits per calling UID and caps request bodies at 64 KB. The UID comes from the socket's peer credentials (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED` on macOS/FreeBSD); if a platform cannot supply them the broker logs `peer_credentials=false` at startup and every caller shares one window, rather than all being recorded as root.
-- The client secret can be kept out of the config entirely — a systemd credential, a file, or an environment variable ([above](#where-the-client-secret-comes-from)). Whichever file holds it must be 0600 and owned by root or the broker's uid, including `broker.yaml` itself when the secret is inline; the broker refuses to start rather than treat a world-readable secret as confidential.
+- The client secret can be kept out of the config entirely — a systemd credential, a file, or an environment variable ([above](#where-the-client-secret-comes-from)). Whichever file holds it must be 0600 and owned by root or the broker's uid, and `broker.yaml` is checked the same way whether or not the secret is inline; the broker refuses to start rather than treat a world-readable secret — or a world-readable set of mapping rules — as confidential.
 - Session IDs are generated by the broker with `crypto/rand`; a client-supplied `session_id` on an `authenticate` request is ignored.
 - Org and team membership is checked server-side in the broker, before mapping.
 - Enrollment records name the provider they were created against, so on a host with two providers an account with the same login at the other one cannot claim an enrollment. Records written before v0.3.0 name no provider and match any; re-enroll to scope them.

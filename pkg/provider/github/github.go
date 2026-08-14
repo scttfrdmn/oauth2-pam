@@ -518,10 +518,26 @@ func (p *Provider) checkAccess(id *provider.Identity) error {
 
 // GitHub API helpers
 
+// getUser fetches GET /user, the call every later decision is built on.
+//
+// An empty login is refused here, at the point the value enters the system. There
+// is no such thing as a GitHub account without one, so a /user response missing it
+// is a malformed reply — from a GHES that answered with an error body, a proxy that
+// rewrote it, or a decode that produced the zero value — and not an identity.
+//
+// Refusing it downstream is not enough, which is the lesson of #80: an empty login
+// is not merely useless, it is a wildcard. It matched an enrollment record whose
+// own login was missing, in the most authoritative mapping tier, so the pair
+// ("", "") granted whichever local account that record named. Store.Find, Store.Add
+// and the mapper each refuse it now, and each of those is a different reader of the
+// same value; the provider is where it stops being possible to produce.
 func (p *Provider) getUser(ctx context.Context, accessToken string) (*gitHubUser, error) {
 	var user gitHubUser
 	if err := p.apiGet(ctx, accessToken, "/user", &user); err != nil {
 		return nil, err
+	}
+	if user.Login == "" {
+		return nil, fmt.Errorf("GET /user returned no login; the response is not a GitHub user")
 	}
 	return &user, nil
 }

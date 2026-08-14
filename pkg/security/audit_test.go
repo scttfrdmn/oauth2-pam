@@ -462,3 +462,36 @@ func TestTimestampIsPreservedWhenSupplied(t *testing.T) {
 		t.Errorf("Timestamp = %s, want the supplied %s", events[0].Timestamp, ts)
 	}
 }
+
+// NewAuditLoggerWithOutputs is a seam for callers in other packages that need a
+// sink which fails, so the two ways of asking for a logger that records nothing
+// have to be refused rather than honoured quietly.
+func TestNewAuditLoggerWithOutputsRefusesALoggerThatRecordsNothing(t *testing.T) {
+	if _, err := NewAuditLoggerWithOutputs(config.AuditConfig{Enabled: true}); err == nil {
+		t.Error("accepted a logger with no outputs; every event would vanish")
+	}
+	if _, err := NewAuditLoggerWithOutputs(config.AuditConfig{}, &failingOutput{}); err == nil {
+		t.Error("accepted outputs for a disabled logger, which never writes to them")
+	}
+
+	// And what it does build behaves like any other logger: the allowlist applies to
+	// ordinary events and not to access decisions.
+	sink := &failingOutput{}
+	al, err := NewAuditLoggerWithOutputs(
+		config.AuditConfig{Enabled: true, Events: []string{"session_created"}}, sink)
+	if err != nil {
+		t.Fatalf("NewAuditLoggerWithOutputs: %v", err)
+	}
+	if err := al.LogAuthEventErr(AuditEvent{EventType: "authentication_success", Success: true}); err != nil {
+		t.Errorf("LogAuthEventErr = %v, want nil from a working sink", err)
+	}
+	if sink.writes != 1 {
+		t.Errorf("sink saw %d writes, want 1: an access decision is not filterable", sink.writes)
+	}
+	if err := al.LogAuthEventErr(AuditEvent{EventType: "token_refreshed"}); err != nil {
+		t.Errorf("LogAuthEventErr on a filtered event = %v, want nil", err)
+	}
+	if al.FilteredEvents() != 1 {
+		t.Errorf("FilteredEvents = %d, want 1", al.FilteredEvents())
+	}
+}

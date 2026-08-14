@@ -391,10 +391,24 @@ optional and the URL and code in `instructions` as what the user acts on.
 |---|---|---|---|
 | `pending` | A device flow is started and nobody has approved it yet | no | **no** |
 | `authorized` | Approved, identity mapped, and the mapping matches the requested account | yes | **yes**, with `success: true` |
-| `denied` | Refused: the user denied it at the provider, the identity mapped to a different account, the mapping was refused, or a limit was hit | yes | no |
+| `denied` | Refused: the user denied it at the provider, the identity mapped to a different account, or the mapping was refused | yes | no |
 | `expired` | The flow or the session ran out of time | yes | no |
-| `error` | Something failed. Read `error_code` | yes, unless the code says otherwise | no |
+| `error` | Something failed, or the broker is full. Read `error_code` | yes, unless the code says otherwise | no |
 | `revoked` | Reply to `revoke_session` only | yes | n/a |
+
+**A capacity refusal is `error`, never `denied`.** Running out of capacity —
+`SESSION_LIMIT_REACHED` or `AUTH_LIMIT_REACHED` — is a statement about the
+broker's load, not a judgement about the identity presenting itself: nobody was
+refused, the broker declined to try. `denied` is reserved for the three things in
+its row above, all of which are decisions about *this* user, and a client is
+entitled to treat it as one. This broker sent `denied` with
+`SESSION_LIMIT_REACHED` until v0.4.0, so the same condition — this host is full —
+arrived as a decision about the user down one path and as an operational failure
+down the other; a user at their session cap was told their identity had been
+refused, and the module mapped it to `PAM_AUTH_ERR` rather than the
+`PAM_AUTHINFO_UNAVAIL` its twin got ([#84](https://github.com/scttfrdmn/oauth2-pam/issues/84)).
+The two codes stay distinct so a log can tell them apart; the status they arrive
+with does not.
 
 A terminal session remains queryable for a grace period after it ends — two
 minutes in this broker — so a client that is still polling learns the real outcome
@@ -430,11 +444,17 @@ The one code whose retryability is part of the contract:
   answer.
 
 **Capacity conditions — `AUTH_LIMIT_REACHED` (the host's concurrent device flows)
-and `SESSION_LIMIT_REACHED` (this user's active sessions) — are not retried
-either**, but they deserve to be distinguishable in a log, because they say
-something about the host rather than about the user. `AUTH_LIMIT_REACHED` in
-particular is held by *other* logins for as long as their device flows live, so
-retrying inside this login only spends the user's remaining time to fail again.
+and `SESSION_LIMIT_REACHED` (this user's active sessions) — both arrive as
+`status: "error"`, and neither is retried.** The status is the same for both
+because the condition is the same: the broker is at a limit and declined to try,
+which is a fact about the host's load and not a decision about the identity that
+asked (see Status values above, and
+[#84](https://github.com/scttfrdmn/oauth2-pam/issues/84)). They keep separate
+codes because they are worth telling apart in a log — one is this user's own
+sessions, the other is every login on the host — not because a client should act
+on them differently. `AUTH_LIMIT_REACHED` in particular is held by *other* logins
+for as long as their device flows live, so retrying inside this login only spends
+the user's remaining time to fail again.
 
 The remaining codes are diagnostic. A client that does not recognise a code must
 treat the reply as a failure, which for all of these is the right answer:
@@ -448,6 +468,8 @@ treat the reply as a failure, which for all of these is the right answer:
 | `SESSION_NOT_FOUND` | broker | no such `session_id`, or it aged out past the grace period |
 | `SESSION_EXPIRED` | broker | the session or device code ran out of time |
 | `SESSION_NOT_ACTIVE` | broker | a session verb was used on a session that is not authorized |
+| `SESSION_LIMIT_REACHED` | broker | this user already has as many active sessions as the broker allows. `status: "error"` — capacity, not a denial |
+| `AUTH_LIMIT_REACHED` | broker | the host already has as many device flows in progress as the broker allows. `status: "error"` for the same reason |
 | `AUTHENTICATION_FAILED`, `SESSION_CHECK_FAILED`, `SESSION_REFRESH_FAILED`, `SESSION_REVOCATION_FAILED` | broker | the verb's handler returned an internal error; details are in the broker's log, deliberately not on the wire |
 | `RESPONSE_TOO_LARGE` | broker | the reply for this request did not fit the reply cap and was replaced by this one. Terminal |
 
@@ -540,6 +562,10 @@ A **broker**:
 9. Never satisfies a network requirement from an absent `source_ip`. Absent is
    `unknown`, and what `unknown` does is a decision the broker must have made
    before it is asked, not one a validator makes for it by returning false.
+10. Reports a capacity refusal as `status: "error"`, whichever limit was reached,
+    and keeps `denied` for decisions about the identity. Test both limits in one
+    test: the way this was got wrong was two refusals of the same shape written in
+    different places, each self-consistent.
 
 Both ends: **an extension field is never load-bearing for the grant.** Not a
 separate item because it is not a separate test — it is the property the other

@@ -573,6 +573,50 @@ func TestGetIdentityRequiresUserEndpoint(t *testing.T) {
 	}
 }
 
+// TestGetIdentityRefusesAnEmptyLogin: an empty login is not a useless value, it is
+// a wildcard, and the provider is where it enters the system (#80).
+//
+// A /user reply with no login is malformed — every GitHub account has one — and the
+// candidates are a GHES answering with an error body, a proxy rewriting the
+// response, and a decode landing on the zero value. Downstream, the empty string
+// matched an enrollment record whose own login was missing, in the most
+// authoritative mapping tier, so the pair ("", "") granted whichever local account
+// that record named. Store.Find, Store.Add and the mapper each refuse it now; this
+// is the check that stops it being produced in the first place.
+//
+// The bodies below are the shapes it actually arrives in: absent, explicitly empty,
+// and an object that is not a user at all but decodes into one.
+func TestGetIdentityRefusesAnEmptyLogin(t *testing.T) {
+	for name, body := range map[string]string{
+		"absent":        `{"id":1,"name":"Alice"}`,
+		"empty string":  `{"login":"","id":1}`,
+		"an error body": `{"message":"Bad credentials","documentation_url":"https://docs.github.com"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/user", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(body))
+			})
+			mux.HandleFunc("/user/orgs", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`[{"login":"acme"}]`))
+			})
+			mux.HandleFunc("/user/teams", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`[]`))
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+
+			id, err := providerFor(t, srv.URL).GetIdentity(context.Background(), &provider.Token{AccessToken: "gho_abc"})
+			if err == nil {
+				t.Fatalf("GetIdentity returned an identity with login %q for a /user reply naming none", id.Login)
+			}
+			if !strings.Contains(err.Error(), "login") {
+				t.Errorf("err = %q, want it to name the missing login", err)
+			}
+		})
+	}
+}
+
 func TestGetIdentityToleratesOrgAndTeamFailures(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/user", func(w http.ResponseWriter, _ *http.Request) {

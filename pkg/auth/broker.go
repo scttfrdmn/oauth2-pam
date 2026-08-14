@@ -51,8 +51,12 @@ const (
 	StatusExpired = "expired"
 
 	// StatusError means the attempt failed for an operational reason (provider
-	// unreachable, mapping service down, internal error) rather than a
-	// decision about the user. Terminal.
+	// unreachable, mapping service down, internal error, or the broker at a
+	// capacity limit) rather than a decision about the user. Terminal.
+	//
+	// Capacity belongs here and not in StatusDenied: SESSION_LIMIT_REACHED and
+	// AUTH_LIMIT_REACHED both say the broker declined to try, which is a fact
+	// about this host's load and not about the identity that asked. See #84.
 	StatusError = "error"
 )
 
@@ -283,6 +287,12 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 		Str("login_type", req.LoginType).
 		Msg("Processing authentication request")
 
+	// Not a grant path: this records that a login was attempted, before anything
+	// has been decided or handed out, so LogAuthEvent (log the write failure and
+	// carry on) is the right call. Failing the request here would mean a broker that
+	// cannot write its audit trail refuses to start device flows at all — see
+	// LogAuthEventErr at the one authentication_success site for the distinction,
+	// and criticalAuditEvents for why this event is the one the buffer exists for.
 	b.auditLogger.LogAuthEvent(security.AuditEvent{
 		EventType:  "authentication_attempt",
 		UserID:     req.UserID,
@@ -340,6 +350,8 @@ func (b *Broker) Authenticate(req *AuthRequest) (*AuthResponse, error) {
 			Msg("Could not start a device flow at the provider")
 		// The audit record keeps the detail: it is a local log, and an operator
 		// diagnosing an unreachable provider has nowhere else to read it.
+		//
+		// Not a grant path — the login is already failing — so LogAuthEvent.
 		b.auditLogger.LogAuthEvent(security.AuditEvent{
 			EventType:    "device_flow_failed",
 			UserID:       req.UserID,
@@ -724,14 +736,47 @@ func (b *Broker) RevokeSession(sessionID string) error {
 
 	b.removeSession(sessionID)
 
-	b.auditLogger.LogAuthEvent(security.AuditEvent{
+	// What this record claims has to match what was actually revoked — #69.
+	//
+	// A session that never completed its device flow has no authenticated user:
+	// LocalUser is empty, because it is only ever written by activateSession. This
+	// used to be recorded as Success: true with UserID "", which reads as
+	// "someone's session was revoked successfully" and names nobody — a line an
+	// incident review cannot correlate with anything, and worse than no line at
+	// all, because it looks like a resolved fact.
+	//
+	// So Success here means "an authenticated session belonging to UserID was
+	// destroyed", and it is true only when there was such a user to name. For a
+	// pending or terminally failed session the empty UserID is the honest answer,
+	// and the record says which state it was in and which account the login had
+	// asked for. requested_user travels in the metadata rather than in UserID: the
+	// client chose it and the broker never confirmed it, so it must not sit in the
+	// field that elsewhere means "the identity the broker mapped".
+	//
+	// Not a grant path: LogAuthEvent, as a revocation stands whether or not it can
+	// be written down. Withholding the revocation because the sink is full would
+	// leave a live session and a live token instead.
+	authenticated := session.IsActive && session.LocalUser != ""
+	event := security.AuditEvent{
 		EventType: "session_revoked",
 		UserID:    session.LocalUser,
 		SessionID: sessionID,
 		Provider:  session.Provider,
-		Success:   true,
+		Success:   authenticated,
 		Timestamp: time.Now(),
-	})
+		Metadata: map[string]interface{}{
+			"session_status": session.Status,
+		},
+	}
+	if !authenticated {
+		// Success is false for a reason that is not a failure of the revocation, so
+		// say which it is; otherwise the record reads as "revocation failed".
+		event.ErrorMessage = "session was revoked before it authenticated anyone; no local user to name"
+		if session.RequestedLocalUser != "" {
+			event.Metadata["requested_user"] = session.RequestedLocalUser
+		}
+	}
+	b.auditLogger.LogAuthEvent(event)
 
 	return nil
 }
@@ -793,6 +838,9 @@ func (b *Broker) pollDeviceAuthorization(
 					b.failSession(sessionID, StatusExpired, "Device code expired before authorization")
 					return
 				case errors.Is(err, provider.ErrAccessDenied):
+					// A denial, not a grant: LogAuthEvent. The login is refused
+					// whatever the audit sink does, so there is no decision left for
+					// the write error to turn on.
 					b.auditLogger.LogAuthEvent(security.AuditEvent{
 						EventType:    "authentication_denied",
 						SessionID:    sessionID,
@@ -823,6 +871,7 @@ func (b *Broker) pollDeviceAuthorization(
 				if !isTransientError(err) || attempt == 3 {
 					log.Error().Err(err).Int("attempt", attempt).
 						Str("session_id", sessionID).Msg("Failed to resolve provider identity")
+					// A failure, not a grant: LogAuthEvent.
 					b.auditLogger.LogAuthEvent(security.AuditEvent{
 						EventType:    "authentication_failed",
 						SessionID:    sessionID,
@@ -864,6 +913,7 @@ func (b *Broker) pollDeviceAuthorization(
 							Str("session_id", sessionID).
 							Str("provider_login", identity.Login).
 							Msg("Identity mapping failed")
+						// A failure, not a grant: LogAuthEvent.
 						b.auditLogger.LogAuthEvent(security.AuditEvent{
 							EventType:    "authentication_failed",
 							UserID:       identity.Login,
@@ -908,6 +958,9 @@ func (b *Broker) pollDeviceAuthorization(
 						Str("mapped_user", mapResult.LocalUser).
 						Str("provider_login", identity.Login).
 						Msg("Mapped local user does not match requested login; denying")
+					// A denial, not a grant: LogAuthEvent. The session is still
+					// pending and is about to be failed, so nothing is handed out
+					// however the write goes.
 					b.auditLogger.LogAuthEvent(security.AuditEvent{
 						EventType:    "authentication_denied",
 						UserID:       current.RequestedLocalUser,
@@ -976,7 +1029,21 @@ func (b *Broker) pollDeviceAuthorization(
 					return
 				}
 
-				b.auditLogger.LogAuthEvent(security.AuditEvent{
+				// The only grant path in this file, and so the only audit write whose
+				// failure has to fail the login — #69. The session is active as of the
+				// line above: the next check_session hands out an authenticated user.
+				// LogAuthEvent would log the write failure and grant anyway, which is
+				// a full disk turning into a successful login with no record of who
+				// was let in, and that record is the one an incident is reconstructed
+				// from. So the error is taken, and the grant is withdrawn if the
+				// record did not reach a sink.
+				//
+				// Written after activation rather than before, deliberately: before,
+				// the record would claim a success that activateSession might still
+				// refuse. The order here can only produce a session that existed for
+				// microseconds and was then destroyed, which is what the client is
+				// told.
+				if err := b.auditLogger.LogAuthEventErr(security.AuditEvent{
 					EventType:  "authentication_success",
 					UserID:     mapResult.LocalUser,
 					Email:      identity.Email,
@@ -991,7 +1058,15 @@ func (b *Broker) pollDeviceAuthorization(
 						"provider_subject": identity.Subject,
 						"claims":           identity.Claims,
 					},
-				})
+				}); err != nil {
+					log.Error().Err(err).
+						Str("session_id", sessionID).
+						Str("local_user", mapResult.LocalUser).
+						Msg("Could not record the authentication; withdrawing the grant rather than allowing an unlogged login")
+					b.withdrawGrant(sessionID, current.CreatedAt, tokenID,
+						"Internal error recording the authentication")
+					return
+				}
 
 				log.Info().
 					Str("session_id", sessionID).
@@ -1249,15 +1324,21 @@ func (b *Broker) reserveSession(session *Session) *AuthResponse {
 
 	// The per-user limit on *established* sessions. Pending flows are counted
 	// separately, below: an abandoned SSH attempt must not consume a session slot.
+	//
+	// StatusError, via errorResponse, and not StatusDenied — see #84. Both capacity
+	// refusals are statements about the broker's load, not judgements about the
+	// identity presenting itself: nobody was denied, the broker declined to try. It
+	// answered StatusDenied here and StatusError for AUTH_LIMIT_REACHED below, which
+	// meant the same condition — this host is full — reached a client as a decision
+	// about the user down one path and an operational failure down the other. The
+	// consequence was visible in the reference client: "denied" is PAM_AUTH_ERR,
+	// so a user at their session cap was told their identity had been refused,
+	// while the identically-shaped AUTH_LIMIT_REACHED got PAM_AUTHINFO_UNAVAIL
+	// and a chance at the rest of the stack.
 	if max := b.config.Authentication.MaxConcurrentSessions; max > 0 {
 		if b.countUserSessionsLocked(session.RequestedLocalUser) >= max {
 			b.sessionMutex.Unlock()
-			return &AuthResponse{
-				Success:      false,
-				Status:       StatusDenied,
-				ErrorCode:    "SESSION_LIMIT_REACHED",
-				ErrorMessage: "Maximum concurrent sessions reached",
-			}
+			return errorResponse("SESSION_LIMIT_REACHED", "Maximum concurrent sessions reached")
 		}
 	}
 
@@ -1400,6 +1481,36 @@ func (b *Broker) failSession(sessionID, status, message string) {
 		Str("session_id", sessionID).
 		Str("status", status).
 		Msg("Session marked terminally failed")
+}
+
+// withdrawGrant takes back an activation: it destroys the token this flow stored,
+// marks the session terminally errored, and retains it for terminalGrace so the
+// client polling check_session is told the login failed rather than being handed
+// the session that was authorized a moment ago.
+//
+// failSession cannot do this. It refuses to rewrite a session that is no longer
+// pending — right for a cancelled poller's late failure, which must not overwrite
+// an outcome a client has already been given, and wrong here, where the caller is
+// the goroutine that made the session authorized in the first place and is
+// deciding, before anyone has seen it, that it must not stand.
+//
+// createdAt identifies the session that was activated: if the entry is gone or is
+// a different session that reused the ID, only the token is destroyed, because
+// there is nothing left of the grant to withdraw.
+func (b *Broker) withdrawGrant(sessionID string, createdAt time.Time, tokenID, message string) {
+	b.sessionMutex.Lock()
+	if s, ok := b.sessions[sessionID]; ok && s.CreatedAt.Equal(createdAt) {
+		s.Status = StatusError
+		s.ErrorMessage = message
+		s.IsActive = false
+		s.TokenID = ""
+		s.ExpiresAt = time.Now().Add(terminalGrace)
+	}
+	b.sessionMutex.Unlock()
+
+	if tokenID != "" {
+		b.tokenManager.RevokeToken(tokenID)
+	}
 }
 
 // evictExcessPendingFlowsLocked drops the oldest pending flows for userID until

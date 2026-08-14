@@ -129,6 +129,86 @@ func TestConcurrentAuthenticateDoesNotOvershootTheAuthCap(t *testing.T) {
 	}
 }
 
+// TestCapacityRefusalsAreErrorsNotDenials pins the status both capacity refusals
+// carry, in one test, because the way #84 happened is that the two refusals were
+// written in different places and each was self-consistent: reserveSession built
+// its SESSION_LIMIT_REACHED reply by hand with StatusDenied while
+// AUTH_LIMIT_REACHED went through errorResponse.
+//
+// A capacity refusal is a statement about the broker's load — the broker declined
+// to try — and StatusDenied is a decision about the identity. The difference is
+// not cosmetic: the reference client maps "denied" to PAM_AUTH_ERR and an "error"
+// to PAM_AUTHINFO_UNAVAIL, so a user who merely hit their session cap was told
+// their identity had been refused and the rest of the PAM stack never ran.
+func TestCapacityRefusalsAreErrorsNotDenials(t *testing.T) {
+	assertCapacityRefusal := func(t *testing.T, resp *AuthResponse, code string) {
+		t.Helper()
+		if resp.ErrorCode != code {
+			t.Fatalf("error_code = %q, want %q", resp.ErrorCode, code)
+		}
+		if resp.Status == StatusDenied {
+			t.Errorf("%s arrived as status %q; a capacity refusal is about the broker's load, not about the user",
+				code, resp.Status)
+		}
+		if resp.Status != StatusError {
+			t.Errorf("%s: status = %q, want %q", code, resp.Status, StatusError)
+		}
+		if resp.Success {
+			t.Errorf("%s: success = true on a refusal", code)
+		}
+		if resp.UserID != "" {
+			t.Errorf("%s: user_id = %q on a refusal, want empty", code, resp.UserID)
+		}
+		if resp.SessionID != "" {
+			t.Errorf("%s: session_id = %q, want no session created", code, resp.SessionID)
+		}
+	}
+
+	t.Run("SESSION_LIMIT_REACHED", func(t *testing.T) {
+		cfg := brokerConfig(t)
+		cfg.Authentication.MaxConcurrentSessions = 1
+		b := startBroker(t, cfg, newFakeProvider("acme"))
+
+		// One established session, which is what the per-user cap counts; pending
+		// flows are counted separately and deliberately do not fill it.
+		b.setSession(&Session{
+			ID:                 "established",
+			RequestedLocalUser: "alice",
+			LocalUser:          "alice",
+			CreatedAt:          time.Now(),
+			ExpiresAt:          time.Now().Add(time.Hour),
+			Status:             StatusAuthorized,
+			IsActive:           true,
+		})
+
+		resp, err := b.Authenticate(&AuthRequest{UserID: "alice", LoginType: "ssh"})
+		if err != nil {
+			t.Fatalf("Authenticate: %v", err)
+		}
+		assertCapacityRefusal(t, resp, "SESSION_LIMIT_REACHED")
+	})
+
+	t.Run("AUTH_LIMIT_REACHED", func(t *testing.T) {
+		cfg := brokerConfig(t)
+		cfg.Security.RateLimiting.MaxConcurrentAuths = 1
+		b := startBroker(t, cfg, newFakeProvider("acme"))
+
+		// Distinct usernames: per-user eviction would otherwise recycle alice's own
+		// pending flow and the global cap would never be reached.
+		if first, err := b.Authenticate(&AuthRequest{UserID: "alice", LoginType: "ssh"}); err != nil {
+			t.Fatalf("Authenticate: %v", err)
+		} else if first.Status != StatusPending {
+			t.Fatalf("first request: status = %q, want %q", first.Status, StatusPending)
+		}
+
+		resp, err := b.Authenticate(&AuthRequest{UserID: "bob", LoginType: "ssh"})
+		if err != nil {
+			t.Fatalf("Authenticate: %v", err)
+		}
+		assertCapacityRefusal(t, resp, "AUTH_LIMIT_REACHED")
+	})
+}
+
 // TestEvictedPendingFlowStopsPollingTheProvider pins poller cancellation.
 //
 // A device flow evicted to make room for a newer one used to leave its goroutine
