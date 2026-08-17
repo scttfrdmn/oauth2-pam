@@ -10,7 +10,7 @@
 #
 # The source is not copied in — the Makefile target mounts the working tree, so
 # an edit is picked up without rebuilding the image.
-FROM golang:1.25-bookworm
+FROM golang:1.26-bookworm
 
 # Above any source, so editing a file does not re-run apt-get.
 RUN apt-get update \
