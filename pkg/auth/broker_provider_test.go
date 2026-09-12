@@ -50,6 +50,12 @@ type fakeProvider struct {
 	identityGate   chan struct{}
 	identityCtxErr error
 
+	// pollCtx is the context the broker passed the poller, captured in GetIdentity.
+	// A test reads it after the poller exits to check the device-flow deadline timer
+	// was released (the context cancelled) rather than left armed until expiresAt —
+	// the #131 leak, which was invisible in every session field.
+	pollCtx context.Context
+
 	// identityErr, when set, is what GetIdentity returns instead of an identity:
 	// the provider has authenticated the person and then refuses to say who they
 	// are. Wrapping provider.ErrAccessForbidden is how "not in the required org or
@@ -151,6 +157,7 @@ func (f *fakeProvider) GetIdentity(ctx context.Context, _ *provider.Token) (*pro
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.identityCtxErr = ctx.Err()
+	f.pollCtx = ctx
 	if f.identityErr != nil {
 		return nil, fmt.Errorf("acme-sso identity: %w", f.identityErr)
 	}
@@ -283,6 +290,57 @@ func awaitPollerExit(t *testing.T, b *Broker, sessionID string) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("the poller for session %s never finished", sessionID)
+}
+
+// TestPollContextIsReleasedOnASuccessfulLogin is the #131 regression. The
+// device-flow context carries a WithDeadline timer set to the flow's expiry
+// (minutes out). On the poller's error exits failSession cancels it; on the
+// SUCCESS exit the poller used to defer forgetPoll, which dropped the cancel func
+// without calling it, so the timer sat on the runtime heap until expiresAt for a
+// login that finished in seconds. The poller now defers cancelPoll, so the
+// context is cancelled the moment the poller returns.
+//
+// Observed through the context the fake captured in GetIdentity: after the poller
+// has exited, that context must report context.Canceled — not nil (timer still
+// armed, the leak) and not DeadlineExceeded (it did not run out its clock).
+func TestPollContextIsReleasedOnASuccessfulLogin(t *testing.T) {
+	fake := newFakeProvider("acme")
+	b := startBroker(t, brokerConfig(t), fake)
+
+	start, err := b.Authenticate(&AuthRequest{UserID: "alice", LoginType: "ssh"})
+	if err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+	fake.authorize()
+
+	resp := awaitStatus(t, b, start.SessionID)
+	if resp.Status != StatusAuthorized {
+		t.Fatalf("status = %q, want authorized", resp.Status)
+	}
+	awaitPollerExit(t, b, start.SessionID)
+
+	// cancelPoll deletes the map entry (what awaitPollerExit sees) under the lock
+	// and calls cancel() just after unlocking, so poll briefly rather than reading
+	// once.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		fake.mu.Lock()
+		ctx := fake.pollCtx
+		fake.mu.Unlock()
+		if ctx == nil {
+			t.Fatal("the provider never captured the poll context; the flow did not reach GetIdentity")
+		}
+		switch ctx.Err() {
+		case context.Canceled:
+			return // the timer was released — the fix holds
+		case context.DeadlineExceeded:
+			t.Fatalf("poll context hit its deadline; it should have been cancelled on success, not run out")
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("poll context was never cancelled after a successful login; the WithDeadline timer leaks until expiresAt (#131)")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // TestNonGitHubProviderAuthenticatesEndToEnd is the validation for the provider

@@ -800,7 +800,14 @@ func (b *Broker) pollDeviceAuthorization(
 	df *provider.DeviceFlow,
 ) {
 	defer b.wg.Done()
-	defer b.forgetPoll(sessionID)
+	// cancelPoll, not a bare map delete: the poller's own terminal exits (a granted
+	// login, a session removed out from under it) reach only this defer, and calling
+	// the context's cancel here releases the WithDeadline timer now rather than
+	// leaving it armed until expiresAt — the device-flow deadline, minutes after a
+	// login that finished in seconds (#131). On an error exit failSession has already
+	// cancelled and deleted the entry, so this finds nothing and is a no-op; calling
+	// cancel on an already-finished context is defined to be a no-op too.
+	defer b.cancelPoll(sessionID)
 
 	interval := time.Duration(df.PollingInterval) * time.Second
 	if interval <= 0 {
@@ -1372,8 +1379,18 @@ func (b *Broker) deviceFlowDeadline(df *provider.DeviceFlow) time.Time {
 	return df.ExpiresAt
 }
 
-// cancelPoll stops the polling goroutine for a session, if one is still running.
-// Safe to call for a session that has none.
+// cancelPoll stops the polling goroutine for a session, if one is still running,
+// and releases the context's deadline timer. Safe to call for a session that has
+// none, and safe to call more than once: the second call finds no entry.
+//
+// This is both the external stop (failSession, removeSession, eviction) and the
+// poller's own terminal cleanup, deferred in pollDeviceAuthorization. Calling
+// cancel() releases the WithDeadline timer immediately rather than leaving it on
+// the runtime heap until expiresAt; on the poller's success exit the context is
+// already done, and cancel() on a finished context is a defined no-op (#131). It
+// used to have a sibling, forgetPoll, that deleted the entry without calling
+// cancel — the map-growth concern that named is handled by the delete here, so the
+// two collapsed into this one and the timer stopped leaking on the success path.
 //
 // The cancel function is taken under the lock and invoked outside it: callers
 // include paths that already hold sessionMutex, and cancel() must never be able
@@ -1387,14 +1404,6 @@ func (b *Broker) cancelPoll(sessionID string) {
 	if cancel != nil {
 		cancel()
 	}
-}
-
-// forgetPoll drops a finished poller's cancel function without calling it, so
-// the map does not grow with one entry per completed login.
-func (b *Broker) forgetPoll(sessionID string) {
-	b.sessionMutex.Lock()
-	defer b.sessionMutex.Unlock()
-	delete(b.pollCancel, sessionID)
 }
 
 // reserveSession enforces the concurrency caps and inserts the pending entry
