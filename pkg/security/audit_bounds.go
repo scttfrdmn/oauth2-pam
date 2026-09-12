@@ -121,6 +121,14 @@ func boundEvent(event AuditEvent) AuditEvent {
 // still identifies the login it belongs to, and identifying the login is most of
 // what the field is for.
 func boundAuditString(s, field string, lost *[]string) string {
+	// Neutralize terminal-unsafe runes before the size check (#111). The record is
+	// bounded in length and, until now, unbounded in content: a provider-chosen
+	// email or error message carrying U+009B CSI reached the audit file — which cat,
+	// tail and grep decode verbatim — as a live escape. Escaping is lossless, so it
+	// gets no truncation note; the \uXXXX is the faithful record of what arrived, and
+	// an investigator sees it in place. It expands length, so it runs first and the
+	// bound below is enforced on what is actually written.
+	s, _ = escapeTerminalUnsafe(s)
 	if len(s) <= maxAuditStringBytes {
 		return s
 	}
@@ -160,6 +168,16 @@ func boundAuditGroups(groups []string, lost *[]string) []string {
 	if len(groups) == 0 {
 		return groups
 	}
+
+	// Escape terminal-unsafe runes in each entry before measuring, so the size test
+	// is on what will be written and a group name carrying a control character
+	// cannot reach the trail live (#111). A mapper answer is provider-derived like
+	// the rest.
+	escaped := make([]string, len(groups))
+	for i, g := range groups {
+		escaped[i], _ = escapeTerminalUnsafe(g)
+	}
+	groups = escaped
 
 	total := 0
 	oversize := false
@@ -212,7 +230,13 @@ func boundAuditMetadata(md map[string]interface{}, lost *[]string) map[string]in
 			break
 		}
 		bk := boundAuditString(k, "metadata key "+k, lost)
-		encoded, err := json.Marshal(md[k])
+		// Escape terminal-unsafe runes anywhere in the value, including inside a
+		// claims map of provider-chosen names and values, before measuring and
+		// storing it (#111). Measured on the escaped form because that is what is
+		// written; an unmarshallable value is returned unchanged by escapeAuditValue,
+		// so the err branch below still fires on exactly the events it did before.
+		ev, _ := escapeAuditValue(md[k])
+		encoded, err := json.Marshal(ev)
 		switch {
 		case err != nil:
 			// Left exactly as it arrived, which means writeEvent's json.Marshal fails and
@@ -230,7 +254,7 @@ func boundAuditMetadata(md map[string]interface{}, lost *[]string) map[string]in
 			out[bk] = fmt.Sprintf("[!] value omitted: %d bytes, over the %d-byte limit",
 				len(encoded), maxAuditMetadataValueBytes)
 		default:
-			out[bk] = md[k]
+			out[bk] = ev
 		}
 	}
 	return out

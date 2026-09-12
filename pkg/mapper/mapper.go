@@ -225,7 +225,22 @@ func groupsNamedInRules(rules []config.MappingRule) []string {
 func (c *Chain) Map(ctx context.Context, id *provider.Identity, requestedLocalUser string) (*Result, error) {
 	// Tier 0: enrollment file
 	if c.cfg.EnrollmentEnabled && c.cfg.EnrollmentFile != "" && requestedLocalUser != "" {
-		if result := mapViaEnrollment(c.cfg.EnrollmentFile, requestedLocalUser, id); result != nil {
+		result, err := mapViaEnrollment(c.cfg.EnrollmentFile, requestedLocalUser, id)
+		if err != nil {
+			// A file this process cannot trust is a failed login, not a fall-through
+			// to the later tiers (#115). enrollment.Load already refuses a symlinked,
+			// group-writable or wrongly-owned file for the reason store.go states: if
+			// tier 0 can be rewritten by someone else, falling through turns that into
+			// a silent change of mapping policy — the login proceeds under whatever
+			// tier 1/2/3 says, and the operator who made tier 0 authoritative is not
+			// told it was ignored. The error was being swallowed here (warn + nil),
+			// which was exactly the caller-that-does-not-use-the-mitigation shape of
+			// #102 and #104. Returned rather than classified as ErrNoMapping, so the
+			// broker records it as an operational failure naming the file, not as
+			// "this user is not enrolled".
+			return nil, err
+		}
+		if result != nil {
 			if err := c.checkLocalUser("tier0 (enrollment)", result.LocalUser); err != nil {
 				return nil, err
 			}
@@ -313,7 +328,19 @@ func (c *Chain) Map(ctx context.Context, id *provider.Identity, requestedLocalUs
 
 // --- Tier 0: enrollment file ---
 
-func mapViaEnrollment(path, localUser string, id *provider.Identity) *Result {
+// mapViaEnrollment returns the tier-0 mapping for (localUser, id), or (nil, nil)
+// when this tier simply has no answer, or a non-nil error when the enrollment file
+// exists but cannot be trusted.
+//
+// The distinction is the point (#115). "No answer" — no provider login to match
+// on, no matching record, a record with an invalid Unix name — is a fall-through:
+// a later tier may map the identity. A trust failure from enrollment.Load — a
+// symlink at the path, a group-writable or wrongly-owned file or directory — is
+// not, and Map turns it into a refused login. enrollment.Load already draws that
+// line (an absent file is (empty, nil); an untrusted one is an error) precisely so
+// that a caller does not have to, and this returns the error rather than logging
+// and discarding it.
+func mapViaEnrollment(path, localUser string, id *provider.Identity) (*Result, error) {
 	// An identity with no login has nothing for this tier to match on, and must not
 	// be allowed to try. Matching is case-insensitive, EqualFold("", "") is true,
 	// and so an enrollment record whose login: key is missing would answer for every
@@ -324,26 +351,27 @@ func mapViaEnrollment(path, localUser string, id *provider.Identity) *Result {
 	if id.Login == "" {
 		log.Warn().Str("provider", id.Provider).Str("path", path).
 			Msg("mapper tier0: identity has no provider login; skipping enrollment tier")
-		return nil
+		return nil, nil
 	}
 	store, err := enrollment.Load(path)
 	if err != nil {
-		log.Warn().Err(err).Str("path", path).Msg("mapper tier0: failed to load enrollment file")
-		return nil
+		// Not swallowed: returned, so the login fails closed rather than falling
+		// through to a tier the operator did not make authoritative. See Map.
+		return nil, fmt.Errorf("mapper tier0: enrollment file cannot be trusted: %w", err)
 	}
 	rec := store.Find(localUser, id.Login, id.Provider)
 	if rec == nil {
-		return nil
+		return nil, nil
 	}
 	if !unixUsernameRe.MatchString(rec.LocalUser) {
 		log.Warn().Str("local_user", rec.LocalUser).Str("path", path).
 			Msg("mapper tier0: enrollment record has invalid Unix username; skipping")
-		return nil
+		return nil, nil
 	}
 	return &Result{
 		LocalUser: rec.LocalUser,
 		Groups:    rec.Groups,
-	}
+	}, nil
 }
 
 // --- Tier 1: config-file rules ---

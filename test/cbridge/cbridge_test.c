@@ -707,18 +707,26 @@ static void test_protocol_version(void) {
 
     struct broker_response *r = NULL;
 
-    /* The version this module speaks. Accepted, obviously — but assert it, so
-       that bumping PROTOCOL_VERSION without teaching the module the new contract
-       fails here rather than in production. */
-    char reply[128];
-    snprintf(reply, sizeof(reply),
-             "{\"protocol_version\":%d,\"status\":\"pending\",\"session_id\":\"abc\"}",
-             PROTOCOL_VERSION);
-    CHECK(parse_broker_response(reply, &r) == 0, "failed to parse a same-version reply");
+    /* Pin the version this module speaks to a literal, not to PROTOCOL_VERSION
+       itself (#116). Building the reply from PROTOCOL_VERSION and then asserting
+       the parse read PROTOCOL_VERSION back is x == x: it cannot notice a bump,
+       though its comment used to claim it would. So assert the constant IS what
+       the rest of this test is written against — bump it and this fails, which is
+       the prompt to go teach the module the new contract and update these cases,
+       rather than discovering it in production. */
+    CHECK(PROTOCOL_VERSION == 1,
+          "PROTOCOL_VERSION is %d; this suite is written for version 1. If the wire "
+          "contract changed, update the version-aware cases here, then this line.",
+          PROTOCOL_VERSION);
+
+    /* A version-1 reply, written with the literal so the test does not launder the
+       constant through itself, is accepted and read as 1. */
+    CHECK(parse_broker_response(
+              "{\"protocol_version\":1,\"status\":\"pending\",\"session_id\":\"abc\"}", &r) == 0,
+          "failed to parse a version-1 reply");
     if (r != NULL) {
-        CHECK(r->protocol_version == PROTOCOL_VERSION,
-              "protocol_version = %d, want %d", r->protocol_version, PROTOCOL_VERSION);
-        CHECK(protocol_version_supported(r) == 1, "own version refused");
+        CHECK(r->protocol_version == 1, "protocol_version = %d, want 1", r->protocol_version);
+        CHECK(protocol_version_supported(r) == 1, "the module's own version was refused");
         free(r);
         r = NULL;
     }
@@ -751,22 +759,31 @@ static void test_protocol_version(void) {
         r = NULL;
     }
 
-    /* Junk in the field is not version 1 by default. A string, a float or a
-       negative number all leave it at 0, which reads as "the field is absent" —
-       that is the deliberate choice, because the alternative is inventing a
-       version number for a broker that sent nonsense. What must not happen is a
-       nonsense value being treated as a *known* version other than 1. */
+    /* A non-integer version is a malformed reply and is rejected outright (#112),
+       not read as "the field is absent, i.e. v1". This is the case that mattered:
+       json-c parses any number with a '.' or an exponent, and any integer too
+       large for int64, as json_type_double, so {"protocol_version": 2.0} used to
+       leave the field at 0 and be read under the v1 contract and granted — while
+       "2" was correctly refused. The assertion is on the parse RESULT, not on the
+       stored int, because the stored int being 0 is exactly the trap: it is the
+       accept/refuse decision that has to be pinned, not the parser's internals. */
     CHECK(parse_broker_response(
-              "{\"protocol_version\":\"two\",\"status\":\"pending\"}", &r) == 0,
-          "failed to parse a reply with a non-integer protocol_version");
-    if (r != NULL) {
-        CHECK(r->protocol_version == 0, "a string protocol_version became %d", r->protocol_version);
-        free(r);
-        r = NULL;
-    }
+              "{\"protocol_version\":2.0,\"success\":true,\"status\":\"authorized\","
+              "\"user_id\":\"alice\"}", &r) == -1,
+          "a float protocol_version (2.0) was not rejected; it would be read as v1 and granted");
+    CHECK(r == NULL, "parse_broker_response left r set after rejecting a float protocol_version");
 
+    /* A string version is rejected too. */
+    CHECK(parse_broker_response(
+              "{\"protocol_version\":\"two\",\"status\":\"pending\"}", &r) == -1,
+          "a string protocol_version was not rejected");
+    CHECK(r == NULL, "parse_broker_response left r set after rejecting a string protocol_version");
+
+    /* A negative integer is a real int to json-c, so it parses — and is then an
+       unknown version, refused by protocol_version_supported rather than at the
+       parse. The two rejection routes are distinct and both are checked. */
     CHECK(parse_broker_response("{\"protocol_version\":-1,\"status\":\"pending\"}", &r) == 0,
-          "failed to parse a reply with a negative protocol_version");
+          "failed to parse a reply with a negative (but integer) protocol_version");
     if (r != NULL) {
         CHECK(protocol_version_supported(r) == 0, "a negative protocol_version was accepted");
         free(r);
@@ -964,6 +981,53 @@ static void test_terminal_status_to_pam(void) {
         rc = terminal_status_to_pam(r, "alice");
         CHECK(rc == PAM_AUTH_ERR, "a missing status mapped to %d, want PAM_AUTH_ERR (%d)",
               rc, PAM_AUTH_ERR);
+        free(r);
+    }
+}
+
+static void test_poll_reply_is_throttle(void) {
+    printf("  poll_reply_is_throttle: a denial carrying RATE_LIMITED is not a throttle\n");
+
+    /* The poll loop backs off and keeps polling on a throttle, and takes any other
+       terminal status as the answer. The predicate deciding which is which has to
+       read status first: RATE_LIMITED is a throttle only as status "error". Before
+       #114 the loop read the error_code alone, so a reply of status "denied" with
+       RATE_LIMITED — which a broken or hostile broker can send — was polled to the
+       deadline (a 90-second refusal, and an sshd child pinned for it) instead of
+       being taken as the immediate denial it is. */
+    struct broker_response *r;
+
+    /* The one true throttle: status "error" with RATE_LIMITED. */
+    r = parsed("{\"status\":\"error\",\"error_code\":\"RATE_LIMITED\"}");
+    CHECK(r != NULL, "a throttle reply did not parse");
+    if (r != NULL) {
+        CHECK(poll_reply_is_throttle(r) == 1, "status error + RATE_LIMITED was not read as a throttle");
+        free(r);
+    }
+
+    /* A denial carrying the same code is a denial, not a throttle. This is the
+       case #114 was about. */
+    r = parsed("{\"status\":\"denied\",\"error_code\":\"RATE_LIMITED\"}");
+    CHECK(r != NULL, "a denied+RATE_LIMITED reply did not parse");
+    if (r != NULL) {
+        CHECK(poll_reply_is_throttle(r) == 0,
+              "status denied + RATE_LIMITED was read as a throttle; it would be polled to the deadline");
+        free(r);
+    }
+
+    /* So is an expired or authorized reply that happens to carry it. */
+    r = parsed("{\"status\":\"expired\",\"error_code\":\"RATE_LIMITED\"}");
+    CHECK(r != NULL, "an expired+RATE_LIMITED reply did not parse");
+    if (r != NULL) {
+        CHECK(poll_reply_is_throttle(r) == 0, "status expired + RATE_LIMITED was read as a throttle");
+        free(r);
+    }
+
+    /* An error that is not a rate limit is not a throttle either. */
+    r = parsed("{\"status\":\"error\",\"error_code\":\"AUTH_LIMIT_REACHED\"}");
+    CHECK(r != NULL, "an at-capacity reply did not parse");
+    if (r != NULL) {
+        CHECK(poll_reply_is_throttle(r) == 0, "a non-RATE_LIMITED error was read as a throttle");
         free(r);
     }
 }
@@ -1381,9 +1445,13 @@ static void test_build_device_prompt(void) {
               "the prompt does not say what to do next: [%s]", prompt);
         /* Order matters on a terminal: the caption has to precede the art it
            captions, and the "press Enter" line has to be last, where the cursor
-           sits. */
-        CHECK(strstr(prompt, QR_PROMPT_HEADER) < strstr(prompt, PROMPT_TRAILER),
-              "the trailer came before the QR header: [%s]", prompt);
+           sits. Both pointers are guarded against NULL first: strstr returning NULL
+           for an absent header would make NULL < ptr true and the ordering pass
+           vacuously, masking a missing caption (#116). */
+        const char *hdr = strstr(prompt, QR_PROMPT_HEADER);
+        const char *trl = strstr(prompt, PROMPT_TRAILER);
+        CHECK(hdr != NULL && trl != NULL && hdr < trl,
+              "the caption must appear, before the trailer: [%s]", prompt);
         free(r);
     }
 
@@ -1428,7 +1496,14 @@ static void test_build_device_prompt(void) {
         memset(big->qr_code, '#', sizeof(big->qr_code) - 1);
 
         build_device_prompt(prompt, sizeof(prompt), big);
-        CHECK(strlen(prompt) < sizeof(prompt), "the prompt filled its own buffer exactly");
+        /* strlen < sizeof is true of any null-terminated string in the buffer, so
+           it asserted nothing (#116); the meaningful claim is that the write left
+           at least one byte to spare, i.e. did not fill to the brim, which is the
+           shape a truncation would take. The trailer-present check below is the
+           other half — a prompt cut off before PROMPT_TRAILER is the failure this
+           case exists for. */
+        CHECK(strlen(prompt) < sizeof(prompt) - 1,
+              "the prompt filled its buffer to the brim; it was probably truncated");
         CHECK(strstr(prompt, PROMPT_TRAILER) != NULL,
               "maximal instructions and art truncated the trailer away");
         CHECK(strstr(prompt, QR_PROMPT_HEADER) != NULL, "maximal art lost its caption");
@@ -1544,6 +1619,7 @@ int main(void) {
     test_protocol_version();
     test_authorized_for();
     test_terminal_status_to_pam();
+    test_poll_reply_is_throttle();
     test_account_status_to_pam();
     test_account_decision();
     test_parse_reads_the_qr_code();

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/scttfrdmn/oauth2-pam/pkg/security"
 )
 
 // Provider-supplied strings end up on a terminal that nobody has authenticated
@@ -80,19 +82,14 @@ func SanitizePromptBlock(s string) string {
 
 // isDisallowedInPrompt reports whether r must not reach a pre-auth terminal.
 // Newline is handled by the caller, which knows whether it is structural.
+//
+// The set is defined once, in security.DisallowedTerminalRune, so the prompt
+// filter here and the audit record's escaper cannot drift apart \u2014 the reply
+// filter kept its own narrower copy and a test that could not notice, which was
+// #105. This filter removes what that predicate flags; the audit record escapes
+// it; the choice of which runes are dangerous is not made twice.
 func isDisallowedInPrompt(r rune) bool {
-	switch {
-	case r < 0x20: // C0: NUL, BS, TAB, LF, CR, ESC and friends
-		return true
-	case r == 0x7f: // DEL
-		return true
-	case r >= 0x80 && r <= 0x9f: // C1, e.g. U+0085 NEL and U+009B CSI
-		return true
-	case r == '\u2028', r == '\u2029': // LINE and PARAGRAPH SEPARATOR
-		return true
-	default:
-		return false
-	}
+	return security.DisallowedTerminalRune(r)
 }
 
 // sanitizeForPrompt walks s by rune, not by byte, because in valid UTF-8 a C1

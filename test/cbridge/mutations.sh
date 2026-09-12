@@ -57,7 +57,7 @@ mutations=0
 # (#109), because nothing connected the prose to the script. The count is asserted at
 # the end of the run: adding a case fails here until the two documents are updated,
 # which is the only mechanism that keeps a number in prose honest.
-DOCUMENTED_MUTATIONS=25
+DOCUMENTED_MUTATIONS=27
 
 # run <name> <fail|pass> [perl-expression]
 #
@@ -210,6 +210,20 @@ run "any protocol version is acceptable" fail \
 # invisible to a broker that starts enforcing one.
 run "protocol_version omitted from requests" fail \
     '$n = s/^.*json_object_object_add\(req, "protocol_version".*\n//mg'
+
+# A non-integer protocol_version is silently ignored rather than rejected (#112),
+# which leaves the field at 0 — "absent, i.e. v1" — so a broker sending
+# {"protocol_version": 2.0} (a double to json-c) has its reply read under the v1
+# contract, while "2" is correctly refused. Removing the reject branch is the
+# defect exactly as it stood before the fix.
+run "a non-integer protocol_version is ignored, not rejected" fail \
+    '$n = s/\n\s*if \(pv_obj == NULL \|\| json_object_get_type\(pv_obj\) != json_type_int\) \{.*?return -1;\n\s*\}//s'
+
+# The poll loop's throttle predicate drops its status test and reads the error_code
+# alone (#114). A reply of status "denied" carrying RATE_LIMITED is then read as a
+# throttle and polled to the deadline instead of being taken as the denial it is.
+run "a denial carrying RATE_LIMITED is read as a throttle" fail \
+    '$n = s/return strcmp\(r->status, STATUS_ERROR\) == 0 && is_rate_limited\(r\);/return is_rate_limited(r);/g'
 
 # success read with json-c's coercing accessor. Any non-empty string and any
 # non-zero number read as true, so "success":"false" would grant the login — a

@@ -420,6 +420,41 @@ func TestMissingEnrollmentFileFallsThrough(t *testing.T) {
 	}
 }
 
+// An enrollment file that exists but cannot be trusted — here a symlink, which
+// enrollment.Load refuses via O_NOFOLLOW — fails the login rather than falling
+// through to the rule tier (#115). A missing file falls through (above); an
+// untrusted one must not, or an attacker who can rewrite the authoritative tier
+// gets a broker that keeps authenticating under the tier below it and says only
+// "not enrolled". The error is not ErrNoMapping — it is an operational failure
+// naming the file — so it is distinguishable from a user who simply is not
+// enrolled.
+func TestUntrustedEnrollmentFileFailsRatherThanFallingThrough(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on windows")
+	}
+	real := writeEnrollment(t, enrollment.Record{LocalUser: "alice", Login: "alice"})
+	link := filepath.Join(t.TempDir(), "enrolled-users.yaml")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	c := New(config.MapperConfig{
+		EnrollmentEnabled: true,
+		EnrollmentFile:    link,
+		Rules: []config.MappingRule{
+			{Match: config.MatchCriteria{}, LocalUser: "ruleuser"},
+		},
+	})
+
+	res, err := c.Map(context.Background(), identity(), "alice")
+	if err == nil {
+		t.Fatalf("Map returned %v with an untrusted tier-0 file; it fell through to the rule tier", res)
+	}
+	if errors.Is(err, ErrNoMapping) {
+		t.Errorf("err = %v, want an operational trust error, not ErrNoMapping", err)
+	}
+}
+
 // --- Tier 2: external script ---
 
 func writeScript(t *testing.T, body string) string {

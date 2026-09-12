@@ -709,6 +709,83 @@ func TestOrgAndTeamListsArePaginated(t *testing.T) {
 	}
 }
 
+// A walk of few large entries is bounded by bytes, not by the page and entry
+// counts (#113). Each page here is well under maxAPIResponseSize and the total
+// entry count stays far under maxAPIEntries, so neither of those bounds fires; the
+// walk is stopped by maxAPIWalkBytes once the accumulated bodies pass 4 MB. Before
+// the byte bound existed a hostile GHES retained ~20 MB per list this way, per
+// concurrent login.
+func TestAWalkOfFewLargeEntriesIsBoundedByBytes(t *testing.T) {
+	// ~0.5 MB per page: 50 entries whose login is 10 KB each. Under the 1 MB page
+	// cap, so the page decodes; nine such pages cross the 4 MB walk cap while the
+	// entry count (≤ 450) stays an order of magnitude under maxAPIEntries.
+	bigLogin := strings.Repeat("x", 10000)
+	var entries []string
+	for i := 0; i < 50; i++ {
+		entries = append(entries, `{"login":"`+bigLogin+`"}`)
+	}
+	page := "[" + strings.Join(entries, ",") + "]"
+
+	var base string
+	var pages atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/user", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"login":"alice"}`))
+	})
+	mux.HandleFunc("/user/orgs", func(w http.ResponseWriter, _ *http.Request) {
+		// Always a next cursor: the walk must stop on its own, not because the
+		// server ran out of pages.
+		w.Header().Set("Link", `<`+base+`/user/orgs?page=next>; rel="next"`)
+		pages.Add(1)
+		_, _ = w.Write([]byte(page))
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	base = srv.URL
+
+	// getUserOrgs directly, not through GetIdentity: GetIdentity treats a membership
+	// fetch failure as empty membership (an org error is logged and swallowed), so
+	// the byte bound is observed at the walk, which is where it lives.
+	_, err := providerFor(t, srv.URL).getUserOrgs(context.Background(), "gho_abc")
+	if err == nil {
+		t.Fatal("a multi-megabyte walk of large entries was accepted")
+	}
+	if !strings.Contains(err.Error(), "bytes") {
+		t.Errorf("err = %v, want the walk refused for its accumulated size", err)
+	}
+	// It has to stop well before maxAPIPages (20): the byte bound, not the page
+	// count, is what caught it. Nine pages of ~0.5 MB cross 4 MB.
+	if got := pages.Load(); got > 12 {
+		t.Errorf("fetched %d pages before stopping; the byte bound did not fire, the page count did", got)
+	}
+}
+
+// A single claim value larger than any real org or team name is dropped before it
+// enters the identity's claims (#113), so a hostile GHES cannot pad one login,
+// team or org into the claims, the audit record and the reply. A value that large
+// could never match a configured require_org or require_team, so dropping it
+// cannot deny a login that would otherwise be granted.
+func TestAnOversizedClaimValueIsDropped(t *testing.T) {
+	bigLogin := strings.Repeat("y", maxClaimValueBytes+1)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/user/orgs", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`[{"login":"acme"},{"login":"` + bigLogin + `"},{"login":"beta"}]`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	orgs, err := providerFor(t, srv.URL).getUserOrgs(context.Background(), "gho_abc")
+	if err != nil {
+		t.Fatalf("getUserOrgs: %v", err)
+	}
+	want := []string{"acme", "beta"}
+	if len(orgs) != len(want) || orgs[0] != "acme" || orgs[1] != "beta" {
+		t.Errorf("orgs = %v, want %v; the oversized login was not dropped", orgs, want)
+	}
+}
+
 // A cursor is a server-controlled URL and the next request carries the user's
 // access token, so one pointing elsewhere must not be followed. CheckRedirect
 // does not cover this: a Link header is not a redirect.
@@ -877,7 +954,7 @@ func TestDecodeJSONBodyStopsReadingAtTheLimit(t *testing.T) {
 	body := &countingReader{r: io.MultiReader(strings.NewReader(`{"login":"`), endlessReader{})}
 	var dest gitHubUser
 
-	err := decodeJSONBody(body, limit, &dest)
+	_, err := decodeJSONBody(body, limit, &dest)
 	if err == nil {
 		t.Fatal("an endless body was accepted")
 	}
@@ -896,11 +973,17 @@ func TestDecodeJSONBodyAcceptsABodyAtTheLimit(t *testing.T) {
 	var dest gitHubUser
 
 	body := `{"login":"alice","name":"` + strings.Repeat("n", 100) + `"}`
-	if err := decodeJSONBody(strings.NewReader(body), int64(len(body)), &dest); err != nil {
+	n, err := decodeJSONBody(strings.NewReader(body), int64(len(body)), &dest)
+	if err != nil {
 		t.Fatalf("decodeJSONBody: %v", err)
 	}
 	if dest.Login != "alice" {
 		t.Errorf("Login = %q, want alice", dest.Login)
+	}
+	// The reported byte count is what a paginated walk sums to bound itself (#113);
+	// it must be the whole body, not a running remainder.
+	if n != int64(len(body)) {
+		t.Errorf("reported %d bytes read, want %d", n, len(body))
 	}
 }
 
