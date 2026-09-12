@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-12
+
 A tenth review round, on the clock lens — which clock each deadline is measured on
 and what happens when it moves — came back empty: every time comparison in a
 decision path carries Go's monotonic reading and none is stripped before it is used,

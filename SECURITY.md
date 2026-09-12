@@ -74,7 +74,7 @@ problem.
 
 ## What is verified, and what is not
 
-This is pre-1.0 software with no third-party audit. Concretely, as of v0.4.0:
+This is pre-1.0 software with no third-party audit. Concretely, as of v0.4.1:
 
 - The broker half of the protocol is covered end to end by
   `internal/ipc/e2e_test.go`, against a fake GitHub, including the assertion
