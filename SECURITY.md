@@ -8,7 +8,7 @@ nothing is backported: a fix lands on `main` and ships in the next release, so
 
 | Version | Supported | Notes |
 |---|---|---|
-| 0.3.x | yes | the current release |
+| 0.4.x | yes | the current release |
 | anything earlier | **no** | No fix is backported. v0.1.x additionally contains an authentication bypass — do not deploy it, see below. |
 
 The row above is rewritten by `scripts/release.sh`, because a hand-maintained
@@ -74,7 +74,7 @@ problem.
 
 ## What is verified, and what is not
 
-This is pre-1.0 software with no third-party audit. Concretely, as of v0.3.0:
+This is pre-1.0 software with no third-party audit. Concretely, as of v0.4.0:
 
 - The broker half of the protocol is covered end to end by
   `internal/ipc/e2e_test.go`, against a fake GitHub, including the assertion

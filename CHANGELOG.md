@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-12
+
 A third adversarial review round, on a tree that had already survived two. It found
 27 things, which is the argument for keeping the rounds going rather than declaring
 the code reviewed: three of them were fail-**open** reads of the field that decides a
