@@ -162,8 +162,9 @@ const (
 	// maxAPIResponseSize bounds one REST API page. The largest real body is a
 	// per_page=100 page of /user/teams, where every entry carries a full team
 	// object and its parent organization: a few hundred KB. 1 MB leaves room for a
-	// GHES that is more verbose than github.com, and keeps the worst case of a
-	// paginated walk at maxAPIPages × 1 MB of transient decode buffer.
+	// GHES that is more verbose than github.com. This bounds one page only; what a
+	// whole walk accumulates is bounded by maxAPIWalkBytes, because the decoded
+	// entries are retained into id.Claims and are not a transient buffer (#113).
 	maxAPIResponseSize = 1024 * 1024
 )
 
@@ -283,7 +284,7 @@ func (p *Provider) StartDeviceFlow(ctx context.Context) (*provider.DeviceFlow, e
 	}
 
 	var dar deviceAuthResponse
-	if err := decodeJSONBody(resp.Body, maxAuthResponseSize, &dar); err != nil {
+	if _, err := decodeJSONBody(resp.Body, maxAuthResponseSize, &dar); err != nil {
 		return nil, fmt.Errorf("github device flow: decode response: %w", err)
 	}
 
@@ -354,7 +355,7 @@ func (p *Provider) PollDeviceAuthorization(ctx context.Context, deviceCode strin
 	defer func() { _ = resp.Body.Close() }()
 
 	var tr tokenResponse
-	if err := decodeJSONBody(resp.Body, maxAuthResponseSize, &tr); err != nil {
+	if _, err := decodeJSONBody(resp.Body, maxAuthResponseSize, &tr); err != nil {
 		return nil, fmt.Errorf("github poll: decode response: %w", err)
 	}
 
@@ -549,6 +550,11 @@ func (p *Provider) getUserOrgs(ctx context.Context, accessToken string) ([]strin
 	}
 	result := make([]string, 0, len(orgs))
 	for _, o := range orgs {
+		if len(o.Login) > maxClaimValueBytes {
+			log.Warn().Str("provider", p.name).Int("bytes", len(o.Login)).
+				Msg("dropping an oversized org login from the identity's claims; no real org name is this long")
+			continue
+		}
 		result = append(result, o.Login)
 	}
 	return result, nil
@@ -561,7 +567,13 @@ func (p *Provider) getUserTeams(ctx context.Context, accessToken string) ([]stri
 	}
 	result := make([]string, 0, len(teams))
 	for _, t := range teams {
-		result = append(result, t.Organization.Login+"/"+t.Slug)
+		v := t.Organization.Login + "/" + t.Slug
+		if len(v) > maxClaimValueBytes {
+			log.Warn().Str("provider", p.name).Int("bytes", len(v)).
+				Msg("dropping an oversized team name from the identity's claims; no real org/team is this long")
+			continue
+		}
+		result = append(result, v)
 	}
 	return result, nil
 }
@@ -579,12 +591,32 @@ const (
 	// or hostile API can hold a login open in.
 	maxAPIPages = 20
 
-	// maxAPIEntries bounds what a walk accumulates. maxAPIPages alone does not:
-	// nothing obliges a server to honour per_page, so twenty pages of minimal
-	// objects — `{"login":"a"}` is fourteen bytes — fit hundreds of thousands of
-	// entries inside maxAPIResponseSize each, and those are retained rather than
-	// transient. 2,000 is the count maxAPIPages was always meant to imply.
+	// maxAPIEntries bounds the entry COUNT a walk accumulates. maxAPIPages alone
+	// does not: nothing obliges a server to honour per_page, so twenty pages of
+	// minimal objects — `{"login":"a"}` is fourteen bytes — fit hundreds of
+	// thousands of entries inside maxAPIResponseSize each. 2,000 is the count
+	// maxAPIPages was always meant to imply. It is a count and not a size, though,
+	// so it says nothing about a walk of few large entries — see maxAPIWalkBytes,
+	// which is the bound on the bytes, and #113 for why a count was not enough.
 	maxAPIEntries = maxAPIPages * apiPageSize
+
+	// maxAPIWalkBytes bounds the total decoded body a single walk accumulates,
+	// across all its pages. maxAPIResponseSize caps one page; the product with
+	// maxAPIPages (20 MB) was the worst case a walk could retain, per list, and the
+	// retained bytes flow into id.Claims rather than being a transient decode
+	// buffer. 4 MB is far above any real user's org and team membership and an order
+	// of magnitude under that worst case, so a hostile GHES cannot make one login
+	// hold 20 MB, still less 20 MB times max_concurrent_auths.
+	maxAPIWalkBytes = 4 * 1024 * 1024
+
+	// maxClaimValueBytes bounds a single claim value — one org login, or one
+	// "org/team" pair — before it enters id.Claims (#113). A real GitHub org login
+	// is at most 39 characters and a team slug little more; a value orders of
+	// magnitude larger is not a name any require_org or require_team could match, so
+	// dropping it cannot deny a login that would otherwise have been granted, and
+	// keeping it would only carry a hostile server's padding into the claims, the
+	// audit record and the reply. Generous next to a real name, tight next to abuse.
+	maxClaimValueBytes = 256
 )
 
 // apiGetAll fetches every page of a paginated GitHub list endpoint, following the
@@ -596,15 +628,26 @@ func apiGetAll[T any](ctx context.Context, p *Provider, accessToken, path string
 	next := fmt.Sprintf("%s%s?per_page=%d", p.endpoints.APIBase, path, apiPageSize)
 
 	var all []T
+	var totalBytes int64
 	for page := 1; next != ""; page++ {
 		if page > maxAPIPages {
 			return nil, fmt.Errorf("GET %s: more than %d pages", path, maxAPIPages)
 		}
 
 		var batch []T
-		link, err := p.apiGetURL(ctx, accessToken, next, &batch)
+		link, n, err := p.apiGetURL(ctx, accessToken, next, &batch)
 		if err != nil {
 			return nil, err
+		}
+		// Charge bytes, not just entries (#113). maxAPIPages and maxAPIEntries bound
+		// a walk of many small objects; neither bounds a walk of few large ones —
+		// twenty pages of one 1 MB object each is twenty entries, 1% of maxAPIEntries,
+		// and the megabytes are retained (they flow into id.Claims), not transient.
+		// This is the dimension the two counts missed, and it is measured on the
+		// decoded body because that is what the accumulation costs.
+		totalBytes += n
+		if totalBytes > maxAPIWalkBytes {
+			return nil, fmt.Errorf("GET %s: response walk exceeded %d bytes", path, maxAPIWalkBytes)
 		}
 		all = append(all, batch...)
 		if len(all) > maxAPIEntries {
@@ -687,16 +730,16 @@ func parseNextLink(header string) string {
 }
 
 func (p *Provider) apiGet(ctx context.Context, accessToken, path string, dest interface{}) error {
-	_, err := p.apiGetURL(ctx, accessToken, p.endpoints.APIBase+path, dest)
+	_, _, err := p.apiGetURL(ctx, accessToken, p.endpoints.APIBase+path, dest)
 	return err
 }
 
 // apiGetURL performs one authenticated GET against an absolute URL and returns
 // the response's Link header.
-func (p *Provider) apiGetURL(ctx context.Context, accessToken, rawURL string, dest interface{}) (string, error) {
+func (p *Provider) apiGetURL(ctx context.Context, accessToken, rawURL string, dest interface{}) (string, int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return "", fmt.Errorf("build request %s: %w", rawURL, err)
+		return "", 0, fmt.Errorf("build request %s: %w", rawURL, err)
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/vnd.github+json")
@@ -704,19 +747,20 @@ func (p *Provider) apiGetURL(ctx context.Context, accessToken, rawURL string, de
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("GET %s: %w", rawURL, err)
+		return "", 0, fmt.Errorf("GET %s: %w", rawURL, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("GET %s: unexpected status %d", rawURL, resp.StatusCode)
+		return "", 0, fmt.Errorf("GET %s: unexpected status %d", rawURL, resp.StatusCode)
 	}
 
-	if err := decodeJSONBody(resp.Body, maxAPIResponseSize, dest); err != nil {
-		return "", fmt.Errorf("decode %s: %w", rawURL, err)
+	n, err := decodeJSONBody(resp.Body, maxAPIResponseSize, dest)
+	if err != nil {
+		return "", n, fmt.Errorf("decode %s: %w", rawURL, err)
 	}
 
-	return resp.Header.Get("Link"), nil
+	return resp.Header.Get("Link"), n, nil
 }
 
 // decodeJSONBody decodes a JSON response body into dest, refusing a body longer
@@ -727,13 +771,16 @@ func (p *Provider) apiGetURL(ctx context.Context, accessToken, rawURL string, de
 // one over it is reported as too large rather than as the "unexpected end of
 // JSON input" a bare truncation would produce — an operator reading that in a
 // log would go looking for the wrong fault.
-func decodeJSONBody(body io.Reader, limit int64, dest interface{}) error {
+// It returns the number of body bytes consumed, so a paginated walk can bound the
+// size it accumulates rather than only the number of pages and entries (#113).
+func decodeJSONBody(body io.Reader, limit int64, dest interface{}) (int64, error) {
 	limited := &io.LimitedReader{R: body, N: limit + 1}
 	err := json.NewDecoder(limited).Decode(dest)
+	read := (limit + 1) - limited.N
 	if limited.N <= 0 {
-		return fmt.Errorf("response exceeds the %d byte limit", limit)
+		return read, fmt.Errorf("response exceeds the %d byte limit", limit)
 	}
-	return err
+	return read, err
 }
 
 // tokenFingerprint returns a label that identifies an access token in logs and

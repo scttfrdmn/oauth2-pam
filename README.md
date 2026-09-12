@@ -44,7 +44,7 @@ Every request and reply carries a `protocol_version`, so the next change has som
 
 ## Requirements
 
-- Go 1.25+ for the broker and the CLIs (1.24 is end-of-life and no longer receives security backports)
+- Go 1.27+ for the broker and the CLIs (1.25 is two majors behind and has aged out of go.dev's supported window, which the govulncheck job treats as a finding)
 - A C compiler for the PAM module — it is plain C and needs no Go at all
 - Linux with PAM (`libpam0g-dev`)
 - `libjson-c-dev`
@@ -519,7 +519,7 @@ Those two are the check on the checks, and CI runs both on every push to `main` 
 every pull request — the harness mutation check as its own job, the C bridge one as a
 step in the Linux job, next to the suite it mutates. A green suite proves the code
 does what the tests say; it does not prove the tests would notice if it stopped — so
-each of 25 C bridge defects is reintroduced in turn in a copy of the tree, along with
+each of 27 C bridge defects is reintroduced in turn in a copy of the tree, along with
 the v0.1.x authentication bypass and an account stage that fails open, and the suite
 is required to fail each time. A mutation that survives means that regression test is
 decoration.

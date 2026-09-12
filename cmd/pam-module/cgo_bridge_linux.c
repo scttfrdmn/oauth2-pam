@@ -657,10 +657,29 @@ static int parse_broker_response(const char *json_text, struct broker_response *
 
     /* Absent means 1: a v0.2.x broker predates the field. Recorded rather than
        acted on here, so the one place that decides what to do with it is the
-       caller — see check_protocol_version. */
+       caller — see check_protocol_version.
+     *
+     * Present but not an integer is a malformed reply, and rejected here exactly
+     * as a non-boolean "success" is (#112). It used to be silently ignored, which
+     * left r->protocol_version at 0 — "absent, i.e. v1" — so a broker sending
+     * {"protocol_version": 2.0} (json-c parses any number with a '.' or 'e', or an
+     * over-large integer, as json_type_double) had its reply read under the v1
+     * contract and granted, while the same reply written "2" was correctly
+     * refused. The danger this check exists for is precisely a version whose reply
+     * parses fine and whose "authorized" means something new; a type it cannot
+     * even read the version out of is a stronger case for refusing, not a weaker
+     * one. Go's encoding/json cannot emit that shape, so this guards against the
+     * sister implementation and future versions, which is the reason the check
+     * exists at all. */
     json_object *pv_obj = NULL;
-    if (json_object_object_get_ex(root, "protocol_version", &pv_obj) &&
-        pv_obj != NULL && json_object_get_type(pv_obj) == json_type_int) {
+    if (json_object_object_get_ex(root, "protocol_version", &pv_obj)) {
+        if (pv_obj == NULL || json_object_get_type(pv_obj) != json_type_int) {
+            log_pam_message(LOG_ERR,
+                            "Broker sent a non-integer \"protocol_version\"; rejecting the reply");
+            free(r);
+            json_object_put(root);
+            return -1;
+        }
         r->protocol_version = json_object_get_int(pv_obj);
     }
 
@@ -899,6 +918,18 @@ static int is_rate_limited(const struct broker_response *r) {
     return strcmp(r->error_code, ERROR_CODE_RATE_LIMITED) == 0;
 }
 
+/* poll_reply_is_throttle reports whether a poll reply is the broker asking for a
+   slower poll rather than answering. It is a throttle only as status "error" with
+   RATE_LIMITED. A terminal status carrying that code — status "denied" with
+   RATE_LIMITED, which a broken or hostile broker can send — is the terminal answer
+   and must be taken as one, not polled to the deadline (#114). status is
+   authoritative here; error_code only refines an "error". The poll loop reads this
+   rather than is_rate_limited directly so that the ordering is one predicate a test
+   can pin, not an ordering buried in the loop. */
+static int poll_reply_is_throttle(const struct broker_response *r) {
+    return strcmp(r->status, STATUS_ERROR) == 0 && is_rate_limited(r);
+}
+
 /* terminal_status_to_pam maps a terminal broker status to a PAM result.
    A decision about the user is PAM_AUTH_ERR; an operational failure is
    PAM_AUTHINFO_UNAVAIL so that a later module in the stack may still run. */
@@ -1131,25 +1162,8 @@ static int poll_for_authorization(pam_handle_t *pamh, const struct module_option
                                 consecutive_failures);
                 return PAM_AUTHINFO_UNAVAIL;
             }
-        } else if (is_rate_limited(r)) {
-            /* Not a failure and not an answer: the broker is asking for a slower
-               poll. Back off geometrically instead of hammering the same closed
-               window, and do not spend the transport-failure budget on it — three
-               tries at the normal interval would be over in fifteen seconds, well
-               inside the limiter's one-minute window, and the login would die for
-               a condition that clears on its own. The deadline below is what
-               bounds this; a throttled poll costs the broker nothing. */
-            backoff *= 2;
-            if (backoff > MAX_POLL_INTERVAL) backoff = MAX_POLL_INTERVAL;
-            wait = backoff;
-            log_pam_message(LOG_WARNING,
-                            "Broker rate-limited a session poll for %s; retrying in %ds",
-                            username, wait);
-            free(r);
-            r = NULL;
         } else {
             consecutive_failures = 0;
-            backoff = poll_interval;
 
             if (strcmp(r->status, STATUS_AUTHORIZED) == 0) {
                 int ok = authorized_for(r, username);
@@ -1162,12 +1176,39 @@ static int poll_for_authorization(pam_handle_t *pamh, const struct module_option
                 log_pam_message(LOG_INFO, "Authentication successful for user: %s", username);
                 return PAM_SUCCESS;
             }
-            if (strcmp(r->status, STATUS_PENDING) != 0) {
+
+            /* A throttle is status "error" with RATE_LIMITED, and only that: the
+               broker asking for a slower poll, not answering. status is consulted
+               first, and error_code only refines an "error" — reading error_code
+               without the status test meant a reply of status "denied" (or any
+               terminal status) carrying RATE_LIMITED, which a broken or hostile
+               broker can send, was taken as a throttle and polled to the deadline
+               instead of as the terminal answer it is (#114). It fails closed —
+               the login is refused either way — but it turns an immediate denial
+               into a 90-second one and pins an sshd pre-auth child for it.
+
+               Back off geometrically rather than hammering the closed window, and
+               do not spend the transport-failure budget on it: the deadline below
+               is what bounds a throttle, which costs the broker nothing. */
+            if (poll_reply_is_throttle(r)) {
+                backoff *= 2;
+                if (backoff > MAX_POLL_INTERVAL) backoff = MAX_POLL_INTERVAL;
+                wait = backoff;
+                log_pam_message(LOG_WARNING,
+                                "Broker rate-limited a session poll for %s; retrying in %ds",
+                                username, wait);
+                free(r);
+                r = NULL;
+            } else if (strcmp(r->status, STATUS_PENDING) != 0) {
                 int rc = terminal_status_to_pam(r, username);
                 free(r);
                 return rc;
+            } else {
+                /* Pending: the broker answered, so a previous throttle's backoff
+                   is spent — reset it. */
+                backoff = poll_interval;
+                free(r);
             }
-            free(r);
         }
 
         if (monotonic_seconds() + wait > deadline) {

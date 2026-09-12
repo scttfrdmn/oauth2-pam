@@ -531,6 +531,11 @@ treat the reply as a failure, which for all of these is the right answer:
 | `AUTH_LIMIT_REACHED` | broker | the host already has as many device flows in progress as the broker allows. `status: "error"` for the same reason |
 | `AUTHENTICATION_FAILED`, `SESSION_CHECK_FAILED`, `SESSION_REFRESH_FAILED`, `SESSION_REVOCATION_FAILED` | broker | the verb's handler returned an internal error; details are in the broker's log, deliberately not on the wire |
 | `RESPONSE_TOO_LARGE` | broker | the reply for this request did not fit the reply cap and was replaced by this one. Terminal |
+| `SOURCE_AUTH_LIMIT_REACHED` | broker | this source (a (user, address) pair) already has as many device flows in progress as the broker allows for one client. `status: "error"` — capacity, like `AUTH_LIMIT_REACHED`, but scoped to the caller rather than the host |
+| `POLICY_DENIED` | broker | an authorization policy refused this identity — a group, address, time or risk rule the operator configured. `status: "denied"`, terminal |
+| `DEVICE_NOT_TRUSTED` | broker | a policy required a hardware-backed authentication method and the identity's token did not carry one (RFC 8176 `amr` has neither `hwk` nor `fido`). `status: "denied"`, terminal |
+| `NO_LOCAL_ACCOUNT` | broker | the requested local account does not exist on the host. `status: "denied"`, terminal |
+| `FORBIDDEN` | broker | a session verb was used on a session belonging to another caller. `status: "error"` — a decision about the caller, not the identity |
 
 `RESPONSE_TOO_LARGE` is registered here because `oidc-pam` sends it (`oidc-pam#162`:
 an 8 KiB client buffer against a reply whose QR art was serialized twice refused
@@ -548,6 +553,48 @@ today; relying on receiving it is not. This broker does substitute it, as of the
 fix for [#56](https://github.com/scttfrdmn/oauth2-pam/issues/56) — every reply is
 serialized and measured before it is written — which is a property of this
 implementation and not yet a promise of version 1.
+
+The last seven codes above are registered because `oidc-pam` produces them, and by
+rule 3 a code a second implementation reads is contract rather than dialect. Each
+is additive and permitted by the compatibility table — a new `error_code` whose
+retryability is discoverable — so nothing already deployed breaks, and `oidc-pam`
+adopts whatever spelling is settled here rather than the other way around
+([#103](https://github.com/scttfrdmn/oauth2-pam/issues/103),
+[#117](https://github.com/scttfrdmn/oauth2-pam/issues/117)). Four points the
+registration turns on:
+
+- **`POLICY_DENIED` matters because the three denial reasons in the Status table
+  are all things the *user* can see and act on** — they denied it at the provider,
+  the identity mapped to another account, or the mapping was refused — and a policy
+  denial is not. The user did everything right and an administrator's configuration
+  refused them; a client that can tell the two apart can say so instead of implying
+  the user made a mistake. It is not `AUTHENTICATION_FAILED`, which the table
+  reserves for an internal handler error whose detail is deliberately off the wire.
+
+- **`NO_LOCAL_ACCOUNT` tells an unauthenticated caller that a username is not a
+  local account, which is enumerable.** `oidc-pam` is willing to say so because the
+  same answer is already available to anyone who can reach `sshd` on the host — but
+  that reasoning is written down here rather than left for the next implementation
+  to assume, because a broker on a host where it is *not* already enumerable should
+  send a generic denial instead.
+
+- **The per-source capacity case earns its own code rather than reusing
+  `AUTH_LIMIT_REACHED`.** `AUTH_LIMIT_REACHED` is documented as a fact about the
+  host's load; a cap that is per (user, address) is a fact about one client's
+  behaviour, and the spec already spends separate codes to tell a host-wide
+  condition from a caller-specific one (`AUTH_LIMIT_REACHED` vs
+  `SESSION_LIMIT_REACHED`). So the host-wide pending-flow cap stays
+  `AUTH_LIMIT_REACHED` and the per-source cap is `SOURCE_AUTH_LIMIT_REACHED`; both
+  are `status: "error"` capacity, neither is a denial. `oidc-pam` sends
+  `TOO_MANY_PENDING_AUTHS` for both today and collapses to these two under its
+  [#179](https://github.com/scttfrdmn/oidc-pam/issues/179) protocol adoption.
+
+- **`FORBIDDEN` is a decision about the caller, not the identity** — a session verb
+  aimed at another caller's session — so it is `status: "error"`, not `denied`,
+  which is reserved for judgements about the authenticating user. This broker does
+  not currently emit it (its session verbs are reached only for the caller's own
+  sessions); it is registered so that the spelling exists for the implementation
+  that does.
 
 ## What this contract deliberately does not do
 

@@ -86,7 +86,7 @@ This is pre-1.0 software with no third-party audit. Concretely, as of v0.3.0:
   `test/integration/mutations.sh` rebuilds the module twice — once with the v0.1.x
   bypass reintroduced, once with the account stage failing open — and requires the
   harness to refuse the login both times; `test/cbridge/mutations.sh` reintroduces
-  each of 25 C bridge defects in turn, one per run, and requires the C unit tests
+  each of 27 C bridge defects in turn, one per run, and requires the C unit tests
   to fail. Both run in CI on every push to `main` and every pull request — the
   harness one as its own job (`integration-mutations`), the C bridge one as a step
   in the `linux` job, alongside the suite it mutates — so "these tests would catch

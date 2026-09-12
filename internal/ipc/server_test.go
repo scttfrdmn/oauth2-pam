@@ -168,13 +168,31 @@ func TestEveryRequestStringIsBounded(t *testing.T) {
 	// tighter bound than a length.
 	whitelisted := map[string]bool{"type": true, "login_type": true}
 
+	// Non-string fields whose size is bounded by something other than a byte length
+	// in requestFields, named so that adding one is a deliberate act. ProtocolVersion
+	// is an int, bounded by its type; Metadata is a map, bounded by boundMetadata in
+	// server.go. Anything else non-string is not covered by the requestFields walk
+	// and must not pass silently — the loop below fails on it rather than skipping
+	// it, which is what a bare `kind != String { continue }` did until #116: a future
+	// []string or a second map field would have reached the log unbounded and this
+	// test would have stayed green.
+	boundedByType := map[string]bool{"protocol_version": true, "metadata": true}
+
 	rt := reflect.TypeOf(Request{})
 	for i := 0; i < rt.NumField(); i++ {
 		field := rt.Field(i)
+		name := jsonName(field)
+
 		if field.Type.Kind() != reflect.String {
+			if boundedByType[name] {
+				continue
+			}
+			t.Errorf("request field %q (%s, kind %s) is not a string and is not one of the "+
+				"non-string fields known to be bounded by their type or by boundMetadata; "+
+				"add a bound for it and record it here, do not let a new kind pass unchecked",
+				name, field.Name, field.Type.Kind())
 			continue
 		}
-		name := jsonName(field)
 		if _, ok := bounded[name]; ok {
 			continue
 		}

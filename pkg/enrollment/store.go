@@ -73,8 +73,21 @@ var unvalidated LocalUserValidator
 //
 // The file's mode and owner are checked before anything is parsed — see
 // checkPerms. A file this process cannot trust is an error rather than an empty
-// store: falling through to the later tiers would turn "somebody else can rewrite
-// tier 0" into a silent change of mapping policy.
+// store, and the mapper turns that error into a refused login rather than falling
+// through to the later tiers (#115, which is where that caller was fixed to stop
+// swallowing it).
+//
+// What the fall-through actually costs is worth stating precisely, because the
+// earlier phrasing here ("a silent change of mapping policy") claimed more than is
+// reachable. Tier 0 only ever grants, it is consulted first, and every tier's
+// answer must still equal the requested login name, so skipping a compromised
+// tier 0 cannot grant an account the later tiers would not have granted anyway —
+// there is no silent *widening*. What is lost is the signal: an attacker who has
+// planted a symlink or replaced the file has demonstrated write access to a
+// location the operator made authoritative, and a broker that kept authenticating
+// past that, saying only "not enrolled", would be hiding the one thing worth
+// alarming on. Failing closed here is about not proceeding on an untrusted
+// input, not about a mapping the fall-through could forge.
 func Load(path string) (*Store, error) {
 	// O_NOFOLLOW refuses a symlink in the same syscall as the open, rather than
 	// leaving a window in which one could appear between a check and the read (#96).
