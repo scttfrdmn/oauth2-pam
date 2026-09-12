@@ -50,6 +50,14 @@ cp cmd/pam-module/cgo_bridge.h "$WORK/cmd/pam-module/"
 cp test/cbridge/cbridge_test.c "$WORK/test/cbridge/"
 
 failures=0
+mutations=0
+
+# DOCUMENTED_MUTATIONS is the number README.md and SECURITY.md say this script
+# reintroduces. Both said six for three releases while the real number grew to 25
+# (#109), because nothing connected the prose to the script. The count is asserted at
+# the end of the run: adding a case fails here until the two documents are updated,
+# which is the only mechanism that keeps a number in prose honest.
+DOCUMENTED_MUTATIONS=25
 
 # run <name> <fail|pass> [perl-expression]
 #
@@ -59,6 +67,8 @@ failures=0
 # reported as a setup failure rather than a pass.
 run() {
     local name=$1 expect=$2 expr=${3:-}
+
+    [ "$expect" = "fail" ] && mutations=$((mutations + 1))
 
     cp "$BRIDGE" "$WORK/$BRIDGE"
 
@@ -301,8 +311,14 @@ run "oversized QR art is truncated rather than dropped" fail \
     '$n = s/(if \(len >= dst_size\) \{).*?return;/$1 len = dst_size - 1; memcpy(dst, val, len); dst[len] = 0; return;/s'
 
 echo
+if [ "$mutations" -ne "$DOCUMENTED_MUTATIONS" ]; then
+    echo "this script reintroduces $mutations defects; README.md and SECURITY.md say" \
+         "$DOCUMENTED_MUTATIONS. Update both, and DOCUMENTED_MUTATIONS above, so the" \
+         "documented count is the real one (#109)."
+    failures=$((failures + 1))
+fi
 if [ "$failures" -ne 0 ]; then
     echo "$failures case(s) failed — a regression test is not protecting what it claims to"
     exit 1
 fi
-echo "every mutation was caught"
+echo "every mutation was caught ($mutations of them)"

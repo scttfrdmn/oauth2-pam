@@ -83,9 +83,19 @@ else
     install -m 0600 -o root -g root configs/example.yaml "$CONFDIR/broker.yaml"
     echo "  wrote $CONFDIR/broker.yaml from the example — edit it before starting the broker"
 
-    # Fill in the encryption key now. Left unset, secure_token_storage does
-    # nothing and access tokens sit in the broker's memory in the clear; and a
-    # generated key beats whatever an administrator would type by ~200 bits.
+    # Fill in the encryption key now, but understand what it does and does not
+    # buy. Left unset, tokens are NOT in the clear: NewTokenManager falls back to
+    # security.NewEphemeralEncryption() and encrypts under a per-process key, and
+    # only secure_token_storage: false gives plaintext. Nothing is written to
+    # disk either, so a key that dies with the process loses nothing on restart —
+    # the tokens die with it.
+    #
+    # What this line buys is that the key is stated in the config rather than left
+    # to a fallback: it is visible, rotatable, and does not change meaning if that
+    # default ever does. And if a key is going to be there at all, a generated one
+    # beats whatever an administrator would type by ~200 bits.
+    #
+    # This comment claimed an unset key left tokens in the clear until #109.
     key=$("$PREFIX/bin/oauth2-pam-admin" gen-key) || die "gen-key failed"
     # The sed script arrives on stdin rather than in argv. /proc/<pid>/cmdline is
     # world-readable on Linux, so a key passed as an argument is recoverable by

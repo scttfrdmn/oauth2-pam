@@ -83,16 +83,22 @@ This is pre-1.0 software with no third-party audit. Concretely, as of v0.3.0:
   `sshd` over a real ssh connection — is covered by the container harness in
   `test/integration/`.
 - **Both suites are mutation-checked in CI, by scripts you can run yourself.**
-  `test/integration/mutations.sh` rebuilds the module with the v0.1.x bypass
-  reintroduced and requires the harness to refuse the login; `test/cbridge/mutations.sh`
-  reintroduces each of the six C bridge defects fixed in v0.2.0 and requires the
-  C unit tests to fail. Both run in CI on every push and pull request — the
+  `test/integration/mutations.sh` rebuilds the module twice — once with the v0.1.x
+  bypass reintroduced, once with the account stage failing open — and requires the
+  harness to refuse the login both times; `test/cbridge/mutations.sh` reintroduces
+  each of 25 C bridge defects in turn, one per run, and requires the C unit tests
+  to fail. Both run in CI on every push to `main` and every pull request — the
   harness one as its own job (`integration-mutations`), the C bridge one as a step
   in the `linux` job, alongside the suite it mutates — so "these tests would catch
   it" is a check rather than a claim.
 - **A login against real github.com has never been verified by the test suite.**
   Everything above fakes the provider.
-- Tokens are held encrypted in memory (AES-256-GCM) and never written to disk.
+- Tokens are held encrypted in memory (AES-GCM) and never written to disk. The
+  cipher is AES-256 for a generated key or a base64 32-byte one, and AES-128 or
+  AES-192 if a raw 16- or 24-byte `token_encryption_key` is configured — those
+  lengths are accepted for compatibility with 0.1.x configs, and this document said
+  256 unconditionally until
+  [#109](https://github.com/scttfrdmn/oauth2-pam/issues/109).
   With no `token_encryption_key` configured the broker generates one for the
   process, so the shipped default is encryption rather than plaintext; that key
   lives in the same heap as the ciphertext, so it defends against a core dump or
@@ -108,18 +114,31 @@ differences matter if you are relying on one of them:
 
 | Tool | When | A finding fails the run? |
 |---|---|---|
-| CodeQL (`security-extended`) | pushes to `main`, every PR, weekly | yes |
+| CodeQL (`security-extended,security-and-quality`, Go **and** C) | pushes to `main`, every PR, weekly | **no** — alerts go to the Security tab; the job passes |
 | govulncheck | pushes to `main`, every PR, weekly | yes |
 | gosec | pushes to `main`, every PR, weekly | **no** — `continue-on-error`; findings go to the Security tab for triage |
 | Dependency review | pull requests only | yes, at `moderate` |
 | OpenSSF Scorecard | pushes to `main`, weekly — not on PRs | no, it is a posture report |
 
+CodeQL analyzes the C as well as the Go: the job is a `go` + `c-cpp` matrix, and
+because a C database needs a real compile, the `c-cpp` leg installs the PAM and
+json-c headers and runs `make build-pam` under the extractor — the same command CI
+and `release.yml` use, so what is analyzed is what ships. On top of that,
+`cmd/pam-module/cgo_bridge_linux.c` is covered by `test/cbridge`, compiled
+`-Werror -Wall -Wextra -Wconversion` and mutation-checked as described above. This
+document said no scanner analyzed the C at all until
+[#109](https://github.com/scttfrdmn/oauth2-pam/issues/109).
+
 Three gaps worth stating plainly rather than leaving to be inferred:
 
-- **No scanner analyzes the C.** CodeQL runs with `languages: go`, so
-  `cmd/pam-module/cgo_bridge_linux.c` is in no database. What covers it is
-  `test/cbridge` — compiled `-Werror -Wall -Wextra -Wconversion`, and
-  mutation-checked as described above.
+- **Only two of those tools can fail a run, and CodeQL is not one of them.** The
+  `analyze` step has no `fail-on` and there is no CodeQL config setting a threshold,
+  so a new alert appears in the Security tab and the job is green. `govulncheck`
+  exits non-zero and `dependency-review` is set to `fail-on-severity: moderate`;
+  those two are the ones where "fails the run" is backed by something in the file.
+  This table claimed CodeQL failed the run until
+  [#109](https://github.com/scttfrdmn/oauth2-pam/issues/109), which is the wrong
+  direction for a document whose purpose is saying what is actually checked.
 - **A push to a topic branch runs nothing.** Both workflows are `push` on `main`
   plus `pull_request`; the scans reach a branch when it opens a pull request, not
   while it is being pushed to.

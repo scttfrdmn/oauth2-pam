@@ -47,6 +47,17 @@ a terminal is `oauth2-pam-enroll`, which does not import `pkg/auth` and so inher
 none of it. A test of a function cannot notice a caller that does not call it, and
 neither can a reviewer who starts from the function.
 
+An eighth round found six, and the two that matter share a shape the previous seven
+did not look for: a protection that exists on one path and not on the path beside it,
+where nothing in either place says the other exists. The prompt sanitizer had been
+hardened over three rounds to strip C1 as well as C0, because U+009B *is* CSI to a
+terminal decoding UTF-8; the reply filter twenty lines away kept its own narrower
+rule, and its test asserted that rule rather than the policy — restating the
+implementation's own predicate, so it could not have failed. The audit record had
+every field bounded on the way to the terminal and none of them bounded on the way to
+the audit file. The other three are documentation read against the code, which round
+six made a habit and this round made a test.
+
 **Upgrade notes.** `broker.yaml` must be mode 0600 regardless of where the client
 secret lives — the check used to apply only when the secret was inline, which left
 the file holding the token-encryption key unchecked in every deployment that did the
@@ -54,7 +65,7 @@ right thing with its secret. A deployment relying on the old behaviour will refu
 start until it is chmodded; the error names the file and the command. A negative
 `mapper.min_uid` is also now rejected rather than silently disabling the UID floor.
 
-Two more from the sixth round. The **directory holding `enrollments.json`** must not be
+Two more from the sixth round. The **directory holding `enrolled-users.yaml`** must not be
 writable by anyone but its owner unless it is sticky; `/etc/oauth2-pam` at 0750 root
 already satisfies this, but a deployment that put the file somewhere group-writable
 will now fail both `Load` and `Save` with an error naming the directory and
@@ -64,7 +75,131 @@ session or a deleted enrollment is not caught at login. Add it before relying on
 revocation; read the warning next to it first, because `account required
 oauth2_pam.so` on its own denies the publickey break-glass path.
 
+Three more from the eighth round, all startup errors rather than silent changes.
+`audit.outputs[].path` **must now be absolute** (under systemd the working directory
+is `/`, so a relative path named a file nobody meant), and the file and the directory
+holding it are checked the way the client secret and the enrollment file already were:
+the open refuses a symlink, the target must be a regular file, and neither it nor its
+directory may be writable by group or other. Group *read* stays allowed, so `0640`
+with an operators group is fine. And a malformed `security.token_encryption_key` is
+now rejected **even when `secure_token_storage: false`**, where it used to be exempt
+and then failed on the day storage was turned back on.
+
 ### Fixed
+
+- **The audit record was bounded on the way to the terminal and unbounded on the way
+  to the audit file.** Every provider-chosen string that reaches a pre-auth tty has a
+  byte cap and a filter; the same strings — provider login, email, mapped local user,
+  the group list, the error message a provider wrote — reached `LogAuthEventErr` at
+  whatever length they arrived, and from there a JSON line in `/var/log`, journald, and
+  `oauth2-pam-admin`'s console. An identity with a megabyte of groups is a megabyte per
+  login attempt, unauthenticated, from anything that can reach the socket, in the one
+  file the fail-closed rule says a login cannot proceed without: fill the filesystem
+  and the broker grants no logins at all. Records are now bounded on the way in —
+  1 KiB per string, 256 bytes per group name, 128 groups, 32 metadata keys, 64 KiB for
+  the record — with truncation marked in an `audit_truncated` field rather than done
+  silently, because a trail that quietly shortens a group name is a trail that lies
+  about who was in what. Truncation is at a rune boundary, so the record stays valid
+  UTF-8. A record that still cannot be bounded is replaced by a minimal one naming the
+  event, the decision and the account: the fail-closed rule means the alternative to a
+  degraded record is a refused login.
+  ([#104](https://github.com/scttfrdmn/oauth2-pam/issues/104))
+
+- **The reply filter kept its own narrower control-character rule, and its test could
+  not have caught it.** `boundedReplyField` stripped C0 and DEL; the prompt sanitizer
+  three rounds of hardening older also strips C1 (U+0080–U+009F), U+2028 and U+2029,
+  because `encoding/json` does not escape U+009B and U+009B *is* CSI to a terminal
+  decoding UTF-8. So a provider-chosen group name or email carrying a bare C1 was
+  filtered for the prompt and forwarded intact to the audit file, journald, and the
+  admin console. The test that was meant to hold that line asserted
+  `r < 0x20 || r == 0x7f` — the filter's own former condition, restated — over input
+  containing no C1 at all, which is a test structurally incapable of noticing what the
+  filter passed. `boundedReplyField` now calls the shared `isDisallowedInPrompt`, so
+  there is one policy in one place, and the test calls the shared
+  `assertNoDisallowedRunes`, which additionally requires the result to be valid UTF-8
+  and so closes the raw-`0x9b` case where a lone byte ranges as U+FFFD. A second test
+  walks an authorized reply by reflection and asserts on every string in it, so a field
+  added later is covered without anyone remembering to add it here.
+  ([#105](https://github.com/scttfrdmn/oauth2-pam/issues/105))
+
+- **The audit file was opened with no check on what it was or who could write it.** The
+  client secret's file, the mapper script and the enrollment file each refuse a
+  symlink, require a regular file, and require that neither the file nor its directory
+  be writable by anyone but the owner. The audit sink — the one file the fail-closed
+  rule refuses logins to protect — had none of it, and `path` was not even required to
+  be absolute. The symlink case is the one that matters: point the path at `/dev/null`
+  and every write succeeds, so "the record was written" is satisfied by a sink that
+  keeps nothing, every login is granted, and the trail is empty. That is the single
+  audit failure nothing downstream can detect, because every mechanism built to detect
+  one is watching for an error. `openAuditFile` now checks the directory *before* the
+  `O_CREAT` open (this is the tree's only creating open, so checking afterwards means
+  creating a file in a directory the process has just decided it does not trust), opens
+  with `O_NOFOLLOW`, and requires a regular file whose mode and owner it verifies from
+  the descriptor. The mask is write-only, 0o022, not the secret file's 0o077: a
+  group-readable trail at 0640 is a deliberate arrangement, and refusing it would
+  refuse every login on the host, which is a worse answer to a disclosure than the
+  disclosure. `O_NONBLOCK` is part of the fix rather than an incidental flag — an
+  `O_WRONLY` open of a FIFO with no reader blocks forever, so without it the
+  regular-file check is unreachable on exactly the path it exists to refuse, and the
+  test for it hangs the suite instead of failing.
+  ([#106](https://github.com/scttfrdmn/oauth2-pam/issues/106))
+
+- **The README named the wrong config key for tier 0, so following it produced a
+  broker that ignored every enrolled user.** Enrollment is switched on by
+  `mapper.enrollment_enabled`; the README gave `mapper.enrollment_file`, which only
+  says where the file is. An operator following it got "at least one tier must be
+  configured", added a rule to get past that, and ended with a broker where tier 0 was
+  never consulted while `oauth2-pam-enroll` reported success. The structural reason it
+  lasted is that `configs/example.yaml` is loaded and validated by a test and the prose
+  is not, so a new test takes the documentation's word for it: every dotted key in
+  backticks under a real config section, across `README.md`, `SECURITY.md` and
+  `docs/*.md`, must resolve to a real `mapstructure` tag, with a control test that
+  fails if the scan stops finding keys. It cannot check that a key means what the prose
+  says. It checks the thing that keeps being wrong: whether the key exists.
+  ([#107](https://github.com/scttfrdmn/oauth2-pam/issues/107))
+
+- **`configs/example.yaml` named the wrong error code for a full auth queue.**
+  `max_concurrent_auths` refuses with `AUTH_LIMIT_REACHED`, not `RATE_LIMITED`, and the
+  two are deliberately different answers: `RATE_LIMITED` comes from
+  `max_requests_per_minute` and means "retry", while `AUTH_LIMIT_REACHED` means the
+  capacity is held by other logins, is terminal for the attempt, and maps to a
+  different PAM result. A client keying on the documented name retries a refusal that
+  will not clear. No test catches this one and the comment says so — the wrong name is
+  itself a real constant, so nothing mechanical can tell which of the two the sentence
+  meant.
+  ([#108](https://github.com/scttfrdmn/oauth2-pam/issues/108))
+
+- **A cluster of documentation claims that were false against the code, several of them
+  in `SECURITY.md`, whose entire purpose is saying what is and is not verified.** Two
+  understated the project, which in that document is its own defect: it said no scanner
+  analyzed the C (the CodeQL job is a `go` + `c-cpp` matrix that compiles the bridge
+  under the extractor), and the README said nothing checked the directory around the
+  client-secret file (`checkPerms` ends by checking exactly that). Three overstated it:
+  a CodeQL finding does not fail the run and never did — there is no `fail-on` and no
+  threshold, so alerts land in the Security tab and the job stays green, which leaves
+  `govulncheck` and `dependency-review` as the only two tools whose "fails the run" is
+  backed by something in the file; the enrollment file's rule is write-only 0o022, not
+  the secret file's "0600 or tighter", so a 0644 enrollment file loads; and CI runs on
+  pushes to `main` plus pull requests, not "every push". Tokens are AES-GCM, but
+  AES-128 or AES-192 if a raw 16- or 24-byte key is configured, where both documents
+  said 256 unconditionally. The C bridge mutation count was six; it is 25 — so
+  `test/cbridge/mutations.sh` now counts its own `expect fail` cases and fails if the
+  total is not the documented one, which is the only one of these that can drift again
+  silently. Also corrected: the audit `events` list does not apply to the four
+  access-decision events (documented as "everything else is dropped", which is safer
+  than stated and the opposite of what an operator editing it expects), `local_user`
+  accepts the `{login}` spelling as well as `{{ .Login }}`, the secret file may be
+  owned by root *or* the broker's uid, the PAM module directory is asked of `dpkg`
+  where there is one and guessed from a fixed list elsewhere, and
+  `scripts/install-release.sh` claimed an unset encryption key left tokens in the clear
+  when the broker falls back to a per-process key. Two dead-code observations from the
+  same round are closed with it: `Encryption.Destroy` had no caller outside its own
+  test despite documenting "call it at shutdown", so `TokenManager.Stop` now calls it;
+  and `enrollment.Unvalidated`, exported so that callers choosing to skip validation
+  could be grepped for, has stayed at zero outside this package's tests and is now
+  unexported, since an exported sentinel with no callers is an invitation to a first
+  one.
+  ([#109](https://github.com/scttfrdmn/oauth2-pam/issues/109))
 
 - **`oauth2-pam-enroll` drew the provider's `verification_uri` and `user_code` on a
   root terminal without filtering them.** The broker sanitizes those two strings
@@ -127,7 +262,7 @@ oauth2_pam.so` on its own denies the publickey break-glass path.
 
 - **The enrollment file's permission check could be rolled back by anyone who could
   write its directory.** `checkPerms` asserts mode 0600 and root ownership on
-  `enrollments.json`, neither of which can be forged — but the *name* can be reused.
+  `enrolled-users.yaml`, neither of which can be forged — but the *name* can be reused.
   Given write access to the parent directory, an attacker renames the current file
   away and puts back an earlier root-owned 0600 copy, restoring a deleted enrollment
   or a superseded GitHub-login-to-local-user binding, and every check passes because
