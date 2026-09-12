@@ -47,6 +47,23 @@ a terminal is `oauth2-pam-enroll`, which does not import `pkg/auth` and so inher
 none of it. A test of a function cannot notice a caller that does not call it, and
 neither can a reviewer who starts from the function.
 
+A ninth round found five, and the one that matters is the eighth round's lesson one
+step on. Round eight brought the audit record's *lengths* under a bound; its content
+was still unfiltered, so a provider-chosen string carrying U+009B CSI reached the
+audit file — which `cat`, `tail` and `grep` decode verbatim — as a live escape,
+because `encoding/json` leaves DEL and the whole C1 range raw. The fix that unified
+the prompt and reply filters named the audit file as affected and landed only on the
+reply. The rune policy now lives in one place both packages call, and the record
+escapes what the prompt removes. The other four: a C `protocol_version` read that
+accepted a float as version 1 and granted under it (the protection was on the
+`success` field beside it, whose comment claimed the two were treated alike — they
+were not); a paginated walk bounded by entry and page counts but never by bytes, so
+few large entries slipped both; a poll loop that read `RATE_LIMITED` without first
+reading `status`, turning a denial into a 90-second one; and a tier-0 trust error
+that its own store documented as un-swallowable, swallowed by its only caller. Plus
+the eighth round's second lens turned on the suite itself — five assertions that
+restated what they checked and so could not fail.
+
 An eighth round found six, and the two that matter share a shape the previous seven
 did not look for: a protection that exists on one path and not on the path beside it,
 where nothing in either place says the other exists. The prompt sanitizer had been
@@ -86,6 +103,103 @@ now rejected **even when `secure_token_storage: false`**, where it used to be ex
 and then failed on the day storage was turned back on.
 
 ### Fixed
+
+- **The audit record was bounded in length and unfiltered in content.** #104
+  bounded how large a record could be; nothing bounded what runes it held. A
+  provider-chosen email, group name, or error message carrying U+009B CSI reached
+  the audit file, journald and `oauth2-pam-admin`'s console as a live terminal
+  escape, because `boundEvent` truncated and never filtered a rune and
+  `encoding/json` leaves DEL and the whole C1 range (U+0080–U+009F) raw. This is
+  #105's own conclusion — that a bare C1 reaches "the audit file, journald, and the
+  admin console" — carried to the path #105 did not touch: that fix landed only on
+  the reply filter. The rune policy now lives once in
+  `security.DisallowedTerminalRune`, which the prompt filter and the record's
+  escaper both call; the prompt removes what it flags (its buffer is fixed and an
+  escape could push the trailing template off the end), while the record escapes it
+  to a printable `\uXXXX` (a record exists to be read back, and evidence of what a
+  provider sent is the point). The escape reaches the file as the literal text
+  `\u009b`, reversible and inert, and covers every string in the record including
+  the keys and values of a nested claims map. A new test asserts on the marshalled
+  *bytes*, with a control proving the same scan finds the escapes in an unbounded
+  record — asserting on the struct would have been #105's tautology again.
+  ([#111](https://github.com/scttfrdmn/oauth2-pam/issues/111))
+
+- **The C module read `protocol_version` only when it was an integer, and silently
+  ignored any other type — leaving it at 0, which means "v1".** So a broker sending
+  `{"protocol_version": 2.0}` (json-c parses any number with a `.` or an exponent as
+  a double) had its reply read under the version-1 contract and granted, while the
+  same reply written `"2"` was correctly refused. The danger the check exists for is
+  exactly a reply that parses cleanly while `authorized` means something new. A
+  non-integer `protocol_version` is now rejected outright, byte-for-byte as a
+  non-boolean `success` already was — the field beside it, whose comment had claimed
+  the two were treated alike when they were not. Reachable only by a broker that is
+  not this one (Go's `encoding/json` cannot emit that shape), which is the
+  implementation- and version-skew case the check is for.
+  ([#112](https://github.com/scttfrdmn/oauth2-pam/issues/112))
+
+- **A paginated GitHub walk was bounded by page and entry counts, never by bytes.**
+  `maxAPIPages` (20) and `maxAPIEntries` (2000) bound a walk of many small objects;
+  neither bounds a walk of few large ones. Twenty pages of one ~1 MB object each is
+  twenty entries — 1% of the entry cap — and the megabytes are retained into
+  `id.Claims`, not transient, so a hostile GitHub Enterprise Server could make one
+  login hold ~20 MB per membership list. A walk now charges the decoded bytes and
+  stops at `maxAPIWalkBytes` (4 MB), and a single claim value larger than any real
+  org or team name is dropped before it enters the claims. `audit_bounds.go`'s own
+  comment had already noted this gap; #104 answered it at the record and this
+  answers it at the source.
+  ([#113](https://github.com/scttfrdmn/oauth2-pam/issues/113))
+
+- **The poll loop read `RATE_LIMITED` without first reading `status`.** A throttle
+  is `status: "error"` with `RATE_LIMITED` and nothing else — the broker asking for
+  a slower poll. Reading the `error_code` alone meant a reply of `status: "denied"`
+  carrying `RATE_LIMITED`, which a broken or hostile broker can send, was taken as a
+  throttle and polled to the deadline instead of as the denial it is: a 90-second
+  refusal where an immediate one was due, and an sshd pre-auth child pinned for it.
+  It failed closed — the login was refused either way — but the predicate diverged
+  from the two other readers of the same code. `status` is now authoritative, the
+  throttle test is one predicate a unit test pins, and the poll loop consults it.
+  ([#114](https://github.com/scttfrdmn/oauth2-pam/issues/114))
+
+- **The mapper swallowed the tier-0 trust error its store documents as
+  un-swallowable.** `enrollment.Load` refuses a symlinked, group-writable or
+  wrongly-owned enrollment file, for the reason `store.go` states: if tier 0 can be
+  rewritten by someone else, falling through to the later tiers turns that into a
+  silent change of mapping policy. `mapViaEnrollment`, the only caller, logged the
+  error and returned nil, falling through — the same correct-mitigation-with-a-
+  caller-that-does-not-use-it shape as #102 and #104. It now returns the error and
+  the login fails closed, as an operational failure naming the file rather than as
+  "this user is not enrolled". The store's own comment is corrected too: the threat
+  is the loss of the signal that an authoritative file was tampered with, not a
+  silent *widening* of policy, which — since tier 0 only grants and every tier's
+  answer must match the requested login — is not reachable.
+  ([#115](https://github.com/scttfrdmn/oauth2-pam/issues/115))
+
+- **Five test assertions that restated what they checked and so could not fail.**
+  The eighth round's lens — a test that asserts the implementation's own predicate —
+  turned on the suite. A C case built a reply from `PROTOCOL_VERSION` and asserted
+  the parse read `PROTOCOL_VERSION` back (`x == x`), now pinning the constant to the
+  literal the suite is written against; a prompt-order check compared
+  `strstr(header) < strstr(trailer)` without guarding against a `NULL` header, which
+  makes the comparison pass vacuously when the header is absent; a truncation check
+  asserted `strlen(prompt) < sizeof(prompt)`, true of any string in the buffer, now
+  checking a byte is left to spare; and `internal/ipc`'s reflective field-bound test
+  skipped any non-string field, so a future slice or second map would reach the log
+  unbounded and the test stay green — it now fails on a kind it does not know how to
+  bound rather than skipping it.
+  ([#116](https://github.com/scttfrdmn/oauth2-pam/issues/116))
+
+- **Wire-protocol registry: `POLICY_DENIED`, `DEVICE_NOT_TRUSTED`,
+  `NO_LOCAL_ACCOUNT`, `SOURCE_AUTH_LIMIT_REACHED` and `FORBIDDEN`.** `docs/wire-
+  protocol.md` is the contract shared with `oidc-pam`, which produces these codes;
+  by the spec's own rule 3, a code a second implementation reads is contract rather
+  than dialect. The one vocabulary decision the registration settled: the per-source
+  pending-flow cap earns a distinct `SOURCE_AUTH_LIMIT_REACHED` rather than reusing
+  the host-wide `AUTH_LIMIT_REACHED`, because a fact about one client's behaviour and
+  a fact about the host's load are things a client should be able to tell apart —
+  which is the reason the spec already spends separate codes on the host-wide and
+  per-user capacity cases. All are additive and break nothing deployed.
+  ([#103](https://github.com/scttfrdmn/oauth2-pam/issues/103),
+  [#117](https://github.com/scttfrdmn/oauth2-pam/issues/117))
 
 - **The audit record was bounded on the way to the terminal and unbounded on the way
   to the audit file.** Every provider-chosen string that reaches a pre-auth tty has a
