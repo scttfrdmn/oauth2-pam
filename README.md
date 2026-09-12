@@ -44,7 +44,7 @@ Every request and reply carries a `protocol_version`, so the next change has som
 
 ## Requirements
 
-- Go 1.25+ for the broker and the CLIs (1.24 is end-of-life and no longer receives security backports)
+- Go 1.27+ for the broker and the CLIs (1.25 is two majors behind and has aged out of go.dev's supported window, which the govulncheck job treats as a finding)
 - A C compiler for the PAM module — it is plain C and needs no Go at all
 - Linux with PAM (`libpam0g-dev`)
 - `libjson-c-dev`
