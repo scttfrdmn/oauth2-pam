@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+A tenth review round, on the clock lens — which clock each deadline is measured on
+and what happens when it moves — came back empty: every time comparison in a
+decision path carries Go's monotonic reading and none is stripped before it is used,
+so an NTP step or a VM restore cannot extend a session or reset a window. The
+eleventh, on the leak lens — does every early-return and error path release what it
+acquired — found one bounded leak, fixed below.
+
+### Fixed
+
+- **The device-flow poll context's deadline timer was released on every error exit
+  but not on the success exit.** The poller's context carries a `WithDeadline` timer
+  set to the flow's expiry, minutes out. On an error, denial or expiry, `failSession`
+  runs `cancelPoll`, which calls the context's cancel and frees the timer at once. On
+  a *granted* login (and on the "session removed out from under the poller" exits) the
+  poller reached only its deferred `forgetPoll`, which deleted the cancel-map entry
+  *without calling cancel* — so the timer stayed on the runtime heap until `expiresAt`
+  for a login that finished in seconds. One lightweight runtime timer per successful
+  authentication, reaped automatically at the deadline, and not reachable pre-auth
+  (the leaking branches require a provider-issued token), so the standing count was
+  bounded and this is low severity — but it is a real asymmetry: the release was on
+  one exit and not the one beside it. The poller now defers `cancelPoll` on every
+  exit, and `forgetPoll` is gone; calling cancel on the already-finished success
+  context is a defined no-op, and on an error exit the entry is already gone so it
+  no-ops there too. A test drives a successful login and asserts the poll context
+  reports `context.Canceled` once the poller has exited — it read `nil` (timer still
+  armed) before the fix.
+  ([#131](https://github.com/scttfrdmn/oauth2-pam/issues/131))
+
 ## [0.4.0] - 2026-09-12
 
 A third adversarial review round, on a tree that had already survived two. It found
