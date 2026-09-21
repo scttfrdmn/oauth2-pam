@@ -89,7 +89,7 @@ jobs:
         run: make build-pam VERSION=codeql GIT_COMMIT=codeql BUILD_DATE=codeql
 
       - name: Analyze
-        uses: github/codeql-action/analyze@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
+        uses: github/codeql-action/analyze@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
         with:
           # One SARIF upload per language against the same commit, so each needs a
           # category of its own or the second overwrites the first.
